@@ -68,3 +68,4 @@ CoverArt 是面向 Roon 生态的 Android 客户端，专注在大屏设备上�
 
 
 欢迎提交 Issue/PR，为 Roon 爱好者共建更好的客厅视觉体验。
+# CoverArt
