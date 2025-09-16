@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# IDE & tooling
+.idea/
+*.iml
+.claude/
+
+# Gradle
+.gradle/
+/build/
+**/build/
+!gradle/wrapper/
+
+# Android specific
+local.properties
+*.keystore
+*.jks
+*.keystore.properties
+
+# Logs
+*.log
+
+# Generated artifacts
+app/release/
+app/build/
