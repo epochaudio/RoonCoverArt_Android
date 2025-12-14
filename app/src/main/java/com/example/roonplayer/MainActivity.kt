@@ -424,6 +424,10 @@ class MainActivity : Activity() {
     private var webSocketClient: SimpleWebSocketClient? = null
     private val connectionValidator = RoonConnectionValidator()
     private val connectionHelper = SimplifiedConnectionHelper(connectionValidator)
+    
+    // Manual CoroutineScope bound to Activity lifecycle
+    private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    
     private lateinit var smartConnectionManager: SmartConnectionManager
     private lateinit var networkDetector: NetworkReadinessDetector
     private lateinit var healthMonitor: ConnectionHealthMonitor
@@ -3493,7 +3497,20 @@ class MainActivity : Activity() {
         updateStatus("正在验证连接...")
         connectButton.text = "连接到Roon"
         
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
+            val currentJob = coroutineContext[Job]
+            
+            // Prevent concurrent connection attempts
+            synchronized(this@MainActivity) {
+                if (webSocketClient?.isConnected() == true) {
+                    mainHandler.post {
+                        updateStatus("已连接")
+                        connectButton.text = "断开连接"
+                    }
+                    return@launch
+                }
+            }
+
             try {
                 // 使用简化的连接验证
                 val connectionInfo = connectionHelper.validateAndGetConnectionInfo(hostInput)
@@ -3506,11 +3523,13 @@ class MainActivity : Activity() {
                     return@launch
                 }
                 
+                if (!isActive) return@launch
+                
                 val (host, port) = connectionInfo
                 logDebug("Validated connection to $host:$port")
                 
                 // 保存成功验证的IP
-                mainHandler.post {
+                withContext(Dispatchers.Main) {
                     saveIP(hostInput)
                     updateStatus("正在连接到 $host:$port...")
                     connectButton.text = "连接中..."
@@ -3520,15 +3539,17 @@ class MainActivity : Activity() {
                 webSocketClient?.disconnect()
                 
                 // 创建WebSocket连接
-                webSocketClient = SimpleWebSocketClient(host, port) { message ->
+                val newClient = SimpleWebSocketClient(host, port) { message ->
                     handleWebSocketMessage(message)
                 }
                 
+                webSocketClient = newClient
+                
                 logDebug("Attempting WebSocket connection to $host:$port")
-                webSocketClient?.connect()
+                newClient.connect()
                 logDebug("WebSocket connection successful")
                 
-                mainHandler.post {
+                withContext(Dispatchers.Main) {
                     updateStatus("已连接，正在监听消息...")
                     connectButton.text = "断开连接"
                 }
@@ -3541,9 +3562,14 @@ class MainActivity : Activity() {
                 
             } catch (e: Exception) {
                 logError("Connection failed: ${e.message}", e)
-                mainHandler.post {
+                withContext(Dispatchers.Main) {
                     updateStatus("连接失败: ${e.message}")
                     connectButton.text = "连接到Roon"
+                    // Ensure client is cleaned up on failure
+                    if (webSocketClient?.isConnected() != true) {
+                        webSocketClient?.disconnect()
+                        webSocketClient = null
+                    }
                 }
             }
         }
@@ -6489,6 +6515,13 @@ class MainActivity : Activity() {
     
     override fun onDestroy() {
         super.onDestroy()
+        
+        // Cancel all activity-scoped coroutines to prevent leaks
+        try {
+            activityScope.cancel()
+        } catch (e: Exception) {
+            logWarning("Error cancelling activity scope: ${e.message}")
+        }
         
         smartConnectionManager.unregisterNetworkMonitoring()
         healthMonitor.stopMonitoring()

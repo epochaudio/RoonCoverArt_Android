@@ -47,11 +47,11 @@ class RoonConnectionValidator {
 
         try {
             val address = InetAddress.getByName(ip)
-            val socket = Socket()
             
             withTimeout(customTimeout.toLong()) {
-                socket.connect(InetSocketAddress(address, port), customTimeout)
-                socket.close()
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(address, port), customTimeout)
+                }
             }
             
             Log.i(TAG, "Successfully connected to Roon Core at $ip:$port")

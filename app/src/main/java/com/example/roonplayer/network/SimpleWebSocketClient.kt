@@ -57,11 +57,18 @@ class SimpleWebSocketClient(
             // Reset scope
             scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             
-            socket = Socket()
+            val newSocket = Socket()
+            socket = newSocket
             logDebug("Socket object created")
             
-            socket?.connect(InetSocketAddress(host, port), 5000)
-            logDebug("Socket connected successfully")
+            try {
+                newSocket.connect(InetSocketAddress(host, port), 5000)
+                logDebug("Socket connected successfully")
+            } catch (e: Exception) {
+                try { newSocket.close() } catch (ignore: Exception) {}
+                socket = null
+                throw e
+            }
             
             socket?.let { sock ->
                 logDebug("Connected via TCP, using WebSocket protocol")
@@ -196,12 +203,21 @@ class SimpleWebSocketClient(
             scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             
             // 重新建立socket连接
-            socket = Socket()
-            socket?.connect(InetSocketAddress(host, port), 10000) // 10秒超时
+            val newSocket = Socket()
+            try {
+                newSocket.connect(InetSocketAddress(host, port), 10000) // 10秒超时
+            } catch (e: Exception) {
+                try { newSocket.close() } catch (ignore: Exception) {}
+                logError("❌ Failed to connect reconnection socket: ${e.message}")
+                return false
+            }
             
-            val sock = socket
-            if (sock == null || !sock.isConnected) {
-                logError("❌ Failed to create reconnection socket")
+            socket = newSocket
+            val sock = newSocket
+            if (!sock.isConnected) {
+                logError("❌ Socket not connected after creation")
+                try { sock.close() } catch (ignore: Exception) {}
+                socket = null
                 return false
             }
             
