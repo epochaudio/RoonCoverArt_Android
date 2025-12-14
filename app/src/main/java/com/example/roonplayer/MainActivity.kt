@@ -2492,6 +2492,12 @@ class MainActivity : Activity() {
                 } else {
                     hostPort to ROON_WS_PORT
                 }
+            
+                // Validate host to prevent "by_core_id_" issues
+                if (!isValidHost(host)) {
+                    logDebug("⚠️ Skipping paired core with invalid host: $host")
+                    continue
+                }
                 
                 val coreId = sharedPreferences.getString("roon_core_id_$hostPort", "") ?: ""
                 val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0)
@@ -2827,17 +2833,17 @@ class MainActivity : Activity() {
     }
     
     private fun testConnection(ip: String, port: Int): Boolean {
-        return try {
-            val socket = Socket()
+    return try {
+        Socket().use { socket ->
             socket.connect(InetSocketAddress(ip, port), 1000) // Reduced timeout to 1 second
-            socket.close()
-            logDebug("Connection successful: $ip:$port")
-            true
-        } catch (e: Exception) {
-            logDebug("Connection failed: $ip:$port - ${e.message}")
-            false
         }
+        logDebug("Connection successful: $ip:$port")
+        true
+    } catch (e: Exception) {
+        logDebug("Connection failed: $ip:$port - ${e.message}")
+        false
     }
+}
     
     // Efficient Roon Core discovery by listening to Core's multicast announcements
     private suspend fun listenForRoonCoreAnnouncements() {
@@ -3485,7 +3491,7 @@ class MainActivity : Activity() {
         }
         
         updateStatus("正在验证连接...")
-        connectButton.text = "验证中..."
+        connectButton.text = "连接到Roon"
         
         GlobalScope.launch(Dispatchers.IO) {
             try {
@@ -3804,9 +3810,42 @@ class MainActivity : Activity() {
             val jsonBody = mooMessage.jsonBody
             
             logDebug("Parsed - Verb: $verb, Service: $servicePath, RequestId: $requestId, Body: $jsonBody")
+            
+            // Send default success response for REQUEST to prevent timeout on Roon side
+            if (verb == "REQUEST") {
+                 // But don't send response for registry/changed as it might not expect it or we handle it by action
+                 // Actually, for REQUEST we should usually acknowledge.
+                 // Let's handle specific requests first.
+            }
 
             
             when (verb) {
+                "REQUEST" -> {
+                    when {
+                         servicePath.contains("registry") && servicePath.contains("changed") -> {
+                             logDebug("Received registry changed event")
+                             // This is the signal that authorization status might have changed (e.g. user clicked Enable)
+                             if (authDialogShown || !isConnectionHealthy()) {
+                                 logDebug("Registry changed - triggering re-registration check")
+                                 mainHandler.post {
+                                     updateStatus("检测到Roon设置变更，正在更新注册...")
+                                 }
+                                 // Trigger a single registration attempt
+                                 sendRegistration()
+                             }
+                             
+                             // Acknowledge the request
+                             val response = "MOO/1 COMPLETE $servicePath\nRequest-Id: $requestId\nContent-Type: application/json\nContent-Length: 0\n\n"
+                             sendMoo(response)
+                         }
+                         else -> {
+                             logDebug("Received generic REQUEST: $servicePath")
+                             // Acknowledge to be polite
+                             val response = "MOO/1 COMPLETE $servicePath\nRequest-Id: $requestId\nContent-Type: application/json\nContent-Length: 0\n\n"
+                             sendMoo(response)
+                         }
+                    }
+                }
                 "RESPONSE" -> {
                     when {
                         servicePath.contains("registry") && servicePath.contains("info") -> {
@@ -5618,7 +5657,18 @@ class MainActivity : Activity() {
         return connections
     }
     
+    private fun isValidHost(host: String): Boolean {
+        return host.isNotBlank() && 
+               !host.contains("by_core_id_") && 
+               !host.contains(" ") &&
+               !host.contains("\n")
+    }
+
     private fun saveSuccessfulConnection(ip: String, port: Int) {
+        if (!isValidHost(ip)) {
+            logWarning("⚠️ Attempted to save invalid host: $ip")
+            return
+        }
         val currentTime = System.currentTimeMillis()
         val key = "roon_successful_${ip}_port_${port}_time"
         val countKey = "roon_successful_${ip}_port_${port}_count"
@@ -5695,6 +5745,10 @@ class MainActivity : Activity() {
                     val parts = key.removePrefix("roon_successful_").removeSuffix("_time").split("_port_")
                     if (parts.size == 2) {
                         val ip = parts[0]
+                    
+                        // Skip invalid hosts (fixes "by_core_id_" bug)
+                        if (!isValidHost(ip)) continue
+                    
                         val port = parts[1].toInt()
                         val lastTime = value as Long
                         val countKey = "roon_successful_${ip}_port_${port}_count"
@@ -5993,7 +6047,13 @@ class MainActivity : Activity() {
         }
         
         // Start the retry loop
-        mainHandler.postDelayed(retryRunnable, 30000) // First retry after 30 seconds
+        // FIX: Disable aggressive retry loop to prevent duplicate registration entries
+        // multiple requests with new Request-IDs create multiple "Pending" entries in Roon
+        // We now rely on 'com.roonlabs.registry:1/changed' event or manual retry
+        
+        logDebug("Authorization retry loop disabled - waiting for 'registry/changed' event or manual retry")
+        
+        // mainHandler.postDelayed(retryRunnable, 30000) // DISABLED
     }
     
     private fun showAuthorizationDialog() {
@@ -6507,9 +6567,9 @@ class MainActivity : Activity() {
             val lastPort = sharedPreferences.getInt("last_successful_port", 0)
             val lastTime = sharedPreferences.getLong("last_connection_time", 0)
             
-            // Only try if connection was successful within the last 7 days
+            // Only try if connection was successful within the last 7 days and host is valid
             val weekAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000L)
-            if (lastHost != null && lastPort > 0 && lastTime > weekAgo) {
+            if (lastHost != null && lastPort > 0 && lastTime > weekAgo && isValidHost(lastHost)) {
                 logDebug("🔄 Attempting auto-reconnect to $lastHost:$lastPort")
                 ipInput.setText("$lastHost:$lastPort")
                 connect()

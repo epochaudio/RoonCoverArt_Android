@@ -1,4 +1,0 @@
-#Tue Aug 12 13:52:43 CST 2025
-base.0=/Users/yiwen/work/CoverArtForAndroid/app/build/intermediates/dex/debugAndroidTest/mergeProjectDexDebugAndroidTest/0/classes.dex
-path.0=0/classes.dex
-renamed.0=classes.dex

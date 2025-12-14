@@ -1,4 +1,0 @@
-com.example.roonplayer.test.app-androidTest-0 /Users/yiwen/work/CoverArtForAndroid/app/build/generated/res/resValues/androidTest/debug
-com.example.roonplayer.test.app-mergeDebugAndroidTestResources-1 /Users/yiwen/work/CoverArtForAndroid/app/build/intermediates/incremental/debugAndroidTest/mergeDebugAndroidTestResources/merged.dir
-com.example.roonplayer.test.app-mergeDebugAndroidTestResources-2 /Users/yiwen/work/CoverArtForAndroid/app/build/intermediates/incremental/debugAndroidTest/mergeDebugAndroidTestResources/stripped.dir
-com.example.roonplayer.test.app-merged_res-3 /Users/yiwen/work/CoverArtForAndroid/app/build/intermediates/merged_res/debugAndroidTest
