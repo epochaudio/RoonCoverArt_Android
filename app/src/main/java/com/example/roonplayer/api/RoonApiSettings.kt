@@ -5,7 +5,7 @@ import android.widget.EditText
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import com.example.roonplayer.SimpleWebSocketClient
+import com.example.roonplayer.network.SimpleWebSocketClient
 
 /**
  * RoonApiSettings - 基于官方RoonCoverArt实现的Settings管理类

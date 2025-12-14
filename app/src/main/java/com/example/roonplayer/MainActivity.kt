@@ -54,6 +54,7 @@ import com.example.roonplayer.network.SimplifiedConnectionHelper
 import com.example.roonplayer.network.SmartConnectionManager
 import com.example.roonplayer.network.NetworkReadinessDetector
 import com.example.roonplayer.network.ConnectionHealthMonitor
+import com.example.roonplayer.network.SimpleWebSocketClient
 import kotlin.concurrent.withLock
 
 class MainActivity : Activity() {
@@ -3509,6 +3510,9 @@ class MainActivity : Activity() {
                     connectButton.text = "连接中..."
                 }
                 
+                // 确保断开旧连接，防止线程泄漏
+                webSocketClient?.disconnect()
+                
                 // 创建WebSocket连接
                 webSocketClient = SimpleWebSocketClient(host, port) { message ->
                     handleWebSocketMessage(message)
@@ -3519,14 +3523,15 @@ class MainActivity : Activity() {
                 logDebug("WebSocket connection successful")
                 
                 mainHandler.post {
-                    updateStatus("已连接，正在握手...")
+                    updateStatus("已连接，正在监听消息...")
                     connectButton.text = "断开连接"
                 }
+
+                // Handshake is now handled inside SimpleWebSocketClient.connect()
+                logDebug("WebSocket connection handling...")
                 
-                // 稳定连接后开始握手
-                delay(1000)
-                logDebug("Initiating WebSocket handshake...")
-                sendWebSocketHandshake()
+                // Immediately request core info to keep connection alive and start registration
+                sendInfoRequest()
                 
             } catch (e: Exception) {
                 logError("Connection failed: ${e.message}", e)
@@ -3772,71 +3777,34 @@ class MainActivity : Activity() {
         try {
             logDebug("Received Moo message:\n$message")
             
-            // Parse Moo protocol message - handle both \r\n and \n line endings
-            val lines = message.split("\r\n", "\n")
-            if (lines.isEmpty()) return
-            
-            val firstLine = lines[0]
-            logDebug("Moo first line: $firstLine")
-            
-            // Check for HTTP WebSocket upgrade response
-            if (firstLine.startsWith("HTTP/1.1 101")) {
+            // Handle HTTP WebSocket handshake specifically
+            if (message.startsWith("HTTP/1.1 101")) {
                 logDebug("WebSocket handshake successful! Sending info request first...")
                 sendInfoRequest()
                 return
-            } else if (firstLine.startsWith("HTTP/1.1 404")) {
+            } else if (message.startsWith("HTTP/1.1 404")) {
                 logError("WebSocket endpoint not found - trying different approach")
                 // Try sending MOO protocol directly
                 sendInfoRequest()
                 return
             }
             
-            // Parse first line: "MOO/1 RESPONSE service/method" or "MOO/1 COMPLETE"
-            val parts = firstLine.split(" ", limit = 3)
-            if (parts.size < 2) return
+            // Use extracted parser
+            val parser = com.example.roonplayer.network.MooParser()
+            val mooMessage = parser.parse(message)
             
-            val verb = parts[1] // RESPONSE, COMPLETE, etc.
-            val servicePath = if (parts.size > 2) parts[2] else ""
-            
-            // Parse headers
-            var contentLength = 0
-            var requestId = ""
-            var headerEndIndex = 1
-            
-            for (i in 1 until lines.size) {
-                val line = lines[i]
-                if (line.isEmpty()) {
-                    headerEndIndex = i + 1
-                    break
-                }
-                
-                val colonIndex = line.indexOf(':')
-                if (colonIndex > 0) {
-                    val headerName = line.substring(0, colonIndex).trim()
-                    val headerValue = line.substring(colonIndex + 1).trim()
-                    
-                    when (headerName.lowercase()) {
-                        "content-length" -> contentLength = headerValue.toIntOrNull() ?: 0
-                        "request-id" -> requestId = headerValue
-                    }
-                }
+            if (mooMessage == null) {
+                // Could not parse as MOO message (and wasn't handled HTTP above)
+                return
             }
             
-            // Parse JSON body if present
-            var jsonBody: JSONObject? = null
-            if (contentLength > 0 && headerEndIndex < lines.size) {
-                val bodyLines = lines.subList(headerEndIndex, lines.size)
-                val bodyString = bodyLines.joinToString("\n")
-                if (bodyString.isNotEmpty()) {
-                    try {
-                        jsonBody = JSONObject(bodyString)
-                    } catch (e: Exception) {
-                        logError("Failed to parse JSON body: ${e.message}")
-                    }
-                }
-            }
+            val verb = mooMessage.verb
+            val servicePath = mooMessage.servicePath
+            val requestId = mooMessage.requestId
+            val jsonBody = mooMessage.jsonBody
             
             logDebug("Parsed - Verb: $verb, Service: $servicePath, RequestId: $requestId, Body: $jsonBody")
+
             
             when (verb) {
                 "RESPONSE" -> {
@@ -4141,59 +4109,10 @@ class MainActivity : Activity() {
     }
     
     private fun retryRegistrationWithoutSettings() {
-        val requestId = this.requestId++
-        
-        // Get saved token for this core (if any) - now using core_id
-        val hostInput = ipInput.text.toString().trim()
-        val coreId = sharedPreferences.getString("roon_core_id_$hostInput", null)
-        val savedToken = if (coreId != null) {
-            sharedPreferences.getString("roon_core_token_by_core_id_$coreId", null)
-        } else {
-            // Fallback to old IP-based token for backward compatibility
-            sharedPreferences.getString("roon_core_token_$hostInput", null)
-        }
-        
-        // Create the JSON body without settings service
-        val body = JSONObject().apply {
-            put("extension_id", EXTENSION_ID)
-            put("display_name", "CoverArt")
-            put("display_version", "2.15")
-            put("publisher", PUBLISHER)
-            put("email", "masked")
-            put("website", "https://shop236654229.taobao.com/")
-            
-            // Add token if we have one from previous pairing
-            if (savedToken != null) {
-                put("token", savedToken)
-            }
-            
-            // Only transport service - no settings
-            put("required_services", org.json.JSONArray().apply {
-                put("com.roonlabs.transport:2")
-                put("com.roonlabs.image:1")
-            })
-            put("optional_services", org.json.JSONArray())
-            put("provided_services", org.json.JSONArray())
-        }
-        
-        val bodyString = body.toString()
-        val bodyBytes = bodyString.toByteArray(Charsets.UTF_8)
-        
-        // Create Moo protocol message
-        val mooMessage = buildString {
-            append("MOO/1 REQUEST com.roonlabs.registry:1/register\n")
-            append("Request-Id: $requestId\n")
-            append("Content-Type: application/json\n")
-            append("User-Agent: RoonPlayerAndroid/1.0\n")
-            append("Host: ${ipInput.text.toString().trim()}\n")
-            append("Content-Length: ${bodyBytes.size}\n")
-            append("\n")
-            append(bodyString)
-        }
-        
-        logDebug("Retrying registration without settings service")
-        logDebug("Retry register message (with token: ${savedToken != null}):\n$mooMessage")
-        sendMoo(mooMessage)
+        logWarning("Retrying registration without settings service due to previous failure")
+        val request = prepareRegisterRequest(includeSettings = false)
+        logDebug("Retry register message (with token: ${request.hasToken}):\n${request.mooMessage}")
+        sendMoo(request.mooMessage)
     }
     
     private fun handleZoneUpdate(body: JSONObject) {
@@ -5805,101 +5724,7 @@ class MainActivity : Activity() {
         saveSuccessfulConnection(ip, port)
     }
     
-    // Enhanced error diagnosis and logging
-    private fun diagnoseConnectionError(ip: String, port: Int, error: Exception): String {
-        val diagnosis = StringBuilder()
-        diagnosis.append("🔍 连接诊断报告 - $ip:$port\n")
-        diagnosis.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-        
-        when {
-            error is ConnectException -> {
-                diagnosis.append("❌ 错误类型: 连接被拒绝\n")
-                diagnosis.append("📝 可能原因:\n")
-                diagnosis.append("   • Roon Core未启动或端口未监听\n")
-                diagnosis.append("   • 防火墙阻止了连接\n")
-                diagnosis.append("   • IP地址或端口号错误\n")
-                diagnosis.append("💡 建议解决方案:\n")
-                diagnosis.append("   • 检查Roon Core是否运行\n")
-                diagnosis.append("   • 尝试其他常用端口: 9100, ROON_WS_PORT, 9332\n")
-                diagnosis.append("   • 检查防火墙设置\n")
-            }
-            error is SocketTimeoutException -> {
-                diagnosis.append("❌ 错误类型: 连接超时\n")
-                diagnosis.append("📝 可能原因:\n")
-                diagnosis.append("   • 网络延迟过高\n")
-                diagnosis.append("   • Core响应缓慢\n")
-                diagnosis.append("   • 网络不稳定\n")
-                diagnosis.append("💡 建议解决方案:\n")
-                diagnosis.append("   • 检查网络连接质量\n")
-                diagnosis.append("   • 增加连接超时时间\n")
-                diagnosis.append("   • 尝试重启网络设备\n")
-            }
-            error is UnknownHostException -> {
-                diagnosis.append("❌ 错误类型: 主机不可达\n")
-                diagnosis.append("📝 可能原因:\n")
-                diagnosis.append("   • IP地址不存在\n")
-                diagnosis.append("   • DNS解析失败\n")
-                diagnosis.append("   • 网络配置错误\n")
-                diagnosis.append("💡 建议解决方案:\n")
-                diagnosis.append("   • 检查IP地址格式\n")
-                diagnosis.append("   • 使用IP地址而非域名\n")
-                diagnosis.append("   • 检查网络设置\n")
-            }
-            else -> {
-                diagnosis.append("❌ 错误类型: ${error.javaClass.simpleName}\n")
-                diagnosis.append("📝 错误信息: ${error.message}\n")
-                diagnosis.append("💡 建议解决方案:\n")
-                diagnosis.append("   • 检查网络连接\n")
-                diagnosis.append("   • 重启APP和Roon Core\n")
-                diagnosis.append("   • 查看详细日志\n")
-            }
-        }
-        
-        // Add network diagnostics
-        diagnosis.append("\n🔍 网络诊断:\n")
-        try {
-            val reachable = InetAddress.getByName(ip).isReachable(3000)
-            diagnosis.append("   • Ping测试: ${if (reachable) "✅ 成功" else "❌ 失败"}\n")
-        } catch (e: Exception) {
-            diagnosis.append("   • Ping测试: ❌ 异常 - ${e.message}\n")
-        }
-        
-        // Test common ports
-        val commonPorts = listOf(9100, ROON_WS_PORT, 9332, 9001, 9002)
-        diagnosis.append("   • 端口扫描结果:\n")
-        for (testPort in commonPorts) {
-            try {
-                val socket = Socket()
-                socket.connect(InetSocketAddress(ip, testPort), 1000)
-                socket.close()
-                diagnosis.append("     - $testPort: ✅ 开放\n")
-                if (testPort != port) {
-                    diagnosis.append("       💡 建议尝试此端口\n")
-                }
-            } catch (e: Exception) {
-                diagnosis.append("     - $testPort: ❌ 关闭\n")
-            }
-        }
-        
-        diagnosis.append("\n📊 连接历史:\n")
-        val successfulConnections = getRecentSuccessfulConnections(ip)
-        if (successfulConnections.isNotEmpty()) {
-            diagnosis.append("   • 最近成功连接:\n")
-            successfulConnections.forEach { conn ->
-                val time = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(conn.lastSeen))
-                diagnosis.append("     - ${conn.ip}:${conn.port} at $time (${conn.successCount}次)\n")
-            }
-        } else {
-            diagnosis.append("   • 暂无成功连接记录\n")
-        }
-        
-        return diagnosis.toString()
-    }
-    
-    private fun getRecentSuccessfulConnections(targetIp: String): List<RoonCoreInfo> {
-        val connections = getPrioritizedConnections()
-        return connections.filter { it.ip == targetIp }.take(3)
-    }
+
     
     // Enhanced logging with categories
     private fun logConnectionEvent(category: String, level: String, message: String, details: String = "") {
@@ -6825,565 +6650,3 @@ class MainActivity : Activity() {
 }
 
 // WebSocket客户端实现 - 使用Roon的官方WebSocket API
-class SimpleWebSocketClient(
-    private val host: String,
-    private val port: Int,
-    private val onMessage: (String) -> Unit
-) {
-    private var socket: Socket? = null
-    private var connected = false
-    
-    companion object {
-        private const val DEBUG_ENABLED = true
-        private const val LOG_TAG = "RoonPlayer"
-    }
-    
-    // Logging methods for SimpleWebSocketClient
-    private fun logDebug(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.d(LOG_TAG, message)
-    }
-    
-    private fun logInfo(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.i(LOG_TAG, message)
-    }
-    
-    private fun logWarning(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.w(LOG_TAG, message)
-    }
-    
-    private fun logError(message: String, e: Exception? = null) {
-        if (DEBUG_ENABLED) android.util.Log.e(LOG_TAG, message, e)
-    }
-    
-    fun isConnected(): Boolean = connected
-    
-    fun getHost(): String = host
-    fun getPort(): Int = port
-    
-    @Throws(Exception::class)
-    fun connect() {
-        logDebug("SimpleWebSocketClient.connect() to $host:$port using WebSocket protocol")
-        try {
-            socket = Socket()
-            logDebug("Socket object created")
-            
-            socket?.connect(InetSocketAddress(host, port), 5000)
-            logDebug("Socket connected successfully")
-            
-            socket?.let { sock ->
-                logDebug("Connected via TCP, using WebSocket protocol")
-                
-                // Configure socket for reliable WebSocket communication
-                sock.tcpNoDelay = true
-                sock.keepAlive = true
-                sock.soTimeout = 0 // No timeout initially
-                
-                connected = true
-                
-                logDebug("Socket configured: tcpNoDelay=${sock.tcpNoDelay}, keepAlive=${sock.keepAlive}")
-                
-                // 开始监听MOO消息
-                GlobalScope.launch(Dispatchers.IO) {
-                    try {
-                        val input = sock.getInputStream()
-                        
-                        logDebug("Starting MOO message listener loop")
-                        
-                        // Give a short delay to let the connection stabilize
-                        kotlinx.coroutines.delay(100)
-                        
-                        while (connected && !sock.isClosed && sock.isConnected) {
-                            try {
-                                logDebug("Waiting for MOO message...")
-                                
-                                // Set timeout for each read operation
-                                sock.soTimeout = 15000 // 15 second timeout per read
-                                
-                                val message = readMooMessage(input)
-                                if (message != null) {
-                                    logDebug("Received MOO message (${message.length} chars)")
-                                    onMessage(message)
-                                } else {
-                                    logWarning("Received null message, connection may be closed")
-                                    // 等待一下再重试，而不是立即断开
-                                    kotlinx.coroutines.delay(1000)
-                                    
-                                    // 检查连接状态，如果仍然无法接收消息则尝试重连
-                                    if (!sock.isConnected || sock.isClosed) {
-                                        logDebug("🔄 Socket disconnected, attempting to reconnect...")
-                                        try {
-                                            if (connectToExistingCore()) {
-                                                logDebug("✅ Reconnection successful")
-                                                continue
-                                            } else {
-                                                logError("❌ Reconnection failed")
-                                                break
-                                            }
-                                        } catch (reconE: Exception) {
-                                            logError("❌ Reconnection attempt failed: ${reconE.message}")
-                                            break
-                                        }
-                                    }
-                                }
-                            } catch (e: java.net.SocketTimeoutException) {
-                                logDebug("Read timeout - continuing to listen")
-                                // Continue waiting for more messages
-                            } catch (e: java.io.IOException) {
-                                logError("IO error in message loop: ${e.message}")
-                                // 尝试自动重连而不是直接退出
-                                logDebug("🔄 Attempting to reconnect after IO error...")
-                                kotlinx.coroutines.delay(2000) // 等待2秒后重连
-                                
-                                try {
-                                    // 重新建立连接
-                                    if (connectToExistingCore()) {
-                                        logDebug("✅ Reconnection successful, continuing to listen")
-                                        continue
-                                    } else {
-                                        logError("❌ Reconnection failed")
-                                        break
-                                    }
-                                } catch (reconE: Exception) {
-                                    logError("❌ Reconnection attempt failed: ${reconE.message}")
-                                    break
-                                }
-                            } catch (e: Exception) {
-                                logError("Unexpected error in message loop: ${e.message}", e)
-                                break
-                            }
-                        }
-                        logDebug("MOO message listener loop ended - connected: $connected, socket closed: ${sock.isClosed}, socket connected: ${sock.isConnected}")
-                    } catch (e: Exception) {
-                        logError("MOO message listening failed: ${e.message}", e)
-                    } finally {
-                        connected = false
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            logError("MOO connection failed: ${e.message}", e)
-            throw e
-        }
-    }
-    
-    // 重连到现有的Roon Core，使用当前的连接参数
-    fun connectToExistingCore(): Boolean {
-        return try {
-            logDebug("🔄 Attempting to reconnect to $host:$port")
-            
-            // 断开现有连接
-            disconnect()
-            
-            // 重新建立socket连接
-            socket = Socket()
-            socket?.connect(InetSocketAddress(host, port), 10000) // 10秒超时
-            
-            val sock = socket
-            if (sock == null || !sock.isConnected) {
-                logError("❌ Failed to create reconnection socket")
-                return false
-            }
-            
-            connected = true
-            logDebug("✅ Socket reconnected successfully")
-            
-            // 发送WebSocket握手 - 使用标准Roon API路径
-            val websocketKey = "dGhlIHNhbXBsZSBub25jZQ=="
-            val handshake = buildString {
-                append("GET ${MainActivity.ROON_WS_PATH} HTTP/1.1\r\n")  // 使用标准Roon API路径
-                append("Host: $host\r\n")
-                append("Upgrade: websocket\r\n")
-                append("Connection: Upgrade\r\n")
-                append("Sec-WebSocket-Key: $websocketKey\r\n")
-                append("Sec-WebSocket-Version: 13\r\n")
-                append("User-Agent: RoonPlayerAndroid/1.0\r\n")
-                append("\r\n")
-            }
-            
-            sock.getOutputStream().write(handshake.toByteArray())
-            sock.getOutputStream().flush()
-            
-            // 读取握手响应
-            sock.soTimeout = 5000
-            val input = sock.getInputStream()
-            val buffer = ByteArray(1024)
-            val bytesRead = input.read(buffer)
-            
-            if (bytesRead > 0) {
-                val response = String(buffer, 0, bytesRead)
-                if (response.contains("101 Switching Protocols")) {
-                    logDebug("✅ WebSocket handshake successful on reconnection")
-                    
-                    // 重启消息监听循环
-                    GlobalScope.launch(Dispatchers.IO) {
-                        try {
-                            kotlinx.coroutines.delay(100)
-                            logDebug("🔄 Restarting message listener after reconnection")
-                            
-                            while (connected && !sock.isClosed && sock.isConnected) {
-                                try {
-                                    sock.soTimeout = 15000
-                                    val message = readMooMessage(input)
-                                    if (message != null) {
-                                        onMessage(message)
-                                    } else {
-                                        logWarning("Null message in reconnected listener")
-                                        break
-                                    }
-                                } catch (e: java.net.SocketTimeoutException) {
-                                    continue
-                                } catch (e: Exception) {
-                                    logError("Error in reconnected listener: ${e.message}")
-                                    break
-                                }
-                            }
-                        } catch (e: Exception) {
-                            logError("Reconnected listener failed: ${e.message}")
-                        }
-                    }
-                    
-                    return true
-                } else {
-                    logError("❌ WebSocket handshake failed on reconnection")
-                    return false
-                }
-            } else {
-                logError("❌ No handshake response on reconnection")
-                return false
-            }
-        } catch (e: Exception) {
-            logError("❌ Reconnection failed: ${e.message}", e)
-            connected = false
-            return false
-        }
-    }
-    
-    fun send(message: String) {
-        socket?.let { sock ->
-            try {
-                logDebug("Sending raw TCP message: $message")
-                val messageBytes = message.toByteArray(Charsets.UTF_8)
-                logDebug("Message bytes (${messageBytes.size}): ${messageBytes.joinToString(" ") { "%02x".format(it) }}")
-                
-                val outputStream = sock.getOutputStream()
-                outputStream.write(messageBytes)
-                outputStream.flush()
-                
-                logDebug("TCP message sent successfully (${messageBytes.size} bytes)")
-                
-                // Verify socket is still connected
-                if (!sock.isConnected || sock.isClosed) {
-                    logWarning("Warning: Socket state after send - connected: ${sock.isConnected}, closed: ${sock.isClosed}")
-                }
-            } catch (e: Exception) {
-                logError("Send failed: ${e.message}", e)
-                connected = false
-            }
-        } ?: logError("Cannot send message: socket is null")
-    }
-    
-    fun sendWebSocketFrame(message: String) {
-        socket?.let { sock ->
-            try {
-                logDebug("Sending WebSocket frame: $message")
-                val messageBytes = message.toByteArray(Charsets.UTF_8)
-                
-                // Create WebSocket frame (simple text frame)
-                val frame = createWebSocketFrame(messageBytes)
-                
-                val outputStream = sock.getOutputStream()
-                outputStream.write(frame)
-                outputStream.flush()
-                
-                logDebug("WebSocket frame sent successfully (${frame.size} bytes)")
-            } catch (e: Exception) {
-                logError("WebSocket send failed: ${e.message}", e)
-                connected = false
-            }
-        } ?: logError("Cannot send WebSocket frame: socket is null")
-    }
-    
-    private fun createWebSocketFrame(payload: ByteArray): ByteArray {
-        // Create a properly masked WebSocket text frame
-        val payloadLength = payload.size
-        
-        // Generate random mask key (required for client-to-server frames)
-        val maskKey = byteArrayOf(
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte()
-        )
-        
-        // Apply mask to payload
-        val maskedPayload = ByteArray(payload.size)
-        for (i in payload.indices) {
-            maskedPayload[i] = (payload[i].toInt() xor maskKey[i % 4].toInt()).toByte()
-        }
-        
-        val frame = when {
-            payloadLength < 126 -> {
-                // Small payload (0-125 bytes) - Use binary frame (0x82) instead of text (0x81)
-                byteArrayOf(0x82.toByte(), (payloadLength or 0x80).toByte()) + 
-                maskKey + maskedPayload
-            }
-            payloadLength < 65536 -> {
-                // Medium payload (126-65535 bytes) - Use binary frame (0x82)
-                byteArrayOf(0x82.toByte(), (126 or 0x80).toByte()) +
-                byteArrayOf((payloadLength shr 8).toByte(), payloadLength.toByte()) +
-                maskKey + maskedPayload
-            }
-            else -> {
-                // Large payload (>65535 bytes) - not expected for our use case
-                throw IllegalArgumentException("Payload too large for simple WebSocket frame")
-            }
-        }
-        return frame
-    }
-    
-    fun disconnect() {
-        connected = false
-        socket?.close()
-        socket = null
-    }
-    
-    // WebSocket frame reassembly variables for handling fragmented binary messages
-    private var frameBuffer: ByteArrayOutputStream? = null
-    private var framingInProgress: Boolean = false
-    private var expectedFrameType: Int = -1
-    
-    private fun readMooMessage(input: InputStream): String? {
-        try {
-            // Check if this is a WebSocket handshake response or WebSocket frame
-            val firstByte = input.read()
-            if (firstByte == -1) {
-                logWarning("End of stream while reading")
-                return null
-            }
-            
-            // Check if it looks like HTTP response (starts with 'H' = 0x48)
-            if (firstByte == 0x48) {
-                logDebug("Reading HTTP handshake response...")
-                
-                // Read the rest of the HTTP response
-                val buffer = StringBuilder()
-                buffer.append(firstByte.toChar())
-                
-                // Read until we get double CRLF (end of HTTP headers)
-                var lastChars = ""
-                while (true) {
-                    val b = input.read()
-                    if (b == -1) break
-                    
-                    val char = b.toChar()
-                    buffer.append(char)
-                    lastChars += char
-                    
-                    // Keep only last 4 characters
-                    if (lastChars.length > 4) {
-                        lastChars = lastChars.substring(1)
-                    }
-                    
-                    // Check for end of HTTP headers
-                    if (lastChars == "\r\n\r\n") {
-                        break
-                    }
-                }
-                
-                val response = buffer.toString()
-                logDebug("HTTP response received: $response")
-                return response
-            }
-            
-            // Otherwise, treat as WebSocket frame
-            logDebug("Reading WebSocket frame...")
-            
-            val secondByte = input.read()
-            if (secondByte == -1) {
-                logWarning("End of stream while reading payload length")
-                return null
-            }
-            
-            val fin = (firstByte and 0x80) != 0
-            val opcode = firstByte and 0x0F
-            val masked = (secondByte and 0x80) != 0
-            var payloadLength = (secondByte and 0x7F).toLong()
-            
-            logDebug("WebSocket frame: fin=$fin, opcode=$opcode, masked=$masked, initial_length=$payloadLength")
-            
-            // Handle different WebSocket frame types
-            when (opcode) {
-                0 -> {
-                    // Continuation frame - part of fragmented message
-                    logDebug("Received WebSocket continuation frame")
-                    if (!framingInProgress) {
-                        logWarning("Received continuation frame but no fragmentation in progress")
-                        return readMooMessage(input) // Skip this frame and read next
-                    }
-                }
-                1, 2 -> {
-                    // Text or binary frame - start of new message
-                    logDebug("Received WebSocket data frame")
-                    if (framingInProgress) {
-                        logWarning("Starting new frame while fragmentation in progress, resetting buffer")
-                        frameBuffer?.reset()
-                        framingInProgress = false
-                    }
-                    expectedFrameType = opcode
-                }
-                8 -> {
-                    // Close frame
-                    logWarning("Received WebSocket close frame")
-                    return null
-                }
-                9 -> {
-                    // Ping frame
-                    logDebug("Received WebSocket ping frame")
-                }
-                10 -> {
-                    // Pong frame
-                    logDebug("Received WebSocket pong frame")
-                }
-                else -> {
-                    logWarning("Unknown WebSocket opcode: $opcode")
-                }
-            }
-            
-            // Handle extended payload length
-            if (payloadLength == 126L) {
-                val byte1 = input.read()
-                val byte2 = input.read()
-                if (byte1 == -1 || byte2 == -1) return null
-                payloadLength = ((byte1 shl 8) or byte2).toLong()
-            } else if (payloadLength == 127L) {
-                // 64-bit length (not expected for Roon)
-                for (i in 0..7) {
-                    if (input.read() == -1) return null
-                }
-                logWarning("64-bit payload length not supported")
-                return null
-            }
-            
-            // Read mask key if present (server shouldn't send masked frames)
-            if (masked) {
-                for (i in 0..3) {
-                    if (input.read() == -1) return null
-                }
-            }
-            
-            // Read payload only for data frames and continuation frames
-            if (opcode == 0 || opcode == 1 || opcode == 2) {
-                if (payloadLength > Int.MAX_VALUE) {
-                    logError("Payload too large: $payloadLength")
-                    return null
-                }
-                
-                val payload = ByteArray(payloadLength.toInt())
-                var totalRead = 0
-                while (totalRead < payloadLength) {
-                    val bytesRead = input.read(payload, totalRead, (payloadLength - totalRead).toInt())
-                    if (bytesRead == -1) {
-                        logWarning("End of stream while reading payload")
-                        return null
-                    }
-                    totalRead += bytesRead
-                }
-                
-                logDebug("WebSocket payload read: ${payload.size} bytes")
-                
-                // Handle frame reassembly for fragmented messages
-                if (opcode == 1 || opcode == 2) {
-                    // Start of new message
-                    if (!fin) {
-                        // This is the first frame of a fragmented message
-                        logDebug("Starting fragmented message reassembly")
-                        frameBuffer = ByteArrayOutputStream()
-                        frameBuffer!!.write(payload)
-                        framingInProgress = true
-                        return readMooMessage(input) // Continue reading next frame
-                    } else {
-                        // Complete single frame message
-                        return processCompleteMessage(payload, opcode)
-                    }
-                } else if (opcode == 0) {
-                    // Continuation frame
-                    if (frameBuffer == null) {
-                        frameBuffer = ByteArrayOutputStream()
-                    }
-                    frameBuffer!!.write(payload)
-                    
-                    if (fin) {
-                        // This is the final frame, reassemble complete message
-                        logDebug("Fragmented message reassembly complete")
-                        val completePayload = frameBuffer!!.toByteArray()
-                        frameBuffer!!.close()
-                        frameBuffer = null
-                        framingInProgress = false
-                        
-                        return processCompleteMessage(completePayload, expectedFrameType)
-                    } else {
-                        // More frames to come
-                        logDebug("Continuing fragmented message reassembly")
-                        return readMooMessage(input) // Continue reading next frame
-                    }
-                }
-            }
-            
-            // Handle close frames specially
-            if (opcode == 8) {
-                logWarning("Connection closed by server")
-                return null
-            }
-            
-            // For other frame types (ping, pong, etc), continue reading
-            logDebug("Non-data frame, continuing to read...")
-            return readMooMessage(input)
-            
-        } catch (e: Exception) {
-            logError("Failed to read MOO message: ${e.message}", e)
-            // Reset frame buffer on error
-            frameBuffer?.close()
-            frameBuffer = null
-            framingInProgress = false
-            return null
-        }
-    }
-    
-    private fun processCompleteMessage(payload: ByteArray, frameType: Int): String {
-        logDebug("Processing complete message: ${payload.size} bytes, frameType=$frameType")
-        
-        // For binary frame types (2) or when payload starts with binary markers, preserve as binary
-        if (frameType == 2 || isBinaryData(payload)) {
-            logDebug("Processing as binary data")
-            // Use ISO-8859-1 to preserve binary data without corruption
-            return String(payload, Charsets.ISO_8859_1)
-        } else {
-            // Text frame - safe to use UTF-8
-            return String(payload, Charsets.UTF_8)
-        }
-    }
-    
-    private fun isBinaryData(payload: ByteArray): Boolean {
-        // Check for common binary markers
-        if (payload.size >= 2) {
-            val firstTwo = (payload[0].toInt() and 0xFF) to (payload[1].toInt() and 0xFF)
-            // JPEG marker (FF D8)
-            if (firstTwo.first == 0xFF && firstTwo.second == 0xD8) return true
-            // PNG marker (89 50)
-            if (firstTwo.first == 0x89 && firstTwo.second == 0x50) return true
-        }
-        
-        // Check for high percentage of non-printable characters
-        var nonPrintable = 0
-        val sampleSize = minOf(100, payload.size)
-        for (i in 0 until sampleSize) {
-            val byte = payload[i].toInt() and 0xFF
-            if (byte < 32 && byte != 9 && byte != 10 && byte != 13) {
-                nonPrintable++
-            }
-        }
-        
-        return (nonPrintable.toFloat() / sampleSize) > 0.3
-    }
-    
-}
