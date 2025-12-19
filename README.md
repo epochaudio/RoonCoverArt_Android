@@ -31,7 +31,7 @@
    - The app follows `info → register → subscribe` flow and caches the token for future auto-login.
 
 ### 📦 Version History
-- **2.15 (Latest)**:
+- **2.17 (Latest)**:
   - **Protocol Hardening**: Integrated `SimpleWebSocketClient` with synchronous handshake logic for more reliable connections.
   - **Moo Protocol**: Implemented `MooParser` and `MooMessage` for robust message parsing and handling.
   - **Stability**: Fixed race conditions during Roon Core discovery and registration phases.
@@ -77,7 +77,7 @@
 - **状态提示**：底部状态栏展示连接、授权、区域选择等细节，出现告警（网络中断、区域失效）时便于定位。
 
 ### 📦 版本信息
-- **2.15 (Latest)**:
+- **2.17 (Latest)**:
   - **协议强化**: 引入 `SimpleWebSocketClient` 配合同步握手逻辑，连接更稳定。
   - **Moo 协议**: 实现 `MooParser` 和 `MooMessage`，提升消息解析的安全性和准确性。
   - **稳定性修复**: 修复了 Roon Core 发现与注册阶段的竞态条件问题。
