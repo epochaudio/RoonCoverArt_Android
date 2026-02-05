@@ -19,12 +19,17 @@ class SimpleWebSocketClient(
     
     companion object {
         private const val DEBUG_ENABLED = true
+        private const val FRAME_VERBOSE_LOG = false
         private const val LOG_TAG = "RoonPlayer"
     }
     
     // Logging methods for SimpleWebSocketClient
     private fun logDebug(message: String) {
         if (DEBUG_ENABLED) android.util.Log.d(LOG_TAG, message)
+    }
+
+    private fun logFrameVerbose(message: String) {
+        if (DEBUG_ENABLED && FRAME_VERBOSE_LOG) android.util.Log.d(LOG_TAG, message)
     }
     
     private fun logInfo(message: String) {
@@ -38,6 +43,14 @@ class SimpleWebSocketClient(
     private fun logError(message: String, e: Exception? = null) {
         if (DEBUG_ENABLED) android.util.Log.e(LOG_TAG, message, e)
     }
+
+    private fun logLifecycle(event: String, details: String = "") {
+        if (details.isBlank()) {
+            logInfo("[WS][$event]")
+        } else {
+            logInfo("[WS][$event] $details")
+        }
+    }
     
     fun isConnected(): Boolean = connected
     
@@ -49,7 +62,7 @@ class SimpleWebSocketClient(
     
     @Throws(Exception::class)
     fun connect() {
-        logDebug("SimpleWebSocketClient.connect() to $host:$port using WebSocket protocol")
+        logLifecycle("CONNECT_START", "$host:$port")
         try {
             // Ensure previous connection is cleaned up
             disconnect()
@@ -118,7 +131,7 @@ class SimpleWebSocketClient(
                 
                 val response = headerBuffer.toString()
                 if (response.contains("101 Switching Protocols")) {
-                    logDebug("✅ WebSocket handshake successful")
+                    logLifecycle("CONNECT_OK", "$host:$port")
                     connected = true
                     
                     // Reset timeout for normal operation
@@ -132,7 +145,7 @@ class SimpleWebSocketClient(
                 // 开始监听MOO消息
                 scope.launch {
                     try {
-                        logDebug("Starting MOO message listener loop")
+                        logLifecycle("LOOP_START")
                         
                         // Give a short delay to let the connection stabilize
                         delay(10)
@@ -150,10 +163,9 @@ class SimpleWebSocketClient(
                                         continue
                                     }
                                     
-                                    logDebug("Received MOO message (${message.length} chars)")
                                     onMessage(message)
                                 } else {
-                                    logWarning("Received null message (EOF), connection closed by remote peer")
+                                    logWarning("[WS][REMOTE_EOF] connection closed by remote peer")
                                     break
                                 }
                             } catch (e: java.net.SocketTimeoutException) {
@@ -161,20 +173,20 @@ class SimpleWebSocketClient(
                                 continue
                             } catch (e: java.io.IOException) {
                                 if (connected) {
-                                    logError("IO error in message loop: ${e.message}")
+                                    logError("[WS][LOOP_IO_ERROR] ${e.message}")
                                     break
                                 }
                             } catch (e: Exception) {
                                 if (connected && e !is CancellationException) {
-                                    logError("Unexpected error in message loop: ${e.message}", e)
+                                    logError("[WS][LOOP_UNEXPECTED_ERROR] ${e.message}", e)
                                 }
                                 break
                             }
                         }
-                        logDebug("MOO message listener loop ended")
+                        logLifecycle("LOOP_END")
                     } catch (e: Exception) {
                         if (e !is CancellationException) {
-                            logError("MOO message listening failed: ${e.message}", e)
+                            logError("[WS][LOOP_FAILED] ${e.message}", e)
                         }
                     } finally {
                         if (connected) {
@@ -185,7 +197,7 @@ class SimpleWebSocketClient(
                 }
             }
         } catch (e: Exception) {
-            logError("MOO connection failed: ${e.message}", e)
+            logError("[WS][CONNECT_FAIL] ${e.message}", e)
             connected = false
             throw e
         }
@@ -194,9 +206,9 @@ class SimpleWebSocketClient(
     fun send(message: String) {
         socket?.let { sock ->
             try {
-                logDebug("Sending raw TCP message: $message")
+                logFrameVerbose("Sending raw TCP message: $message")
                 val messageBytes = message.toByteArray(Charsets.UTF_8)
-                logDebug("Message bytes (${messageBytes.size}): ${messageBytes.joinToString(" ") { "%02x".format(it) }}")
+                logFrameVerbose("Message bytes (${messageBytes.size}): ${messageBytes.joinToString(" ") { "%02x".format(it) }}")
                 
                 val outputStream = sock.getOutputStream()
                 outputStream.write(messageBytes)
@@ -218,7 +230,7 @@ class SimpleWebSocketClient(
     fun sendWebSocketFrame(message: String) {
         socket?.let { sock ->
             try {
-                logDebug("Sending WebSocket frame: $message")
+                logFrameVerbose("Sending WebSocket frame: $message")
                 val messageBytes = message.toByteArray(Charsets.UTF_8)
                 
                 // Create WebSocket frame (simple text frame)
@@ -275,6 +287,7 @@ class SimpleWebSocketClient(
     }
     
     fun disconnect() {
+        logLifecycle("DISCONNECT")
         connected = false
         try {
             socket?.close()
@@ -340,8 +353,6 @@ class SimpleWebSocketClient(
             }
             
             // Otherwise, treat as WebSocket frame
-            logDebug("Reading WebSocket frame...")
-            
             val secondByte = input.read()
             if (secondByte == -1) {
                 logWarning("End of stream while reading payload length")
@@ -353,13 +364,13 @@ class SimpleWebSocketClient(
             val masked = (secondByte and 0x80) != 0
             var payloadLength = (secondByte and 0x7F).toLong()
             
-            logDebug("WebSocket frame: fin=$fin, opcode=$opcode, masked=$masked, initial_length=$payloadLength")
+            logFrameVerbose("WebSocket frame: fin=$fin, opcode=$opcode, masked=$masked, initial_length=$payloadLength")
             
             // Handle different WebSocket frame types
             when (opcode) {
                 0 -> {
                     // Continuation frame - part of fragmented message
-                    logDebug("Received WebSocket continuation frame")
+                    logFrameVerbose("Received WebSocket continuation frame")
                     if (!framingInProgress) {
                         logWarning("Received continuation frame but no fragmentation in progress")
                         return readMooMessage(input) // Skip this frame and read next
@@ -367,7 +378,6 @@ class SimpleWebSocketClient(
                 }
                 1, 2 -> {
                     // Text or binary frame - start of new message
-                    logDebug("Received WebSocket data frame")
                     if (framingInProgress) {
                         logWarning("Starting new frame while fragmentation in progress, resetting buffer")
                         frameBuffer?.reset()
@@ -377,16 +387,16 @@ class SimpleWebSocketClient(
                 }
                 8 -> {
                     // Close frame
-                    logWarning("Received WebSocket close frame")
+                    logWarning("[WS][REMOTE_CLOSE_FRAME] close frame received")
                     return null
                 }
                 9 -> {
                     // Ping frame
-                    logDebug("Received WebSocket ping frame")
+                    logFrameVerbose("Received WebSocket ping frame")
                 }
                 10 -> {
                     // Pong frame
-                    logDebug("Received WebSocket pong frame")
+                    logFrameVerbose("Received WebSocket pong frame")
                 }
                 else -> {
                     logWarning("Unknown WebSocket opcode: $opcode")
@@ -433,14 +443,14 @@ class SimpleWebSocketClient(
                     totalRead += bytesRead
                 }
                 
-                logDebug("WebSocket payload read: ${payload.size} bytes")
+                logFrameVerbose("WebSocket payload read: ${payload.size} bytes")
                 
                 // Handle frame reassembly for fragmented messages
                 if (opcode == 1 || opcode == 2) {
                     // Start of new message
                     if (!fin) {
                         // This is the first frame of a fragmented message
-                        logDebug("Starting fragmented message reassembly")
+                        logFrameVerbose("Starting fragmented message reassembly")
                         frameBuffer = ByteArrayOutputStream()
                         frameBuffer!!.write(payload)
                         framingInProgress = true
@@ -458,7 +468,7 @@ class SimpleWebSocketClient(
                     
                     if (fin) {
                         // This is the final frame, reassemble complete message
-                        logDebug("Fragmented message reassembly complete")
+                        logFrameVerbose("Fragmented message reassembly complete")
                         val completePayload = frameBuffer!!.toByteArray()
                         frameBuffer!!.close()
                         frameBuffer = null
@@ -467,7 +477,6 @@ class SimpleWebSocketClient(
                         return processCompleteMessage(completePayload, expectedFrameType)
                     } else {
                         // More frames to come
-                        logDebug("Continuing fragmented message reassembly")
                         return readMooMessage(input) // Continue reading next frame
                     }
                 }
@@ -475,12 +484,11 @@ class SimpleWebSocketClient(
             
             // Handle close frames specially
             if (opcode == 8) {
-                logWarning("Connection closed by server")
+                logWarning("[WS][REMOTE_CLOSED] connection closed by server")
                 return null
             }
             
             // For other frame types (ping, pong, etc), continue reading
-            logDebug("Non-data frame, continuing to read...")
             return readMooMessage(input)
             
         } catch (e: java.net.SocketTimeoutException) {
@@ -499,11 +507,8 @@ class SimpleWebSocketClient(
     }
     
     private fun processCompleteMessage(payload: ByteArray, frameType: Int): String {
-        logDebug("Processing complete message: ${payload.size} bytes, frameType=$frameType")
-        
         // For binary frame types (2) or when payload starts with binary markers, preserve as binary
         if (frameType == 2 || isBinaryData(payload)) {
-            logDebug("Processing as binary data")
             // Use ISO-8859-1 to preserve binary data without corruption
             return String(payload, Charsets.ISO_8859_1)
         } else {
