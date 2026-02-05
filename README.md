@@ -35,6 +35,9 @@
   - **Protocol Hardening**: Integrated `SimpleWebSocketClient` with synchronous handshake logic for more reliable connections.
   - **Moo Protocol**: Implemented `MooParser` and `MooMessage` for robust message parsing and handling.
   - **Stability**: Fixed race conditions during Roon Core discovery and registration phases.
+  - **Reconnect Reliability**: Added in-flight guard and auto-reconnect policy to reduce duplicate connect/register flows.
+  - **Zone Selection**: Added `ZoneSelectionUseCase` and `ZoneConfigRepository` for safer fallback when stored zone is invalid.
+  - **Logging Hygiene**: Reduced WebSocket per-frame log noise and kept lifecycle logs (`CONNECT_START/OK/FAIL`, `LOOP_START/END`, `DISCONNECT`) for troubleshooting.
   - **Art Wall**: Optimized for server-side random image API, improving performance and variety.
   - **Architecture**: Unified WebSocket client and registration flow; added `core_id` token management and auto-migration.
 - **2.13**:
@@ -81,8 +84,53 @@
   - **协议强化**: 引入 `SimpleWebSocketClient` 配合同步握手逻辑，连接更稳定。
   - **Moo 协议**: 实现 `MooParser` 和 `MooMessage`，提升消息解析的安全性和准确性。
   - **稳定性修复**: 修复了 Roon Core 发现与注册阶段的竞态条件问题。
+  - **重连可靠性**: 增加连接防重与自动重连策略，降低重复连接/重复注册概率。
+  - **Zone 选择治理**: 增加 `ZoneSelectionUseCase` 与 `ZoneConfigRepository`，存量 Zone 失效时可安全回退。
+  - **日志止血**: 大幅降低 WebSocket 逐帧日志噪声，保留关键生命周期日志（连接开始/成功/失败、循环开始/结束、断开）。
   - **艺术墙优化**: 适配服务端随机图片 API，提升加载效率与内容多样性。
   - **架构统一**: 统一 WebSocket 客户端与注册流程；引入 core_id Token 管理与自动迁移。
+
+### 🧭 架构审查与改造路线（2026-02）
+#### 审查背景
+- 目标：识别逻辑重复、冗余和高风险错误，制定“先止血后重构”的低风险路线。
+- 范围：
+  - `app/src/main/java/com/example/roonplayer/MainActivity.kt`
+  - `app/src/main/java/com/example/roonplayer/api/RoonApiSettings.kt`
+  - `app/src/main/java/com/example/roonplayer/network/*`
+- 方法：静态审查 + 编译验证（`./gradlew :app:compileDebugKotlin`）。
+
+#### 关键问题分级
+- `P0`：
+  - Zone 失效时缺少回退，导致有可用 Zone 仍可能“无内容”。
+  - 健康监控生命周期不闭合，断开后可能继续监控旧连接。
+  - 重连入口并发，`connect()` 防重不足，可能重复连接/注册。
+  - `token` 持久化读取链路分叉（`core_id` 与 host 口径不一致）。
+- `P1`：
+  - 部分后台线程直接写 UI。
+  - Zone 配置逻辑在 `MainActivity` 与 `RoonApiSettings` 重复实现。
+  - `TrackState/UIState/控件直写` 并行，破坏单一事实源。
+- `P2`：
+  - 冗余/死路径较多。
+  - 存在无效空值保护写法（如 `sendMoo(): Unit` 后接 Elvis）。
+
+#### 最小风险改造清单（提交粒度）
+- 阶段 A（先止血）：
+  - `A1` Zone 失效回退
+  - `A2` 健康监控生命周期绑定
+  - `A3` 连接去重与并发防护
+  - `A4` UI 主线程写入收口
+  - `A5` 配对数据读取一致化
+- 阶段 B（后重构）：
+  - `B1` 提取 `ZoneConfigRepository`
+  - `B2` 提取 `ZoneSelectionUseCase`
+  - `B3` 连接编排收敛
+  - `B4` 状态模型收口（单一事实源）
+  - `B5` 清理死代码与历史分支
+  - `B6` 补齐回归测试（Zone 回退、连接防重、token 迁移、监控生命周期）
+
+#### 当前实施进度
+- 已完成：`A1-A5`、`B1-B6`（含核心 JVM 单测）。
+- 本轮补充：WebSocket 日志止血（关闭逐帧噪声，保留生命周期日志）。
 
 ### 🤝 支持
 若有问题或建议：
