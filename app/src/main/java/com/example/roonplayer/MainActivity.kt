@@ -41,14 +41,31 @@ import android.view.KeyEvent
 import android.media.AudioManager
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import com.example.roonplayer.application.DiscoveredCoreEndpoint
+import com.example.roonplayer.application.DiscoveryOrchestrator
+import com.example.roonplayer.api.ConnectionHistoryRepository
+import com.example.roonplayer.api.PairedCoreRepository
 import com.example.roonplayer.api.RoonApiSettings
+import com.example.roonplayer.api.TokenMigrationStatus
 import com.example.roonplayer.api.ZoneConfigRepository
+import com.example.roonplayer.config.AppRuntimeConfig
+import com.example.roonplayer.config.RuntimeConfigOverrideRepository
+import com.example.roonplayer.config.RuntimeConfigResolution
+import com.example.roonplayer.config.RuntimeConfigResolver
 import com.example.roonplayer.domain.AutoReconnectPolicy
+import com.example.roonplayer.domain.ConnectionRecoveryStrategy
+import com.example.roonplayer.domain.ConnectionRoutingUseCase
+import com.example.roonplayer.domain.ConnectionProbeUseCase
+import com.example.roonplayer.domain.DiscoveryCandidateUseCase
+import com.example.roonplayer.domain.DiscoveryExecutionUseCase
 import com.example.roonplayer.domain.InFlightOperationGuard
+import com.example.roonplayer.domain.PairedCoreSnapshot
+import com.example.roonplayer.domain.ZoneSnapshot
 import com.example.roonplayer.domain.ZoneSelectionUseCase
 import com.example.roonplayer.network.RoonConnectionValidator
 import com.example.roonplayer.network.SimplifiedConnectionHelper
@@ -56,13 +73,16 @@ import com.example.roonplayer.network.SmartConnectionManager
 import com.example.roonplayer.network.NetworkReadinessDetector
 import com.example.roonplayer.network.ConnectionHealthMonitor
 import com.example.roonplayer.network.SimpleWebSocketClient
+import com.example.roonplayer.network.SoodDiscoveryClient
+import com.example.roonplayer.network.SoodProtocolCodec
 import kotlin.concurrent.withLock
 
 class MainActivity : Activity() {
     
     companion object {
         private const val PERMISSION_REQUEST_CODE = 123
-        private const val MAX_CACHED_IMAGES = 900
+        private const val STATUS_AUTO_CONNECT_LAST_PAIRED = "正在自动连接到上次配对的Roon Core..."
+        private const val STATUS_START_AUTO_DISCOVERY = "未找到已配对的Core，正在自动发现..."
         private val REQUIRED_PERMISSIONS = arrayOf(
             android.Manifest.permission.ACCESS_FINE_LOCATION,
             android.Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -75,17 +95,25 @@ class MainActivity : Activity() {
         private const val DEBUG_ENABLED = false
         private const val LOG_TAG = "RoonPlayer"
         
-        // Roon WebSocket connection constants
-        const val ROON_WS_PORT: Int = 9330
+        // Roon WebSocket path
         const val ROON_WS_PATH: String = "/api"
         
         // Extension registration constants
         private const val EXTENSION_ID = "com.epochaudio.coverartandroid"
         private const val DISPLAY_NAME = "CoverArt_Android"
-        private const val DISPLAY_VERSION = "2.17"
+        private const val DISPLAY_VERSION = "2.18"
         private const val PUBLISHER = "门耳朵制作"
         private const val EMAIL = "wuzhengdong12138@gmail.com"
     }
+
+    private lateinit var runtimeConfig: AppRuntimeConfig
+    private lateinit var runtimeConfigResolution: RuntimeConfigResolution
+    private val connectionConfig get() = runtimeConfig.connection
+    private val discoveryNetworkConfig get() = runtimeConfig.discoveryNetwork
+    private val discoveryTimingConfig get() = runtimeConfig.discoveryTiming
+    private val uiTimingConfig get() = runtimeConfig.uiTiming
+    private val cacheConfig get() = runtimeConfig.cache
+    private val webSocketPort get() = connectionConfig.webSocketPort
     
     // Screen types for responsive design
     enum class ScreenType {
@@ -112,8 +140,8 @@ class MainActivity : Activity() {
     // Multi-click detection for media keys
     private var lastPlayPauseKeyTime = 0L
     private var playPauseClickCount = 0
-    private val MULTI_CLICK_TIME_DELTA = 400L // 400ms for multi-click detection
-    private val SINGLE_CLICK_DELAY = 600L // 600ms delay for single click execution
+    private val multiClickTimeDeltaMs get() = uiTimingConfig.multiClickTimeDeltaMs
+    private val singleClickDelayMs get() = uiTimingConfig.singleClickDelayMs
     private var playPauseHandler: Handler? = null
     private var pendingPlayPauseAction: Runnable? = null
     
@@ -291,6 +319,12 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun nextRequestId(): Int {
+        // 请求可能从多个协程并发发出，使用原子递增保证 Request-Id 唯一，
+        // 避免响应关联到错误请求。
+        return requestIdGenerator.getAndIncrement()
+    }
+
     private fun renderState(state: TrackState) {
         if (::statusText.isInitialized) statusText.text = state.statusText
         if (::trackText.isInitialized) trackText.text = state.trackText
@@ -364,16 +398,23 @@ class MainActivity : Activity() {
     private var currentHostInput: String = ""
     
     private var webSocketClient: SimpleWebSocketClient? = null
-    private val connectionValidator = RoonConnectionValidator()
-    private val connectionHelper = SimplifiedConnectionHelper(connectionValidator)
+    private lateinit var connectionValidator: RoonConnectionValidator
+    private lateinit var connectionHelper: SimplifiedConnectionHelper
     private val zoneSelectionUseCase = ZoneSelectionUseCase()
+    private val connectionRoutingUseCase = ConnectionRoutingUseCase()
+    private val connectionProbeUseCase = ConnectionProbeUseCase()
+    private val discoveryExecutionUseCase = DiscoveryExecutionUseCase()
+    private val discoveryOrchestrator = DiscoveryOrchestrator(discoveryExecutionUseCase)
+    private lateinit var discoveryCandidateUseCase: DiscoveryCandidateUseCase
+    private val soodProtocolCodec = SoodProtocolCodec()
+    private val soodDiscoveryClient = SoodDiscoveryClient(soodProtocolCodec)
     
     // Manual CoroutineScope bound to Activity lifecycle
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
     private lateinit var smartConnectionManager: SmartConnectionManager
     private lateinit var healthMonitor: ConnectionHealthMonitor
-    private var requestId = 1
+    private val requestIdGenerator = AtomicInteger(1)
     private val infoRequestSent = AtomicBoolean(false)
     private val connectionGuard = InFlightOperationGuard()
     private val discoveryGuard = InFlightOperationGuard()
@@ -384,6 +425,8 @@ class MainActivity : Activity() {
     private val discoveredCores = ConcurrentHashMap<String, RoonCoreInfo>()
     private lateinit var sharedPreferences: SharedPreferences
     private lateinit var zoneConfigRepository: ZoneConfigRepository
+    private lateinit var connectionHistoryRepository: ConnectionHistoryRepository
+    private lateinit var pairedCoreRepository: PairedCoreRepository
     private var multicastLock: WifiManager.MulticastLock? = null
     private var authDialogShown = false
     private var autoReconnectAttempted = false
@@ -436,12 +479,12 @@ class MainActivity : Activity() {
     private lateinit var artWallGrid: GridLayout
     private val artWallImages = Array<ImageView?>(15) { null }  // 远距离观看优化：横屏3x5，竖屏5x3
     private var artWallTimer: Timer? = null
-    private val ART_WALL_DELAY = 2000L // 2秒
-    private val ART_WALL_UPDATE_INTERVAL = 60000L // 60秒
+    private val artWallUpdateIntervalMs get() = uiTimingConfig.artWallUpdateIntervalMs
+    private val artWallStatsLogDelayMs get() = uiTimingConfig.artWallStatsLogDelayMs
     
     // 延迟切换到艺术墙模式相关
     private var delayedArtWallTimer: Timer? = null
-    private val DELAYED_ART_WALL_SWITCH_DELAY = 5000L // 5秒延迟
+    private val delayedArtWallSwitchDelayMs get() = uiTimingConfig.delayedArtWallSwitchDelayMs
     private var isPendingArtWallSwitch = false
     
     // 艺术墙轮换优化相关变量
@@ -456,17 +499,18 @@ class MainActivity : Activity() {
     private var rotationRound: Int = 0                                       // 当前轮换轮次计数
     
     // 内存管理相关
-    private val maxDisplayCache = 15                                         // 最大显示缓存数量
-    private val maxPreloadCache = 5                                          // 最大预加载缓存数量
+    private val maxCachedImages get() = cacheConfig.maxCachedImages
+    private val maxDisplayCache get() = cacheConfig.maxDisplayCache
+    private val maxPreloadCache get() = cacheConfig.maxPreloadCache
     private val displayImageCache = LinkedHashMap<String, Bitmap>()          // LRU显示图片缓存
     private val preloadImageCache = LinkedHashMap<String, Bitmap>()          // LRU预加载图片缓存
-    private val memoryThreshold = 50 * 1024 * 1024                          // 内存阈值50MB
+    private val memoryThreshold get() = cacheConfig.memoryThresholdBytes
     
     data class RoonCoreInfo(
         val ip: String,
         val name: String,
         val version: String = "Unknown",
-        val port: Int = ROON_WS_PORT,
+        val port: Int,
         val lastSeen: Long = System.currentTimeMillis(),
         val successCount: Int = 0
     )
@@ -507,6 +551,9 @@ class MainActivity : Activity() {
         
         sharedPreferences = getSharedPreferences("CoverArt", Context.MODE_PRIVATE)
         zoneConfigRepository = ZoneConfigRepository(sharedPreferences)
+        connectionHistoryRepository = ConnectionHistoryRepository(sharedPreferences)
+        pairedCoreRepository = PairedCoreRepository(sharedPreferences)
+        initializeRuntimeConfiguration()
         
         // Initialize message processor for sequential handling
         initializeMessageProcessor()
@@ -529,8 +576,8 @@ class MainActivity : Activity() {
         checkAndRequestPermissions()
         
         // Try auto-reconnect first, then start discovery if that fails
-        GlobalScope.launch(Dispatchers.IO) {
-            delay(2000) // Wait for UI to load
+        activityScope.launch(Dispatchers.IO) {
+            delay(uiTimingConfig.startupUiSettleDelayMs)
             
             if (!tryAutoReconnect()) {
                 logDebug("🔍 Starting discovery")
@@ -566,7 +613,7 @@ class MainActivity : Activity() {
             // 检查是否有已配对的核心
             if (pairedCores.isNotEmpty()) {
                 // 使用智能连接管理器，等待网络就绪后自动连接
-                GlobalScope.launch(Dispatchers.IO) {
+                activityScope.launch(Dispatchers.IO) {
                     // 尝试连接最近成功的核心
                     val lastSuccessfulCore = getLastSuccessfulConnection()
                     if (lastSuccessfulCore != null) {
@@ -593,10 +640,8 @@ class MainActivity : Activity() {
                         mainHandler.post {
                             updateStatus("正在搜索Roon Core...")
                         }
-                        GlobalScope.launch(Dispatchers.IO) {
-                            if (!tryAutoReconnect()) {
-                                startAutomaticDiscoveryAndPairing()
-                            }
+                        if (!tryAutoReconnect()) {
+                            startAutomaticDiscoveryAndPairing()
                         }
                     }
                 }
@@ -610,7 +655,7 @@ class MainActivity : Activity() {
         logDebug("🔧 Initializing message processor for sequential handling")
         
         // Start the message processing thread that consumes from our custom queue
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
                 while (!messageProcessor.isShutdown) {
                     try {
@@ -792,7 +837,7 @@ class MainActivity : Activity() {
     }
     
     private fun cleanupOldCache() {
-        while (imageCache.size > MAX_CACHED_IMAGES) {
+        while (imageCache.size > maxCachedImages) {
             val oldestEntry = imageCache.entries.first()
             val file = File(oldestEntry.value)
             if (file.exists()) {
@@ -1024,8 +1069,24 @@ class MainActivity : Activity() {
         
         setContentView(mainLayout)
         
-        smartConnectionManager = SmartConnectionManager(this)
-        healthMonitor = ConnectionHealthMonitor()
+        smartConnectionManager = SmartConnectionManager(
+            context = this,
+            connectionValidator = connectionValidator,
+            defaultPort = connectionConfig.webSocketPort,
+            maxRetryAttempts = connectionConfig.smartRetryMaxAttempts,
+            initialRetryDelayMs = connectionConfig.smartRetryInitialDelayMs,
+            maxRetryDelayMs = connectionConfig.smartRetryMaxDelayMs,
+            networkReadyTimeoutMs = connectionConfig.networkReadyTimeoutMs,
+            networkReadyPollIntervalMs = connectionConfig.networkReadyPollIntervalMs,
+            networkConnectivityCheckTimeoutMs = connectionConfig.networkConnectivityCheckTimeoutMs,
+            networkTestHost = connectionConfig.networkTestHost,
+            networkTestPort = connectionConfig.networkTestPort
+        )
+        healthMonitor = ConnectionHealthMonitor(
+            connectionValidator = connectionValidator,
+            defaultCheckIntervalMs = connectionConfig.healthCheckIntervalMs,
+            quickCheckIntervalMs = connectionConfig.healthQuickCheckIntervalMs
+        )
         
         logDebug("✅ Layout creation completed")
     }
@@ -1567,7 +1628,7 @@ class MainActivity : Activity() {
     }
     
     private fun loadRandomAlbumCovers() {
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             val cachedImages = getCachedImagePaths()
             if (cachedImages.isEmpty()) {
                 logDebug("No cached images available for art wall")
@@ -1607,7 +1668,7 @@ class MainActivity : Activity() {
     
     // 艺术墙轮换优化：扫描所有本地图片路径
     private fun initializeAllImagePaths() {
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
                 val imagePaths = mutableListOf<String>()
                 
@@ -1639,11 +1700,11 @@ class MainActivity : Activity() {
                 
                 logDebug("🎨 Art wall optimization initialized: ${allImagePaths.size} images found")
             
-            // 输出优化统计信息
-            GlobalScope.launch(Dispatchers.Main) {
-                delay(3000) // 等待3秒确保初始化完成
-                logOptimizationStats()
-            }
+                // 输出优化统计信息
+                activityScope.launch(Dispatchers.Main) {
+                    delay(artWallStatsLogDelayMs)
+                    logOptimizationStats()
+                }
             } catch (e: Exception) {
                 logDebug("❌ Error initializing image paths: ${e.message}")
             }
@@ -1814,7 +1875,7 @@ class MainActivity : Activity() {
     }
     
     private fun updateRandomArtWallImages() {
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
                 logDebug("🔄 Starting art wall rotation update...")
                 
@@ -1891,7 +1952,7 @@ class MainActivity : Activity() {
     
     // 安全地加载图片并显示
     private fun loadImageSafely(imagePath: String, position: Int) {
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
                 // 检查文件是否存在
                 if (!File(imagePath).exists()) {
@@ -2007,7 +2068,7 @@ class MainActivity : Activity() {
                         updateRandomArtWallImages()
                     }
                 }
-            }, ART_WALL_UPDATE_INTERVAL, ART_WALL_UPDATE_INTERVAL)
+            }, artWallUpdateIntervalMs, artWallUpdateIntervalMs)
         }
     }
     
@@ -2047,7 +2108,7 @@ class MainActivity : Activity() {
                         isPendingArtWallSwitch = false
                     }
                 }
-            }, DELAYED_ART_WALL_SWITCH_DELAY)
+            }, delayedArtWallSwitchDelayMs)
         }
     }
     
@@ -2062,7 +2123,7 @@ class MainActivity : Activity() {
     }
     
     private fun updateBackgroundColor(bitmap: Bitmap) {
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             val dominantColor = extractDominantColor(bitmap)
             currentDominantColor = dominantColor
             
@@ -2237,98 +2298,74 @@ class MainActivity : Activity() {
     private fun parseHostPortInput(hostPort: String): Pair<String, Int> {
         return if (hostPort.contains(":")) {
             val parts = hostPort.split(":")
-            parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: ROON_WS_PORT)
+            parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: webSocketPort)
         } else {
-            hostPort to ROON_WS_PORT
+            hostPort to webSocketPort
         }
     }
 
-    private fun findHostPortByCoreId(coreId: String): String? {
-        var matchedHostPort: String? = null
-        var latestConnectionTime = Long.MIN_VALUE
+    private fun initializeRuntimeConfiguration() {
+        val overrideRepository = RuntimeConfigOverrideRepository(sharedPreferences)
+        val overrides = overrideRepository.loadOverrides()
+        runtimeConfigResolution = RuntimeConfigResolver(
+            defaults = AppRuntimeConfig.defaults()
+        ).resolve(
+            overrides = overrides,
+            sourceName = RuntimeConfigOverrideRepository.SOURCE_NAME
+        )
+        runtimeConfig = runtimeConfigResolution.config
 
-        for ((key, value) in sharedPreferences.all) {
-            if (!key.startsWith("roon_core_id_")) continue
-            if (value != coreId) continue
+        // 为什么先解析配置再初始化依赖：
+        // 连接验证器和发现策略会捕获构造参数，必须使用最终生效配置创建，避免“配置已覆盖但对象仍用默认值”。
+        connectionValidator = RoonConnectionValidator(
+            defaultPort = connectionConfig.webSocketPort,
+            defaultTimeoutMs = connectionConfig.tcpConnectTimeoutMs
+        )
+        connectionHelper = SimplifiedConnectionHelper(
+            connectionValidator = connectionValidator,
+            defaultPort = connectionConfig.webSocketPort
+        )
+        discoveryCandidateUseCase = DiscoveryCandidateUseCase(runtimeConfig.discoveryPolicy)
 
-            val hostPort = key.removePrefix("roon_core_id_")
-            val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0L)
-            if (lastConnected >= latestConnectionTime) {
-                latestConnectionTime = lastConnected
-                matchedHostPort = hostPort
-            }
-        }
-
-        return matchedHostPort
+        logRuntimeConfigSnapshot(runtimeConfigResolution)
     }
-    
+
+    private fun logRuntimeConfigSnapshot(resolution: RuntimeConfigResolution) {
+        android.util.Log.i(
+            LOG_TAG,
+            "[CONFIG] source=${resolution.sourceName}, overrides=${resolution.overrides.size}, warnings=${resolution.warnings.size}"
+        )
+        for (line in resolution.snapshotLines()) {
+            android.util.Log.i(LOG_TAG, "[CONFIG] $line")
+        }
+        for (override in resolution.overrides) {
+            android.util.Log.i(
+                LOG_TAG,
+                "[CONFIG][override] ${override.key}: raw=${override.rawValue}, applied=${override.appliedValue}, source=${override.source}"
+            )
+        }
+        for (warning in resolution.warnings) {
+            android.util.Log.w(LOG_TAG, "[CONFIG][warning] $warning")
+        }
+    }
+
     private fun loadPairedCores() {
         pairedCores.clear()
+        val records = pairedCoreRepository.loadPairedCores(
+            defaultPort = webSocketPort,
+            isValidHost = ::isValidHost,
+            fallbackLastSuccessful = connectionHistoryRepository.getLastSuccessfulConnectionState()
+        )
 
-        // Load all saved tokens and create paired core info
-        val allPrefs = sharedPreferences.all
-        fun upsertPairedCore(hostPort: String, token: String, coreId: String, lastConnected: Long) {
-            val (host, port) = parseHostPortInput(hostPort)
-
-            if (!isValidHost(host)) {
-                logDebug("⚠️ Skipping paired core with invalid host: $host")
-                return
-            }
-
-            val existing = pairedCores[hostPort]
-            if (existing != null && existing.lastConnected > lastConnected) {
-                return
-            }
-
+        for ((hostPort, record) in records) {
             pairedCores[hostPort] = PairedCoreInfo(
-                ip = host,
-                port = port,
-                token = token,
-                coreId = coreId,
-                lastConnected = lastConnected
+                ip = record.host,
+                port = record.port,
+                token = record.token,
+                coreId = record.coreId,
+                lastConnected = record.lastConnected
             )
-
-            logDebug("Loaded paired core: $hostPort (last connected: $lastConnected, coreId: $coreId)")
-        }
-
-        // Legacy host-based token keys
-        for ((key, value) in allPrefs) {
-            if (!key.startsWith("roon_core_token_")) continue
-            if (key.startsWith("roon_core_token_by_core_id_")) continue
-            if (value !is String) continue
-
-            val hostPort = key.removePrefix("roon_core_token_")
-            val coreId = sharedPreferences.getString("roon_core_id_$hostPort", "") ?: ""
-            val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0L)
-            upsertPairedCore(hostPort, value, coreId, lastConnected)
-        }
-
-        // New core_id-based token keys
-        for ((key, value) in allPrefs) {
-            if (!key.startsWith("roon_core_token_by_core_id_")) continue
-            if (value !is String) continue
-
-            val coreId = key.removePrefix("roon_core_token_by_core_id_")
-            var hostPort = findHostPortByCoreId(coreId)
-            if (hostPort == null) {
-                val lastHost = sharedPreferences.getString("last_successful_host", null)
-                val lastPort = sharedPreferences.getInt("last_successful_port", 0)
-                if (!lastHost.isNullOrBlank() && lastPort > 0) {
-                    hostPort = "$lastHost:$lastPort"
-                }
-            }
-
-            if (hostPort == null) {
-                logDebug("⚠️ Core-id token found but no host mapping: $coreId")
-                continue
-            }
-
-            val lastConnected = sharedPreferences.getLong(
-                "roon_last_connected_by_core_id_$coreId",
-                sharedPreferences.getLong("last_connection_time", 0L)
-            )
-
-            upsertPairedCore(hostPort, value, coreId, lastConnected)
+            logDebug("Loaded paired core: $hostPort (last connected: ${record.lastConnected}, coreId: ${record.coreId})")
         }
     }
     
@@ -2339,20 +2376,24 @@ class MainActivity : Activity() {
         }
 
         logDebug("Starting automatic discovery and pairing")
-        
-        // First try to reconnect to previously paired cores
-        if (pairedCores.isNotEmpty()) {
-            val lastPairedCore = pairedCores.values.maxByOrNull { it.lastConnected }
-            if (lastPairedCore != null) {
-                logDebug("Attempting auto-reconnection to ${lastPairedCore.ip}:${lastPairedCore.port}")
+
+        when (val strategy = connectionRoutingUseCase.strategyForDiscoveryStartup(toPairedCoreSnapshots())) {
+            is ConnectionRecoveryStrategy.Connect -> {
+                logDebug("Attempting auto-reconnection to ${strategy.target.host}:${strategy.target.port}")
                 startConnectionTo(
-                    ip = lastPairedCore.ip,
-                    port = lastPairedCore.port,
-                    delayMs = 1000,
-                    statusMessage = "正在自动连接到上次配对的Roon Core..."
+                    ip = strategy.target.host,
+                    port = strategy.target.port,
+                    delayMs = connectionConfig.autoConnectDelayMs,
+                    statusMessage = STATUS_AUTO_CONNECT_LAST_PAIRED
                 )
                 discoveryGuard.finish()
                 return
+            }
+            ConnectionRecoveryStrategy.Discover -> {
+                // 继续后面的自动发现流程
+            }
+            ConnectionRecoveryStrategy.NoOp -> {
+                // discovery 启动路径理论不会返回 NoOp，保底进入发现流程。
             }
         }
         
@@ -2363,33 +2404,35 @@ class MainActivity : Activity() {
         discoveredCores.clear()
         multicastLock?.acquire()
         
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
-                // Start network scanning
-                scanNetwork()
-                
-                // Wait for discovery results
-                delay(8000)
-                
-                // If SOOD fails, try direct port detection
-                if (discoveredCores.isEmpty()) {
-                    logDebug("SOOD failed, trying direct port detection")
-                    tryDirectPortDetection()
+                val orchestrationResult = discoveryOrchestrator.runAutomaticDiscovery(
+                    runPrimaryScan = { scanNetwork() },
+                    runFallbackScan = {
+                        logDebug("SOOD failed, trying direct port detection")
+                        tryDirectPortDetection()
+                    },
+                    getDiscoveredCores = {
+                        discoveredCores.values.map { core ->
+                            DiscoveredCoreEndpoint(ip = core.ip, port = core.port)
+                        }
+                    },
+                    waitAfterPrimaryMs = discoveryTimingConfig.activeSoodListenWindowMs,
+                    waitAfterFallbackMs = discoveryTimingConfig.directDetectionWaitMs
+                )
+                if (orchestrationResult.execution.fallbackTriggered) {
+                    logDebug("Discovery fallback path executed")
                 }
-                
-                // Wait a bit more for direct detection
-                delay(3000)
                 
                 mainHandler.post {
                     multicastLock?.release()
-                    
-                    if (discoveredCores.isNotEmpty()) {
-                        // Automatically connect to the first discovered core
-                        val firstCore = discoveredCores.values.first()
-                        logDebug("Auto-connecting to discovered core: ${firstCore.ip}:${firstCore.port}")
+
+                    val selectedCore = orchestrationResult.selectedCore
+                    if (selectedCore != null) {
+                        logDebug("Auto-connecting to discovered core: ${selectedCore.ip}:${selectedCore.port}")
                         startConnectionTo(
-                            ip = firstCore.ip,
-                            port = firstCore.port,
+                            ip = selectedCore.ip,
+                            port = selectedCore.port,
                             statusMessage = "发现Roon Core，正在自动连接..."
                         )
                     } else {
@@ -2416,35 +2459,40 @@ class MainActivity : Activity() {
     }
 
     private fun attemptAutoReconnection() {
-        if (autoReconnectAttempted || pairedCores.isEmpty()) {
-            return
-        }
-        
-        autoReconnectAttempted = true
-        
-        // Find the most recently connected core
-        val lastPairedCore = pairedCores.values.maxByOrNull { it.lastConnected }
-        if (lastPairedCore != null) {
-            logDebug("Attempting auto-reconnection to ${lastPairedCore.ip}:${lastPairedCore.port}")
-            startConnectionTo(
-                ip = lastPairedCore.ip,
-                port = lastPairedCore.port,
-                delayMs = 1000,
-                statusMessage = "正在自动连接到上次配对的Roon Core..."
-            )
-        } else {
-            // No previously paired cores, try discovery
-            logDebug("No paired cores found, starting auto-discovery")
-            updateStatus("未找到已配对的Core，正在自动发现...")
-            mainHandler.postDelayed({
-                startAutomaticDiscoveryAndPairing()
-            }, 2000)
+        when (val strategy = connectionRoutingUseCase.strategyForAutoReconnection(
+            autoReconnectAlreadyAttempted = autoReconnectAttempted,
+            pairedCores = toPairedCoreSnapshots()
+        )) {
+            ConnectionRecoveryStrategy.NoOp -> return
+            is ConnectionRecoveryStrategy.Connect -> {
+                autoReconnectAttempted = true
+                logDebug("Attempting auto-reconnection to ${strategy.target.host}:${strategy.target.port}")
+                startConnectionTo(
+                    ip = strategy.target.host,
+                    port = strategy.target.port,
+                    delayMs = connectionConfig.autoConnectDelayMs,
+                    statusMessage = STATUS_AUTO_CONNECT_LAST_PAIRED
+                )
+            }
+            ConnectionRecoveryStrategy.Discover -> {
+                autoReconnectAttempted = true
+                logDebug("No paired cores found, starting auto-discovery")
+                updateStatus(STATUS_START_AUTO_DISCOVERY)
+                mainHandler.postDelayed({
+                    startAutomaticDiscoveryAndPairing()
+                }, connectionConfig.autoDiscoveryDelayMs)
+            }
         }
     }
     
     private fun saveIP(ip: String) {
         sharedPreferences.edit().putString("last_roon_ip", ip).apply()
     }
+
+    private data class AnnouncementCandidate(
+        val primaryPort: Int,
+        val detectionMethod: String
+    )
     
     private suspend fun scanNetwork() {
         logDebug("Starting SOOD discovery")
@@ -2479,27 +2527,24 @@ class MainActivity : Activity() {
             mainHandler.post {
                 updateStatus("尝试已保存的连接...")
             }
-            
-            for ((ip, port) in savedConnections) {
-                logDebug("Testing saved connection: $ip:$port")
-                if (testConnection(ip, port)) {
-                    logDebug("✅ Reconnected to saved Core: $ip:$port")
-                    val coreInfo = RoonCoreInfo(
-                        ip = ip,
-                        name = "Roon Core (已保存)",
-                        version = "Saved",
-                        port = port
-                    )
-                    discoveredCores["$ip:$port"] = coreInfo
-                    
-                    // Update last successful connection time
-                    saveSuccessfulConnection(ip, port)
-                    
-                    mainHandler.post {
-                        updateStatus("✅ 重连成功: $ip:$port")
-                    }
-                    return // Found saved connection! Skip full scan
-                }
+
+            val savedMatch = connectionProbeUseCase.firstMatchFromSavedConnections(
+                savedConnections = savedConnections
+            ) { target ->
+                logDebug("Testing saved connection: ${target.ip}:${target.port}")
+                testConnection(target.ip, target.port)
+            }
+            if (savedMatch != null) {
+                logDebug("✅ Reconnected to saved Core: ${savedMatch.ip}:${savedMatch.port}")
+                recordDiscoveredCore(
+                    ip = savedMatch.ip,
+                    port = savedMatch.port,
+                    name = "Roon Core (已保存连接)",
+                    version = "Saved",
+                    detectionMethod = "saved-history",
+                    statusMessage = "✅ 重连成功: ${savedMatch.ip}:${savedMatch.port}"
+                )
+                return // Found saved connection! Skip full scan
             }
             
             logDebug("⚠️ Saved connections failed, starting network scan")
@@ -2513,107 +2558,49 @@ class MainActivity : Activity() {
             }
         }
         
-        // Full network scan (for first time or when saved connections fail)
-        val priorityIPs = if (isFirstTime) {
-            // First time: comprehensive scan
-            listOf(
-                gateway,
-                "$networkBase.1",      // Router alternative
-                "$networkBase.100",    // Common static ranges
-                "$networkBase.101",
-                "$networkBase.150",
-                "$networkBase.196",    // Known working from logs
-                "$networkBase.200"
-            ).distinct()
-        } else {
-            // Saved connections failed: focused scan
-            listOf(
-                "$networkBase.196",    // Previous working IP
-                "$networkBase.100",
-                "$networkBase.200"
-            ).distinct().filter { it != gateway }
-        }
-        
-        // Enhanced port discovery - comprehensive range based on Roon documentation
-        val roonPorts = if (isFirstTime) {
-            // Full range discovery for first time - include all possible Roon ports
-            listOf(9100, 9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108, 9109, 9110, 
-                   9120, 9130, 9140, 9150, 9160, 9170, 9180, 9190, 9200,
-                   ROON_WS_PORT, 9331, 9332, 9333, 9334, 9335, 9336, 9337, 9338, 9339)
-        } else {
-            // Quick reconnect - prioritize known working ports
-            listOf(9100, ROON_WS_PORT, 9332, 9001, 9002)
-        }
+        val discoveryTargets = discoveryCandidateUseCase.directPortDetectionTargets(
+            networkBase = networkBase,
+            gateway = gateway,
+            isFirstTime = isFirstTime
+        )
+        val priorityIPs = discoveryTargets.ipCandidates
+        val roonPorts = discoveryTargets.portCandidates
         
         for (ip in priorityIPs) {
+            var foundOnCurrentIp = false
             for (port in roonPorts) {
                 try {
                     if (testConnection(ip, port)) {
                         logDebug("Found potential Roon Core at $ip:$port")
-                        
-                        // According to Roon API docs, all connections use WebSocket
-                        // Both ROON_WS_PORT and 9332 are valid WebSocket ports
-                        // Save this successful connection for future use
-                        saveSuccessfulConnection(ip, port)
-                        
-                        if (port == ROON_WS_PORT) {
-                            // Port ROON_WS_PORT is the standard WebSocket API port
-                            val coreInfo = RoonCoreInfo(
-                                ip = ip,
-                                name = "Roon Core (API)",
-                                version = "TCP-Detected", 
-                                port = ROON_WS_PORT
-                            )
-                            discoveredCores["$ip:ROON_WS_PORT"] = coreInfo
-                            
-                            mainHandler.post {
-                                updateStatus("✅ 发现Roon Core: $ip:ROON_WS_PORT")
-                            }
-                            break // Found standard port, stop searching this IP
-                        } else if (port == 9332) {
-                            // Port 9332 is alternative WebSocket port
-                            val coreInfo = RoonCoreInfo(
-                                ip = ip,
-                                name = "Roon Core (Alt)",
-                                version = "TCP-Detected",
-                                port = 9332
-                            )
-                            discoveredCores["$ip:9332"] = coreInfo
-                            
-                            mainHandler.post {
-                                updateStatus("✅ 发现Roon Core: $ip:9332")
-                            }
-                            break // Found alternative port, stop searching this IP
-                        } else if (port == 9100) {
-                            // Port 9100 for first-time comprehensive scan
-                            val coreInfo = RoonCoreInfo(
-                                ip = ip,
-                                name = "Roon Core (9100)",
-                                version = "TCP-Detected",
-                                port = 9100
-                            )
-                            discoveredCores["$ip:9100"] = coreInfo
-                            
-                            mainHandler.post {
-                                updateStatus("✅ 发现Roon Core: $ip:9100")
-                            }
-                            break // Found port, stop searching this IP
-                        }
+
+                        recordDiscoveredCore(
+                            ip = ip,
+                            port = port,
+                            name = "Roon Core (直接探测)",
+                            version = "TCP-Detected",
+                            detectionMethod = "tcp-direct-probe"
+                        )
+                        foundOnCurrentIp = true
+                        break
                     }
                 } catch (e: Exception) {
                     // Continue to next IP/port
                 }
             }
             
+            if (foundOnCurrentIp) {
+                continue
+            }
+
             // Small delay to avoid overwhelming the network
-            delay(100)
+            delay(discoveryTimingConfig.networkScanIntervalMs)
         }
     }
     
     private fun testConnection(ip: String, port: Int): Boolean {
     return try {
         Socket().use { socket ->
-            socket.connect(InetSocketAddress(ip, port), 1000) // Reduced timeout to 1 second
+            socket.connect(InetSocketAddress(ip, port), connectionConfig.tcpConnectTimeoutMs)
         }
         logDebug("Connection successful: $ip:$port")
         true
@@ -2625,34 +2612,40 @@ class MainActivity : Activity() {
     
     // Efficient Roon Core discovery by listening to Core's multicast announcements
     private suspend fun listenForRoonCoreAnnouncements() {
+        var multicastSocket: MulticastSocket? = null
+        var udpSocket: DatagramSocket? = null
+        var roonMulticastGroup: InetAddress? = null
+
         try {
             logDebug("🎯 Starting efficient Roon Core discovery - listening for Core announcements")
             
             // Create multicast socket to listen for Roon Core's announcements
-            val multicastSocket = MulticastSocket(9003)
-            multicastSocket.reuseAddress = true
+            multicastSocket = MulticastSocket(discoveryNetworkConfig.discoveryPort).apply {
+                reuseAddress = true
+            }
             
             // Join the official Roon multicast group
-            val roonMulticastGroup = InetAddress.getByName("239.255.90.90")
+            roonMulticastGroup = InetAddress.getByName(discoveryNetworkConfig.multicastGroup)
             multicastSocket.joinGroup(roonMulticastGroup)
             
-            logDebug("📡 Joined Roon multicast group 239.255.90.90:9003")
+            logDebug("📡 Joined Roon multicast group ${discoveryNetworkConfig.multicastGroup}:${discoveryNetworkConfig.discoveryPort}")
             logDebug("🔊 Listening for Roon Core announcements...")
             
             // Also listen on regular UDP socket for broader coverage
-            val udpSocket = DatagramSocket(null)
-            udpSocket.reuseAddress = true
-            udpSocket.bind(InetSocketAddress(9003))
+            udpSocket = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(discoveryNetworkConfig.discoveryPort))
+            }
             
             val buffer = ByteArray(2048)
             val udpBuffer = ByteArray(2048)
-            multicastSocket.soTimeout = 2000 // 2 second timeout per check
-            udpSocket.soTimeout = 2000
+            multicastSocket.soTimeout = discoveryTimingConfig.announcementSocketTimeoutMs
+            udpSocket.soTimeout = discoveryTimingConfig.announcementSocketTimeoutMs
             
             val startTime = System.currentTimeMillis()
             var foundAny = false
             
-            while (System.currentTimeMillis() - startTime < 20000) { // Listen for 20 seconds total
+            while (System.currentTimeMillis() - startTime < discoveryTimingConfig.announcementListenWindowMs) {
                 try {
                     // Check multicast socket
                     try {
@@ -2696,11 +2689,6 @@ class MainActivity : Activity() {
                 }
             }
             
-            udpSocket.close()
-            
-            multicastSocket.leaveGroup(roonMulticastGroup)
-            multicastSocket.close()
-            
             if (!foundAny) {
                 logWarning("⚠️ No Roon Core announcements received, falling back to active discovery")
                 logDebug("🔍 Will try active SOOD queries and network scanning")
@@ -2720,6 +2708,26 @@ class MainActivity : Activity() {
             logError("❌ Failed to listen for Roon Core announcements: ${e.message}")
             // Fallback to active discovery
             performActiveSoodDiscovery()
+        } finally {
+            // 为什么在 finally 里统一释放：
+            // 发现循环有多条异常与回退路径，只有集中回收才能避免 socket 长时间占用端口。
+            try {
+                if (multicastSocket != null && roonMulticastGroup != null) {
+                    multicastSocket.leaveGroup(roonMulticastGroup)
+                }
+            } catch (leaveGroupError: Exception) {
+                logWarning("Failed to leave multicast group: ${leaveGroupError.message}")
+            }
+            try {
+                udpSocket?.close()
+            } catch (closeUdpError: Exception) {
+                logWarning("Failed to close UDP socket: ${closeUdpError.message}")
+            }
+            try {
+                multicastSocket?.close()
+            } catch (closeMulticastError: Exception) {
+                logWarning("Failed to close multicast socket: ${closeMulticastError.message}")
+            }
         }
     }
     
@@ -2730,88 +2738,42 @@ class MainActivity : Activity() {
             logDebug("🔍 Parsing announcement from $sourceIP")
             logDebug("📝 Raw string: ${dataString.take(200)}")
             logDebug("📝 Hex dump: ${data.take(100).joinToString(" ") { "%02x".format(it) }}")
-            
-            // More aggressive detection - ANY traffic on 9003 is potentially interesting
-            var isRoonRelated = false
-            var detectionMethod = "unknown"
-            
-            // Check various Roon indicators
-            if (dataString.contains("roon", ignoreCase = true)) {
-                isRoonRelated = true
-                detectionMethod = "text-roon"
-            } else if (dataString.contains("RAAT", ignoreCase = true)) {
-                isRoonRelated = true
-                detectionMethod = "text-RAAT"
-            } else if (dataString.contains("RoonCore", ignoreCase = true)) {
-                isRoonRelated = true
-                detectionMethod = "text-RoonCore"
-            } else if (data.size > 4 && data[0] == 'S'.code.toByte() && data[1] == 'O'.code.toByte()) {
-                isRoonRelated = true
-                detectionMethod = "SOOD-protocol"
-            } else if (data.size > 10) {
-                // Any non-trivial UDP traffic on port 9003 might be Roon
-                isRoonRelated = true
-                detectionMethod = "port-9003-traffic"
+
+            val candidate = extractAnnouncementCandidate(data, dataString)
+            if (candidate == null) {
+                logDebug("❌ Announcement ignored (missing strict SOOD fields and no valid fallback port)")
+                return false
             }
-            
-            if (isRoonRelated) {
-                logDebug("🎯 Detected potential Roon traffic from $sourceIP (method: $detectionMethod)")
-                
-                // Extract port information from announcement if available
-                var port = ROON_WS_PORT // Default
-                
-                // Try to parse SOOD response format
-                if (data.size > 6 && data[0] == 'S'.code.toByte() && data[1] == 'O'.code.toByte()) {
-                    val parsedPort = parseSoodResponseForPort(data, sourceIP)
-                    if (parsedPort != null) {
-                        port = parsedPort
-                        logDebug("📊 Extracted port from SOOD: $port")
-                    }
+
+            logDebug("🎯 Valid announcement candidate from $sourceIP via ${candidate.detectionMethod}, primaryPort=${candidate.primaryPort}")
+            val portsToTest = discoveryCandidateUseCase.announcementProbePorts(primaryPort = candidate.primaryPort)
+            logDebug("🔍 Testing ports for $sourceIP: $portsToTest")
+
+            val match = connectionProbeUseCase.firstMatchInMatrix(
+                ipCandidates = listOf(sourceIP),
+                portCandidates = portsToTest,
+                delayBetweenIpMs = 0L
+            ) { target ->
+                logDebug("🔌 Testing connection to ${target.ip}:${target.port}")
+                if (testConnection(target.ip, target.port)) {
+                    true
                 } else {
-                    // Try to extract port from text-based announcement
-                    val portMatch = Regex("port[:\\s]*([0-9]+)", RegexOption.IGNORE_CASE).find(dataString)
-                    if (portMatch != null) {
-                        port = portMatch.groupValues[1].toIntOrNull() ?: ROON_WS_PORT
-                        logDebug("📊 Extracted port from text: $port")
-                    }
+                    logDebug("❌ Connection failed to ${target.ip}:${target.port}")
+                    false
                 }
-                
-                // Test multiple common ports for this IP
-                val portsToTest = listOf(port, 9100, ROON_WS_PORT, 9332, 9001, 9002).distinct()
-                logDebug("🔍 Testing ports for $sourceIP: $portsToTest")
-                
-                for (testPort in portsToTest) {
-                    logDebug("🔌 Testing connection to $sourceIP:$testPort")
-                    if (testConnection(sourceIP, testPort)) {
-                        logInfo("✅ Successfully connected to $sourceIP:$testPort")
-                        
-                        val coreInfo = RoonCoreInfo(
-                            ip = sourceIP,
-                            name = "Roon Core ($detectionMethod)",
-                            version = "Detected",
-                            port = testPort,
-                            lastSeen = System.currentTimeMillis()
-                        )
-                        
-                        discoveredCores["$sourceIP:$testPort"] = coreInfo
-                        saveSuccessfulConnection(sourceIP, testPort)
-                        
-                        withContext(Dispatchers.Main) {
-                            updateStatus("✅ 发现Roon Core: $sourceIP:$testPort")
-                        }
-                        
-                        logConnectionEvent("DISCOVERY", "INFO", "Core detected via $detectionMethod", 
-                            "IP: $sourceIP, Port: $testPort, Method: $detectionMethod")
-                        
-                        return true
-                    } else {
-                        logDebug("❌ Connection failed to $sourceIP:$testPort")
-                    }
-                }
-            } else {
-                logDebug("❌ No Roon indicators found in announcement from $sourceIP")
             }
-            
+            if (match != null) {
+                logInfo("✅ Successfully connected to ${match.ip}:${match.port}")
+                recordDiscoveredCore(
+                    ip = match.ip,
+                    port = match.port,
+                    name = "Roon Core (${candidate.detectionMethod})",
+                    version = "Detected",
+                    detectionMethod = candidate.detectionMethod
+                )
+                return true
+            }
+
             return false
             
         } catch (e: Exception) {
@@ -2824,114 +2786,40 @@ class MainActivity : Activity() {
     private suspend fun performActiveSoodDiscovery() {
         try {
             logDebug("🔍 Performing active SOOD discovery as fallback")
-            
-            val socket = DatagramSocket()
-            socket.broadcast = true
-            socket.reuseAddress = true
-            
-            // SOOD query message
-            val serviceId = "00720724-5143-4a9b-abac-0e50cba674bb"
-            val queryServiceIdBytes = "query_service_id".toByteArray()
-            val serviceIdBytes = serviceId.toByteArray()
-            
-            val query = ByteArray(4 + 1 + 1 + 1 + queryServiceIdBytes.size + 1 + serviceIdBytes.size)
-            var index = 0
-            
-            // Build SOOD query
-            query[index++] = 'S'.code.toByte()
-            query[index++] = 'O'.code.toByte()
-            query[index++] = 'O'.code.toByte()
-            query[index++] = 'D'.code.toByte()
-            query[index++] = 2.toByte() // Version
-            query[index++] = 'Q'.code.toByte() // Query type
-            query[index++] = queryServiceIdBytes.size.toByte()
-            System.arraycopy(queryServiceIdBytes, 0, query, index, queryServiceIdBytes.size)
-            index += queryServiceIdBytes.size
-            query[index++] = serviceIdBytes.size.toByte()
-            System.arraycopy(serviceIdBytes, 0, query, index, serviceIdBytes.size)
-            
-            // Send to key addresses only
             val addresses = listOf(
-                InetAddress.getByName("239.255.90.90"), // Official Roon multicast
-                InetAddress.getByName("255.255.255.255") // Broadcast
+                InetAddress.getByName(discoveryNetworkConfig.multicastGroup), // Official Roon multicast
+                InetAddress.getByName(discoveryNetworkConfig.broadcastAddress) // Broadcast
             )
-            
-            for (address in addresses) {
-                try {
-                    val packet = DatagramPacket(query, query.size, address, 9003)
-                    socket.send(packet)
-                    logDebug("📤 Sent SOOD query to $address")
-                } catch (e: Exception) {
-                    logError("❌ Failed to send SOOD query to $address: ${e.message}")
-                }
-            }
-            
-            // Listen for responses
-            val responseBuffer = ByteArray(1024)
-            socket.soTimeout = 8000 // 8 second timeout
-            
-            val startTime = System.currentTimeMillis()
-            while (System.currentTimeMillis() - startTime < 8000) {
-                try {
-                    val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
-                    socket.receive(responsePacket)
-                    
-                    val response = responsePacket.data.sliceArray(0 until responsePacket.length)
-                    if (response.isNotEmpty()) {
-                        logDebug("📨 SOOD response from ${responsePacket.address.hostAddress}")
-                        parseSoodResponse(response, responsePacket.address.hostAddress ?: "unknown")
+
+            soodDiscoveryClient.discover(
+                serviceId = discoveryNetworkConfig.soodServiceId,
+                targets = addresses,
+                discoveryPort = discoveryNetworkConfig.discoveryPort,
+                socketTimeoutMs = discoveryTimingConfig.activeSoodSocketTimeoutMs,
+                listenWindowMs = discoveryTimingConfig.activeSoodListenWindowMs,
+                onResponse = { payload, sourceIp ->
+                    if (payload.isNotEmpty()) {
+                        logDebug("📨 SOOD response from $sourceIp")
+                        parseSoodResponse(payload, sourceIp)
                     }
-                } catch (e: SocketTimeoutException) {
-                    break
-                } catch (e: Exception) {
-                    logError("❌ SOOD receive error: ${e.message}")
-                    break
+                },
+                onLog = { message ->
+                    logDebug("📤 $message")
+                },
+                onError = { message, error ->
+                    if (error != null) {
+                        logError("❌ $message: ${error.message}", error)
+                    } else {
+                        logError("❌ $message")
+                    }
                 }
-            }
-            
-            socket.close()
+            )
+
             logDebug("✅ Active SOOD discovery completed")
             
         } catch (e: Exception) {
             logError("❌ Active SOOD discovery failed: ${e.message}")
         }
-    }
-    
-    // Helper function to parse SOOD response for port information
-    private fun parseSoodResponseForPort(data: ByteArray, ip: String): Int? {
-        try {
-            if (data.size >= 6 && 
-                data[0] == 'S'.code.toByte() && 
-                data[1] == 'O'.code.toByte() && 
-                data[2] == 'O'.code.toByte() && 
-                data[3] == 'D'.code.toByte()) {
-                
-                var index = 6 // Skip SOOD header + version + type
-                while (index < data.size - 1) {
-                    val keyLength = data[index].toInt() and 0xFF
-                    if (index + 1 + keyLength >= data.size) break
-                    
-                    val key = String(data, index + 1, keyLength, Charsets.UTF_8)
-                    index += 1 + keyLength
-                    
-                    if (index >= data.size) break
-                    val valueLength = data[index].toInt() and 0xFF
-                    if (index + 1 + valueLength > data.size) break
-                    
-                    val value = String(data, index + 1, valueLength, Charsets.UTF_8)
-                    index += 1 + valueLength
-                    
-                    if (key.equals("http_port", ignoreCase = true) || 
-                        key.equals("port", ignoreCase = true) ||
-                        key.equals("ws_port", ignoreCase = true)) {
-                        return value.toIntOrNull()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            logError("Error parsing SOOD port info: ${e.message}")
-        }
-        return null
     }
     
     // Direct scanning of known network ranges as last resort
@@ -2948,63 +2836,54 @@ class MainActivity : Activity() {
             
             logDebug("🌐 Local network: $networkBase.x (Local: $localIP, Gateway: $gateway)")
             
-            // Scan current network first
-            val ipsToScan = mutableListOf<String>()
-            
-            // Add current network range (priority IPs)
-            ipsToScan.addAll(listOf(
-                gateway,
-                "$networkBase.1", "$networkBase.2", "$networkBase.10",
-                "$networkBase.100", "$networkBase.101", "$networkBase.102",
-                "$networkBase.196", "$networkBase.200", "$networkBase.254"
-            ))
-            
-            // Add common network ranges
-            val commonNetworks = listOf("192.168.0", "192.168.1", "10.0.0", "10.1.0")
-            for (network in commonNetworks) {
-                if (network != networkBase) {
-                    ipsToScan.addAll(listOf(
-                        "$network.1", "$network.2", "$network.100", "$network.196"
-                    ))
-                }
-            }
+            val scanTargets = discoveryCandidateUseCase.knownRangeScanTargets(
+                networkBase = networkBase,
+                gateway = gateway
+            )
+            val ipsToScan = scanTargets.ipCandidates
             
             logDebug("🎯 Scanning ${ipsToScan.size} priority IPs")
             
-            val portsToTest = listOf(9100, ROON_WS_PORT, 9332, 9001, 9002)
-            
-            for (ip in ipsToScan.distinct()) {
-                for (port in portsToTest) {
-                    try {
-                        logDebug("🔍 Testing $ip:$port")
-                        if (testConnection(ip, port)) {
-                            logInfo("✅ Found potential Roon Core at $ip:$port")
-                            
-                            val coreInfo = RoonCoreInfo(
-                                ip = ip,
-                                name = "Roon Core (Scanned)",
-                                version = "Direct-Scan",
-                                port = port,
-                                lastSeen = System.currentTimeMillis()
-                            )
-                            
-                            discoveredCores["$ip:$port"] = coreInfo
-                            saveSuccessfulConnection(ip, port)
-                            
-                            withContext(Dispatchers.Main) {
-                                updateStatus("✅ 发现Roon Core: $ip:$port")
-                            }
-                            
-                            logConnectionEvent("DISCOVERY", "INFO", "Core found via direct scan", 
-                                "IP: $ip, Port: $port, Method: Direct-Scan")
-                            
-                            // Found one, can stop scanning
-                            return
-                        }
-                    } catch (e: Exception) {
-                        logDebug("❌ Scan failed for $ip:$port - ${e.message}")
-                    }
+            val portsToTest = scanTargets.portCandidates
+
+            val match = connectionProbeUseCase.firstMatchInMatrix(
+                ipCandidates = ipsToScan,
+                portCandidates = portsToTest,
+                delayBetweenIpMs = 0L
+            ) { target ->
+                try {
+                    logDebug("🔍 Testing ${target.ip}:${target.port}")
+                    testConnection(target.ip, target.port)
+                } catch (e: Exception) {
+                    logDebug("❌ Scan failed for ${target.ip}:${target.port} - ${e.message}")
+                    false
                 }
+            }
+            if (match != null) {
+                logInfo("✅ Found potential Roon Core at ${match.ip}:${match.port}")
+
+                val coreInfo = RoonCoreInfo(
+                    ip = match.ip,
+                    name = "Roon Core (Scanned)",
+                    version = "Direct-Scan",
+                    port = match.port,
+                    lastSeen = System.currentTimeMillis()
+                )
+
+                discoveredCores["${match.ip}:${match.port}"] = coreInfo
+                saveSuccessfulConnection(match.ip, match.port)
+
+                withContext(Dispatchers.Main) {
+                    updateStatus("✅ 发现Roon Core: ${match.ip}:${match.port}")
+                }
+
+                logConnectionEvent(
+                    "DISCOVERY",
+                    "INFO",
+                    "Core found via direct scan",
+                    "IP: ${match.ip}, Port: ${match.port}, Method: Direct-Scan"
+                )
+                return
             }
             
             logWarning("❌ Direct network scanning completed, no Roon Cores found")
@@ -3014,209 +2893,127 @@ class MainActivity : Activity() {
         }
     }
 
-    private suspend fun soodDiscovery() {
-        try {
-            logDebug("Starting SOOD discovery")
-            
-            // Get local network interface info
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val dhcpInfo = wifiManager.dhcpInfo
-            val localIP = intToIp(dhcpInfo.ipAddress)
-            val gateway = intToIp(dhcpInfo.gateway)
-            val networkBase = localIP.substringBeforeLast(".")
-            logDebug("Local IP: $localIP, Gateway: $gateway, Network: $networkBase.x")
-            
-            val socket = DatagramSocket()
-            socket.broadcast = true
-            socket.reuseAddress = true
-            
-            // SOOD query message with official Roon service ID
-            val serviceId = "00720724-5143-4a9b-abac-0e50cba674bb"
-            val queryServiceIdBytes = "query_service_id".toByteArray()
-            val serviceIdBytes = serviceId.toByteArray()
-            
-            // Build proper SOOD query: SOOD + version(2) + type(Q) + key_length + key + value_length + value
-            val query = ByteArray(4 + 1 + 1 + 1 + queryServiceIdBytes.size + 1 + serviceIdBytes.size)
-            var index = 0
-            
-            // SOOD header
-            query[index++] = 'S'.code.toByte()
-            query[index++] = 'O'.code.toByte()
-            query[index++] = 'O'.code.toByte()
-            query[index++] = 'D'.code.toByte()
-            
-            // Version (2)
-            query[index++] = 2.toByte()
-            
-            // Type (Q for query)
-            query[index++] = 'Q'.code.toByte()
-            
-            // Key length and key
-            query[index++] = queryServiceIdBytes.size.toByte()
-            System.arraycopy(queryServiceIdBytes, 0, query, index, queryServiceIdBytes.size)
-            index += queryServiceIdBytes.size
-            
-            // Value length and value
-            query[index++] = serviceIdBytes.size.toByte()
-            System.arraycopy(serviceIdBytes, 0, query, index, serviceIdBytes.size)
-            
-            logDebug("SOOD query bytes: ${query.joinToString(" ") { "%02x".format(it) }}")
-            
-            // Enhanced multi-segment discovery
-            val addresses = mutableListOf(
-                InetAddress.getByName("239.255.90.90"), // Official Roon multicast
-                InetAddress.getByName("255.255.255.255") // Network broadcast
-            )
-            
-            // Add common network segments and broadcast addresses
-            val networkSegments = listOf(
-                "192.168.0", "192.168.1", "192.168.2", "192.168.10", "192.168.11",
-                "10.0.0", "10.0.1", "10.1.0", "172.16.0", "172.16.1"
-            )
-            
-            // Add broadcast addresses for each segment
-            for (segment in networkSegments) {
-                try {
-                    addresses.add(InetAddress.getByName("$segment.255"))
-                } catch (e: Exception) {
-                    logDebug("Invalid broadcast IP: $segment.255")
-                }
-            }
-            
-            // Add known/likely Roon IPs with expanded range
-            val knownIPs = mutableListOf<String>()
-            knownIPs.add("192.168.0.196") // From your logs
-            knownIPs.add(gateway) // Router
-            
-            // Add common ranges for each network segment
-            for (segment in networkSegments) {
-                knownIPs.addAll(listOf(
-                    "$segment.1", "$segment.2", "$segment.10", "$segment.100", 
-                    "$segment.101", "$segment.102", "$segment.200", "$segment.254"
-                ))
-            }
-            
-            for (ip in knownIPs) {
-                try {
-                    addresses.add(InetAddress.getByName(ip))
-                } catch (e: Exception) {
-                    logDebug("Invalid IP for SOOD: $ip")
-                }
-            }
-            
-            for (address in addresses) {
-                try {
-                    val packet = DatagramPacket(query, query.size, address, 9003)
-                    socket.send(packet)
-                    logDebug("Sent SOOD query to $address")
-                } catch (e: Exception) {
-                    logError("Failed to send SOOD query to $address: ${e.message}")
-                }
-            }
-            
-            // Listen for responses for 6 seconds (reduced for faster fallback)
-            socket.soTimeout = 500 // 0.5 second timeout per receive
-            val startTime = System.currentTimeMillis()
-            val maxDuration = 6000 // 6 seconds total
-            
-            try {
-                while (System.currentTimeMillis() - startTime < maxDuration) {
-                    val responseBuffer = ByteArray(1024)
-                    val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
-                    
-                    try {
-                        socket.receive(responsePacket)
-                        val response = responsePacket.data.copyOf(responsePacket.length)
-                        logDebug("SOOD response from ${responsePacket.address.hostAddress}: ${response.joinToString(" ") { "%02x".format(it) }}")
-                        
-                        // Parse SOOD response and extract connection info
-                        parseSoodResponse(response, responsePacket.address.hostAddress ?: "unknown")
-                    } catch (e: java.net.SocketTimeoutException) {
-                        // Continue listening
-                    }
-                }
-            } catch (e: Exception) {
-                logError("SOOD receive error: ${e.message}")
-            }
-            
-            socket.close()
-            logDebug("SOOD discovery completed")
-        } catch (e: Exception) {
-            logError("SOOD discovery failed: ${e.message}", e)
-        }
-    }
-    
     private fun parseSoodResponse(response: ByteArray, ip: String) {
         try {
             logDebug("Parsing SOOD response from $ip: ${response.take(20).joinToString(" ") { "%02x".format(it) }}...")
+
+            val soodMessage = soodProtocolCodec.parseMessage(response)
+            if (soodMessage == null) {
+                logDebug("Not a valid SOOD response")
+                return
+            }
+
+            logDebug("SOOD version: ${soodMessage.version}, type: ${soodMessage.type}")
+            for ((key, value) in soodMessage.properties) {
+                logDebug("SOOD property: $key = $value")
+            }
+
+            // Check if this is a Roon Core response
+            val serviceId = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "service_id")
+            val httpPort = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "http_port")?.toIntOrNull()
+            val uniqueId = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "unique_id")
+            val displayName = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "display_name")
             
-            // Parse SOOD protocol format: SOOD[version][type][key-value pairs]
-            if (response.size >= 6 && 
-                response[0] == 'S'.code.toByte() && 
-                response[1] == 'O'.code.toByte() && 
-                response[2] == 'O'.code.toByte() && 
-                response[3] == 'D'.code.toByte()) {
-                
-                val version = response[4].toInt()
-                val type = response[5].toInt().toChar()
-                
-                logDebug("SOOD version: $version, type: $type")
-                
-                // Parse key-value pairs starting from byte 6
-                var index = 6
-                val properties = mutableMapOf<String, String>()
-                
-                while (index < response.size) {
-                    // Read key length
-                    if (index >= response.size) break
-                    val keyLength = response[index].toInt() and 0xFF
-                    index++
-                    
-                    if (keyLength == 0 || index + keyLength > response.size) break
-                    
-                    // Read key
-                    val key = String(response, index, keyLength)
-                    index += keyLength
-                    
-                    // Read value length
-                    if (index >= response.size) break
-                    val valueLength = response[index].toInt() and 0xFF
-                    index++
-                    
-                    if (valueLength == 0 || index + valueLength > response.size) break
-                    
-                    // Read value  
-                    val value = String(response, index, valueLength)
-                    index += valueLength
-                    
-                    properties[key] = value
-                    logDebug("SOOD property: $key = $value")
-                }
-                
-                // Check if this is a Roon Core response
-                val serviceId = properties["service_id"]
-                val httpPort = properties["http_port"]?.toIntOrNull()
-                val uniqueId = properties["unique_id"]
-                val displayName = properties["display_name"]
-                
-                if (serviceId == "00720724-5143-4a9b-abac-0e50cba674bb" && httpPort != null && uniqueId != null) {
-                    val name = displayName ?: "Roon Core"
-                    val coreInfo = RoonCoreInfo(ip, "$name ($uniqueId)", "SOOD", httpPort)
-                    discoveredCores["$ip:$httpPort"] = coreInfo
-                    
-                    logDebug("Valid Roon Core discovered: $name at $ip:$httpPort (ID: $uniqueId)")
-                    mainHandler.post {
-                        updateStatus("发现Roon Core: $name ($ip:$httpPort)")
-                    }
+            if (serviceId == discoveryNetworkConfig.soodServiceId && httpPort != null) {
+                val name = displayName ?: "Roon Core"
+                val displayCoreName = if (uniqueId != null) {
+                    "$name ($uniqueId)"
                 } else {
-                    logDebug("Not a Roon Core or missing required fields: serviceId=$serviceId, httpPort=$httpPort, uniqueId=$uniqueId")
+                    name
+                }
+                recordDiscoveredCore(
+                    ip = ip,
+                    port = httpPort,
+                    name = displayCoreName,
+                    version = "SOOD",
+                    detectionMethod = "sood-response"
+                )
+                
+                logDebug("Valid Roon Core discovered: $name at $ip:$httpPort (ID: $uniqueId)")
+                mainHandler.post {
+                    updateStatus("发现Roon Core: $name ($ip:$httpPort)")
                 }
             } else {
-                logDebug("Not a valid SOOD response")
+                logDebug("Not a Roon Core or missing required fields: serviceId=$serviceId, httpPort=$httpPort, uniqueId=$uniqueId")
             }
         } catch (e: Exception) {
             logError("Failed to parse SOOD response: ${e.message}", e)
         }
+    }
+
+    private fun extractAnnouncementCandidate(
+        payload: ByteArray,
+        payloadText: String
+    ): AnnouncementCandidate? {
+        val soodMessage = soodProtocolCodec.parseMessage(payload)
+        if (soodMessage != null) {
+            val serviceId = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "service_id")
+            val httpPort = soodProtocolCodec.propertyValueIgnoreCase(soodMessage.properties, "http_port")?.toIntOrNull()
+
+            // 为什么要求 service_id + http_port：
+            // 这是官方发现链路里的强约束字段，满足后才说明该报文可用于后续 ws_connect。
+            if (serviceId == discoveryNetworkConfig.soodServiceId && httpPort != null && httpPort > 0) {
+                return AnnouncementCandidate(
+                    primaryPort = httpPort,
+                    detectionMethod = "SOOD-http_port"
+                )
+            }
+            logDebug("Ignoring SOOD packet without strict fields: serviceId=$serviceId, httpPort=$httpPort")
+        }
+
+        val hasRoonTextSignal = payloadText.contains("roon", ignoreCase = true) ||
+            payloadText.contains("raat", ignoreCase = true) ||
+            payloadText.contains("rooncore", ignoreCase = true)
+        if (!hasRoonTextSignal) {
+            return null
+        }
+
+        // 文本端口只作为兜底：没有严格 SOOD 字段时，允许保守尝试，但不主导主流程决策。
+        val textPort = Regex("port[:\\s]*([0-9]+)", RegexOption.IGNORE_CASE)
+            .find(payloadText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+
+        return textPort?.let {
+            AnnouncementCandidate(
+                primaryPort = it,
+                detectionMethod = "text-port-fallback"
+            )
+        }
+    }
+
+    private fun recordDiscoveredCore(
+        ip: String,
+        port: Int,
+        name: String,
+        version: String,
+        detectionMethod: String,
+        statusMessage: String = "✅ 发现Roon Core: $ip:$port"
+    ) {
+        val normalizedKey = "$ip:$port"
+        val coreInfo = RoonCoreInfo(
+            ip = ip,
+            name = name,
+            version = version,
+            port = port,
+            lastSeen = System.currentTimeMillis()
+        )
+
+        // 为什么统一通过 host:port 键写入：
+        // 发现结果、连接历史、自动重连都依赖同一标识，统一口径可避免“同 Core 多份状态”。
+        discoveredCores[normalizedKey] = coreInfo
+        saveSuccessfulConnection(ip, port)
+        mainHandler.post {
+            updateStatus(statusMessage)
+        }
+        logConnectionEvent(
+            "DISCOVERY",
+            "INFO",
+            "Core detected via $detectionMethod",
+            "IP: $ip, Port: $port, Method: $detectionMethod"
+        )
     }
     
     private fun connect() {
@@ -3275,7 +3072,13 @@ class MainActivity : Activity() {
                 webSocketClient?.disconnect()
                 
                 // 创建WebSocket连接
-                val newClient = SimpleWebSocketClient(host, port) { message ->
+                val newClient = SimpleWebSocketClient(
+                    host = host,
+                    port = port,
+                    connectTimeoutMs = connectionConfig.webSocketConnectTimeoutMs,
+                    handshakeTimeoutMs = connectionConfig.webSocketHandshakeTimeoutMs,
+                    readTimeoutMs = connectionConfig.webSocketReadTimeoutMs
+                ) { message ->
                     handleWebSocketMessage(message)
                 }
                 
@@ -3329,34 +3132,17 @@ class MainActivity : Activity() {
     
     private fun migrateTokenToCoreId(coreId: String) {
         val hostInput = getHostInput()
-        
-        // Check if we already have a core_id-based token
-        val existingToken = sharedPreferences.getString("roon_core_token_by_core_id_$coreId", null)
-        if (existingToken != null) {
-            logDebug("Token already exists for core_id: $coreId, no migration needed")
-            return
-        }
-        
-        // Check if we have an old IP-based token to migrate
-        val oldToken = sharedPreferences.getString("roon_core_token_$hostInput", null)
-        val oldLastConnected = sharedPreferences.getLong("roon_last_connected_$hostInput", 0)
-        
-        if (oldToken != null) {
-            logDebug("Migrating token from IP-based key to core_id: $coreId")
-            
-            val editor = sharedPreferences.edit()
-            // Save with new core_id-based key
-            editor.putString("roon_core_token_by_core_id_$coreId", oldToken)
-            if (oldLastConnected > 0) {
-                editor.putLong("roon_last_connected_by_core_id_$coreId", oldLastConnected)
+
+        when (pairedCoreRepository.migrateLegacyTokenToCoreId(coreId, hostInput)) {
+            TokenMigrationStatus.ALREADY_EXISTS -> {
+                logDebug("Token already exists for core_id: $coreId, no migration needed")
             }
-            
-            // Remove old IP-based keys
-            editor.remove("roon_core_token_$hostInput")
-            editor.remove("roon_last_connected_$hostInput")
-            
-            editor.apply()
-            logDebug("Token migration completed for core_id: $coreId")
+            TokenMigrationStatus.MIGRATED -> {
+                logDebug("Token migration completed for core_id: $coreId")
+            }
+            TokenMigrationStatus.NO_LEGACY_TOKEN -> {
+                logDebug("No legacy token found for host: $hostInput")
+            }
         }
     }
     
@@ -3371,15 +3157,10 @@ class MainActivity : Activity() {
         displayName: String = DISPLAY_NAME,
         displayVersion: String = DISPLAY_VERSION
     ): RegisterRequest {
-        val requestId = this.requestId++
+        val requestId = nextRequestId()
 
         val hostInput = getHostInput()
-        val coreId = sharedPreferences.getString("roon_core_id_$hostInput", null)
-        val savedToken = if (coreId != null) {
-            sharedPreferences.getString("roon_core_token_by_core_id_$coreId", null)
-        } else {
-            sharedPreferences.getString("roon_core_token_$hostInput", null)
-        }
+        val savedToken = pairedCoreRepository.getSavedToken(hostInput)
 
         val body = JSONObject().apply {
             put("extension_id", EXTENSION_ID)
@@ -3512,7 +3293,7 @@ class MainActivity : Activity() {
     
     
     private fun sendInfoRequest() {
-        val requestId = this.requestId++
+        val requestId = nextRequestId()
         
         val mooMessage = buildString {
             append("MOO/1 REQUEST com.roonlabs.registry:1/info\n")
@@ -3756,7 +3537,7 @@ class MainActivity : Activity() {
                 
                 // Save core_id for this host
                 val hostInput = getHostInput()
-                sharedPreferences.edit().putString("roon_core_id_$hostInput", coreId).apply()
+                pairedCoreRepository.saveCoreId(hostInput, coreId)
                 
                 // Now send register message
                 mainHandler.post {
@@ -3786,36 +3567,17 @@ class MainActivity : Activity() {
                 val token = body.getString("token")
                 val hostInput = getHostInput()
                 val currentTime = System.currentTimeMillis()
-                
-                // Get core_id to save token with new scheme
-                val coreId = sharedPreferences.getString("roon_core_id_$hostInput", null)
-                
-                // Save token and last connected time using core_id-based keys
-                val editor = sharedPreferences.edit()
-                if (coreId != null) {
-                    // Use new core_id-based key
-                    editor.putString("roon_core_token_by_core_id_$coreId", token)
-                    editor.putLong("roon_last_connected_by_core_id_$coreId", currentTime)
-                    
-                    // Remove old IP-based token if it exists
-                    editor.remove("roon_core_token_$hostInput")
-                    editor.remove("roon_last_connected_$hostInput")
-                } else {
-                    // Fallback to old scheme if no core_id available
-                    editor.putString("roon_core_token_$hostInput", token)
-                    editor.putLong("roon_last_connected_$hostInput", currentTime)
-                }
-                editor.apply()
+
+                val saveResult = pairedCoreRepository.saveRegistrationToken(
+                    hostInput = hostInput,
+                    token = token,
+                    connectedAt = currentTime
+                )
                 
                 // Update paired cores list
-                val (host, port) = if (hostInput.contains(":")) {
-                    val parts = hostInput.split(":")
-                    parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: ROON_WS_PORT)
-                } else {
-                    hostInput to ROON_WS_PORT
-                }
+                val (host, port) = parseHostPortInput(hostInput)
                 
-                val currentCoreId = coreId ?: ""
+                val currentCoreId = saveResult.coreId ?: ""
                 pairedCores[hostInput] = PairedCoreInfo(
                     ip = host,
                     port = port,
@@ -3827,12 +3589,7 @@ class MainActivity : Activity() {
                 logDebug("✅ Automatic pairing successful! Core: $hostInput")
                 
                 // Track successful connection
-                val (connectionIp, connectionPort) = if (hostInput.contains(":")) {
-                    val parts = hostInput.split(":")
-                    parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: ROON_WS_PORT)
-                } else {
-                    hostInput to ROON_WS_PORT
-                }
+                val (connectionIp, connectionPort) = parseHostPortInput(hostInput)
                 saveSuccessfulConnection(connectionIp, connectionPort)
                 
                 // Reset authorization flag since pairing is successful
@@ -3866,7 +3623,7 @@ class MainActivity : Activity() {
     }
     
     private fun subscribeToTransport() {
-        val requestId = this.requestId++
+        val requestId = nextRequestId()
         
         // Generate a unique subscription key for this transport subscription
         val subscriptionKey = "zones_subscription_${System.currentTimeMillis()}"
@@ -3891,6 +3648,33 @@ class MainActivity : Activity() {
         logDebug("Sending transport subscribe message with subscription_key: $subscriptionKey")
         logDebug("Transport request:\n$mooMessage")
         sendMoo(mooMessage)
+    }
+
+    private fun toZoneSnapshots(zones: Map<String, JSONObject>): Map<String, ZoneSnapshot> {
+        // 这里做一次“协议模型 -> 领域模型”转换，目的是把 JSON 细节留在外层，
+        // 让领域用例只依赖稳定的业务语义（状态、是否有播放信息）。
+        val snapshots = LinkedHashMap<String, ZoneSnapshot>(zones.size)
+        for ((zoneId, zone) in zones) {
+            snapshots[zoneId] = ZoneSnapshot(
+                state = zone.optString("state", ""),
+                hasNowPlaying = zone.optJSONObject("now_playing") != null
+            )
+        }
+        return snapshots
+    }
+
+    private fun toPairedCoreSnapshots(): List<PairedCoreSnapshot> {
+        val snapshots = ArrayList<PairedCoreSnapshot>(pairedCores.size)
+        for (pairedCore in pairedCores.values) {
+            snapshots.add(
+                PairedCoreSnapshot(
+                    host = pairedCore.ip,
+                    port = pairedCore.port,
+                    lastConnected = pairedCore.lastConnected
+                )
+            )
+        }
+        return snapshots
     }
     
     private fun handleZoneUpdate(body: JSONObject) {
@@ -3919,7 +3703,7 @@ class MainActivity : Activity() {
                 // 2. 简化的Zone配置逻辑
                 val storedZoneId = loadStoredZoneConfiguration()
                 val selectionDecision = zoneSelectionUseCase.selectZone(
-                    availableZones = availableZones,
+                    availableZones = toZoneSnapshots(availableZones),
                     storedZoneId = storedZoneId,
                     currentZoneId = currentZoneId
                 )
@@ -4079,7 +3863,7 @@ class MainActivity : Activity() {
     }
     
     private fun loadAlbumArt(imageKey: String) {
-        val requestId = this.requestId++
+        val requestId = nextRequestId()
         
         logDebug("🖼️ Requesting album art: $imageKey")
         
@@ -4107,7 +3891,7 @@ class MainActivity : Activity() {
         }
         
         // 在后台线程发送图片请求，避免NetworkOnMainThreadException
-        GlobalScope.launch(Dispatchers.IO) {
+        activityScope.launch(Dispatchers.IO) {
             try {
                 if (webSocketClient == null) {
                     logError("❌ WebSocket client is null")
@@ -4225,7 +4009,7 @@ class MainActivity : Activity() {
                         val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         if (bitmap != null) {
                             // Save to cache in background only if not already cached
-                            GlobalScope.launch(Dispatchers.IO) {
+                            activityScope.launch(Dispatchers.IO) {
                                 val cachedPath = saveImageToCache(bytes)
                                 if (cachedPath != null) {
                                     logDebug("💾 Image saved to cache: $imageHash")
@@ -4561,36 +4345,11 @@ class MainActivity : Activity() {
     // ============ Connection History Management ============
     
     private fun getSavedSuccessfulConnections(): List<Pair<String, Int>> {
-        val connections = mutableListOf<Pair<String, Int>>()
-        
-        // Get all saved connection keys
-        val allPrefs = sharedPreferences.all
-        val connectionEntries = allPrefs.filter { it.key.startsWith("roon_successful_") && it.key.endsWith("_time") }
-        
-        // Parse and sort by last connection time (most recent first)
-        val connectionData = connectionEntries.mapNotNull { entry ->
-            val keyWithoutSuffix = entry.key.removeSuffix("_time").removePrefix("roon_successful_")
-            val parts = keyWithoutSuffix.split("_port_")
-            if (parts.size == 2) {
-                val ip = parts[0]
-                val port = parts[1].toIntOrNull()
-                val lastTime = entry.value as? Long ?: 0L
-                if (port != null) {
-                    Triple(ip, port, lastTime)
-                } else null
-            } else null
-        }.sortedByDescending { it.third } // Sort by time, most recent first
-        
-        // Convert to list of IP:Port pairs
-        connectionData.forEach { (ip, port, _) ->
-            connections.add(Pair(ip, port))
-        }
-        
+        val connections = connectionHistoryRepository.getSavedSuccessfulConnections(::isValidHost)
         logDebug("Found ${connections.size} saved successful connections")
         connections.forEachIndexed { index, (ip, port) ->
             logDebug("Saved connection $index: $ip:$port")
         }
-        
         return connections
     }
     
@@ -4602,36 +4361,24 @@ class MainActivity : Activity() {
     }
 
     private fun saveSuccessfulConnection(ip: String, port: Int) {
-        if (!isValidHost(ip)) {
+        val saveResult = connectionHistoryRepository.saveSuccessfulConnection(
+            ip = ip,
+            port = port,
+            isValidHost = ::isValidHost
+        )
+        if (saveResult == null) {
             logWarning("⚠️ Attempted to save invalid host: $ip")
             return
         }
-        val currentTime = System.currentTimeMillis()
-        val key = "roon_successful_${ip}_port_${port}_time"
-        val countKey = "roon_successful_${ip}_port_${port}_count"
-        
-        // Increment success count
-        val successCount = sharedPreferences.getInt(countKey, 0) + 1
-        
-        sharedPreferences.edit()
-            .putLong(key, currentTime)
-            .putInt(countKey, successCount)
-            .putString("last_successful_host", ip)
-            .putInt("last_successful_port", port)
-            .putLong("last_connection_time", currentTime)
-            .apply()
-        
-        logDebug("💾 Saved successful connection: $ip:$port at $currentTime (count: $successCount)")
-        
-        // Also save to new connection history system
-        // TODO: saveSuccessfulConnectionToHistory(ip, port)
+
+        logDebug("💾 Saved successful connection: $ip:$port at ${saveResult.savedAt} (count: ${saveResult.successCount})")
     }
     
     // Smart reconnection with exponential backoff and priority
     private suspend fun smartReconnect() {
-        val maxRetries = 5
+        val maxRetries = connectionConfig.smartRetryMaxAttempts
         var retryCount = 0
-        var backoffDelay = 1000L // Start with 1 second
+        var backoffDelay = connectionConfig.smartRetryInitialDelayMs
         
         while (retryCount < maxRetries && !isFinishing) {
             try {
@@ -4656,14 +4403,14 @@ class MainActivity : Activity() {
                 if (retryCount < maxRetries) {
                     logDebug("Waiting ${backoffDelay}ms before next retry")
                     delay(backoffDelay)
-                    backoffDelay = minOf(backoffDelay * 2, 30000L) // Cap at 30 seconds
+                    backoffDelay = minOf(backoffDelay * 2, connectionConfig.smartReconnectMaxBackoffMs)
                 }
                 
             } catch (e: Exception) {
                 logError("Smart reconnect error: ${e.message}")
                 retryCount++
                 delay(backoffDelay)
-                backoffDelay = minOf(backoffDelay * 2, 30000L)
+                backoffDelay = minOf(backoffDelay * 2, connectionConfig.smartReconnectMaxBackoffMs)
             }
         }
         
@@ -4675,42 +4422,16 @@ class MainActivity : Activity() {
     
     // Get connections sorted by priority (success count, recency)
     private fun getPrioritizedConnections(): List<RoonCoreInfo> {
-        val connections = mutableListOf<RoonCoreInfo>()
-        val allPrefs = sharedPreferences.all
-        
-        for ((key, value) in allPrefs) {
-            if (key.startsWith("roon_successful_") && key.endsWith("_time")) {
-                try {
-                    val parts = key.removePrefix("roon_successful_").removeSuffix("_time").split("_port_")
-                    if (parts.size == 2) {
-                        val ip = parts[0]
-                    
-                        // Skip invalid hosts (fixes "by_core_id_" bug)
-                        if (!isValidHost(ip)) continue
-                    
-                        val port = parts[1].toInt()
-                        val lastTime = value as Long
-                        val countKey = "roon_successful_${ip}_port_${port}_count"
-                        val successCount = sharedPreferences.getInt(countKey, 1)
-                        
-                        connections.add(RoonCoreInfo(
-                            ip = ip,
-                            name = "Smart Priority ($successCount successes)",
-                            version = "Cached",
-                            port = port,
-                            lastSeen = lastTime,
-                            successCount = successCount
-                        ))
-                    }
-                } catch (e: Exception) {
-                    logError("Error parsing connection data: ${e.message}")
-                }
-            }
+        return connectionHistoryRepository.getPrioritizedConnections(::isValidHost).map { record ->
+            RoonCoreInfo(
+                ip = record.ip,
+                name = "Smart Priority (${record.successCount} successes)",
+                version = "Cached",
+                port = record.port,
+                lastSeen = record.lastSeen,
+                successCount = record.successCount
+            )
         }
-        
-        // Sort by success count (desc) then by recency (desc)
-        return connections.sortedWith(compareByDescending<RoonCoreInfo> { it.successCount }
-            .thenByDescending { it.lastSeen })
     }
     
     // Enhanced logging with categories
@@ -4748,28 +4469,11 @@ class MainActivity : Activity() {
     
     // Enhanced connection management and persistence
     private fun cleanupOldConnections() {
-        val cutoffTime = System.currentTimeMillis() - (30 * 24 * 60 * 60 * 1000L) // 30 days
-        val editor = sharedPreferences.edit()
-        val keysToRemove = mutableListOf<String>()
-        
-        sharedPreferences.all.forEach { (key, value) ->
-            if (key.startsWith("roon_successful_") && key.endsWith("_time")) {
-                if (value is Long && value < cutoffTime) {
-                    keysToRemove.add(key)
-                    // Also remove the corresponding count key
-                    val countKey = key.replace("_time", "_count")
-                    keysToRemove.add(countKey)
-                }
-            }
-        }
-        
-        keysToRemove.forEach { key ->
-            editor.remove(key)
-        }
-        
-        if (keysToRemove.isNotEmpty()) {
-            editor.apply()
-            logDebug("🧹 Cleaned up ${keysToRemove.size/2} old connection records")
+        val removedCount = connectionHistoryRepository.cleanupOldConnections(
+            connectionConfig.connectionHistoryRetentionMs
+        )
+        if (removedCount > 0) {
+            logDebug("🧹 Cleaned up $removedCount old connection records")
         }
     }
     
@@ -4778,7 +4482,7 @@ class MainActivity : Activity() {
         val autoReconnectEnabled = sharedPreferences.getBoolean("auto_reconnect_enabled", true)
         if (!autoReconnectEnabled) return
         
-        CoroutineScope(Dispatchers.IO).launch {
+        activityScope.launch(Dispatchers.IO) {
             val lastConnection = getLastSuccessfulConnection()
             if (lastConnection != null && discoveredCores.isEmpty()) {
                 logConnectionEvent("AUTO_RECONNECT", "INFO", "Attempting auto-reconnect to ${lastConnection.ip}:${lastConnection.port}")
@@ -4875,7 +4579,7 @@ class MainActivity : Activity() {
                 if (!isArtWallMode) {
                     enterArtWallMode()
                 }
-            }, 2000) // 给UI更新一点时间，然后进入艺术墙
+            }, uiTimingConfig.resetDisplayArtWallDelayMs)
         }
     }
     
@@ -4926,7 +4630,7 @@ class MainActivity : Activity() {
             return
         }
         
-        val currentRequestId = requestId++
+        val currentRequestId = nextRequestId()
         
         val body = JSONObject().apply {
             put("zone_or_output_id", zoneId)
@@ -4946,7 +4650,7 @@ class MainActivity : Activity() {
         }
         
         try {
-            GlobalScope.launch(Dispatchers.IO) {
+            activityScope.launch(Dispatchers.IO) {
                 try {
                     sendMoo(mooMessage)
                 } catch (e: Exception) {
@@ -5076,11 +4780,11 @@ class MainActivity : Activity() {
         
         // Check connection health after resuming
         val timeSincePause = System.currentTimeMillis() - lastPauseTime
-        if (timeSincePause > 30000) { // If paused for more than 30 seconds
+        if (timeSincePause > connectionConfig.longPauseReconnectThresholdMs) {
             logDebug("Long pause detected, checking connection health")
             // Use existing smartReconnect if connection is lost
             if (webSocketClient?.isConnected() != true) {
-                GlobalScope.launch(Dispatchers.IO) {
+                activityScope.launch(Dispatchers.IO) {
                     smartReconnect()
                 }
             }
@@ -5105,12 +4809,10 @@ class MainActivity : Activity() {
         val lastStopTime = sharedPreferences.getLong("last_stop_time", 0)
         val timeSinceStop = System.currentTimeMillis() - lastStopTime
         
-        if (timeSinceStop > 60000) { // If stopped for more than 1 minute
+        if (timeSinceStop > connectionConfig.longStopReconnectThresholdMs) {
             logDebug("App was stopped for extended period, verifying connection")
             if (webSocketClient?.isConnected() != true) {
-                GlobalScope.launch(Dispatchers.IO) {
-                    setupAutoReconnect()
-                }
+                setupAutoReconnect()
             }
         }
     }
@@ -5183,19 +4885,19 @@ class MainActivity : Activity() {
     
     private fun tryAutoReconnect(): Boolean {
         try {
-            val lastHost = sharedPreferences.getString("last_successful_host", null)
-            val lastPort = sharedPreferences.getInt("last_successful_port", 0)
-            val lastTime = sharedPreferences.getLong("last_connection_time", 0)
+            val lastSuccessfulState = connectionHistoryRepository.getLastSuccessfulConnectionState()
 
             val decision = autoReconnectPolicy.decide(
-                lastHost = lastHost,
-                lastPort = lastPort,
-                lastConnectionTime = lastTime,
+                lastHost = lastSuccessfulState.host,
+                lastPort = lastSuccessfulState.port,
+                lastConnectionTime = lastSuccessfulState.lastConnectionTime,
                 isValidHost = ::isValidHost
             )
             if (decision.shouldReconnect) {
-                logDebug("🔄 Attempting auto-reconnect to $lastHost:$lastPort")
-                startConnectionTo(lastHost!!, lastPort)
+                val host = lastSuccessfulState.host!!
+                val port = lastSuccessfulState.port
+                logDebug("🔄 Attempting auto-reconnect to $host:$port")
+                startConnectionTo(host, port)
                 return true
             }
             logDebug("Auto-reconnect skipped: ${decision.reason}")
@@ -5227,7 +4929,7 @@ class MainActivity : Activity() {
                 val currentTime = System.currentTimeMillis()
                 val timeDelta = currentTime - lastPlayPauseKeyTime
                 
-                if (timeDelta < MULTI_CLICK_TIME_DELTA) {
+                if (timeDelta < multiClickTimeDeltaMs) {
                     // Within multi-click time window - increment count
                     playPauseClickCount++
                 } else {
@@ -5250,7 +4952,7 @@ class MainActivity : Activity() {
                             togglePlayPause()
                             playPauseClickCount = 0
                         }
-                        playPauseHandler?.postDelayed(pendingPlayPauseAction!!, SINGLE_CLICK_DELAY)
+                        playPauseHandler?.postDelayed(pendingPlayPauseAction!!, singleClickDelayMs)
                     }
                     1 -> {
                         // Second click - delay execution to allow for third click
@@ -5258,7 +4960,7 @@ class MainActivity : Activity() {
                             nextTrack()
                             playPauseClickCount = 0
                         }
-                        playPauseHandler?.postDelayed(pendingPlayPauseAction!!, MULTI_CLICK_TIME_DELTA)
+                        playPauseHandler?.postDelayed(pendingPlayPauseAction!!, multiClickTimeDeltaMs)
                     }
                     2 -> {
                         // Third click - execute immediately

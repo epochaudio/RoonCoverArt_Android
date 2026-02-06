@@ -9,8 +9,8 @@ android {
         applicationId "com.example.roonplayer"
         minSdk 26
         targetSdk 33
-        versionCode 8
-        versionName "2.17"
+        versionCode 9
+        versionName "2.18"
     }
 
     buildTypes {

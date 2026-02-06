@@ -3,12 +3,13 @@ package com.example.roonplayer.network
 import android.util.Log
 import kotlinx.coroutines.*
 
-class ConnectionHealthMonitor {
+class ConnectionHealthMonitor(
+    private val connectionValidator: RoonConnectionValidator,
+    private val defaultCheckIntervalMs: Long,
+    private val quickCheckIntervalMs: Long
+) {
     companion object {
         private const val TAG = "ConnectionHealthMonitor"
-        private const val DEFAULT_CHECK_INTERVAL = 15000L
-        private const val QUICK_CHECK_INTERVAL = 5000L
-        private const val HEALTH_CHECK_TIMEOUT = 3000
     }
 
     sealed class HealthStatus {
@@ -18,16 +19,16 @@ class ConnectionHealthMonitor {
         data class Error(val message: String) : HealthStatus()
     }
 
-    private val connectionValidator = RoonConnectionValidator()
+    private val monitoringScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var monitoringJob: Job? = null
-    private var currentInterval = DEFAULT_CHECK_INTERVAL
+    private var currentInterval = defaultCheckIntervalMs
 
     private var consecutiveFailures = 0
     private var isMonitoring = false
 
     fun startMonitoring(
         ip: String,
-        port: Int = 9330,
+        port: Int,
         onHealthChange: (HealthStatus) -> Unit
     ) {
         if (isMonitoring) {
@@ -38,9 +39,9 @@ class ConnectionHealthMonitor {
         Log.i(TAG, "开始健康监控: $ip:$port")
         isMonitoring = true
         consecutiveFailures = 0
-        currentInterval = DEFAULT_CHECK_INTERVAL
+        currentInterval = defaultCheckIntervalMs
 
-        monitoringJob = CoroutineScope(Dispatchers.IO).launch {
+        monitoringJob = monitoringScope.launch {
             while (isActive && isMonitoring) {
                 try {
                     val healthStatus = checkConnectionHealth(ip, port)
@@ -62,9 +63,10 @@ class ConnectionHealthMonitor {
         Log.i(TAG, "停止健康监控")
         isMonitoring = false
         monitoringJob?.cancel()
+        monitoringScope.coroutineContext.cancelChildren()
         monitoringJob = null
         consecutiveFailures = 0
-        currentInterval = DEFAULT_CHECK_INTERVAL
+        currentInterval = defaultCheckIntervalMs
     }
 
     private suspend fun checkConnectionHealth(ip: String, port: Int): HealthStatus = withContext(Dispatchers.IO) {
@@ -115,11 +117,11 @@ class ConnectionHealthMonitor {
     private fun adjustMonitoringInterval(healthStatus: HealthStatus) {
         val newInterval = when (healthStatus) {
             is HealthStatus.Healthy -> {
-                if (consecutiveFailures == 0) DEFAULT_CHECK_INTERVAL else QUICK_CHECK_INTERVAL
+                if (consecutiveFailures == 0) defaultCheckIntervalMs else quickCheckIntervalMs
             }
-            is HealthStatus.Degraded -> QUICK_CHECK_INTERVAL
-            is HealthStatus.Unhealthy -> QUICK_CHECK_INTERVAL
-            is HealthStatus.Error -> DEFAULT_CHECK_INTERVAL
+            is HealthStatus.Degraded -> quickCheckIntervalMs
+            is HealthStatus.Unhealthy -> quickCheckIntervalMs
+            is HealthStatus.Error -> defaultCheckIntervalMs
         }
 
         if (newInterval != currentInterval) {

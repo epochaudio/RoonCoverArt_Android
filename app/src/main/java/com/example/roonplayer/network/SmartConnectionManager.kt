@@ -5,12 +5,21 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlin.math.min
 
-class SmartConnectionManager(private val context: Context) {
+class SmartConnectionManager(
+    context: Context,
+    private val connectionValidator: RoonConnectionValidator,
+    private val defaultPort: Int,
+    private val maxRetryAttempts: Int,
+    private val initialRetryDelayMs: Long,
+    private val maxRetryDelayMs: Long,
+    private val networkReadyTimeoutMs: Long,
+    networkReadyPollIntervalMs: Long,
+    networkConnectivityCheckTimeoutMs: Int,
+    networkTestHost: String,
+    networkTestPort: Int
+) {
     companion object {
         private const val TAG = "SmartConnectionManager"
-        private const val MAX_RETRY_ATTEMPTS = 5
-        private const val INITIAL_RETRY_DELAY = 1000L
-        private const val MAX_RETRY_DELAY = 15000L
     }
 
     sealed class ConnectionResult {
@@ -19,19 +28,24 @@ class SmartConnectionManager(private val context: Context) {
         data class NetworkNotReady(val message: String) : ConnectionResult()
     }
 
-    private val networkDetector = NetworkReadinessDetector(context)
-    private val connectionValidator = RoonConnectionValidator()
+    private val networkDetector = NetworkReadinessDetector(
+        context = context,
+        networkReadyPollIntervalMs = networkReadyPollIntervalMs,
+        connectivityCheckTimeoutMs = networkConnectivityCheckTimeoutMs,
+        dnsTestHost = networkTestHost,
+        dnsTestPort = networkTestPort
+    )
 
     suspend fun connectWithSmartRetry(
         ip: String, 
-        port: Int = 9330,
+        port: Int = defaultPort,
         onStatusUpdate: (String) -> Unit = {}
     ): ConnectionResult = withContext(Dispatchers.IO) {
         
         onStatusUpdate("检测网络连接状态...")
         Log.i(TAG, "开始智能连接到 $ip:$port")
 
-        val networkState = networkDetector.waitForNetworkReady()
+        val networkState = networkDetector.waitForNetworkReady(networkReadyTimeoutMs)
         when (networkState) {
             is NetworkReadinessDetector.NetworkState.NotAvailable -> {
                 onStatusUpdate("网络不可用，请检查网络连接")
@@ -50,11 +64,11 @@ class SmartConnectionManager(private val context: Context) {
         }
 
         var lastError: String = ""
-        var retryDelay = INITIAL_RETRY_DELAY
+        var retryDelay = initialRetryDelayMs
 
-        for (attempt in 1..MAX_RETRY_ATTEMPTS) {
-            onStatusUpdate("正在连接... (尝试 $attempt/$MAX_RETRY_ATTEMPTS)")
-            Log.d(TAG, "连接尝试 $attempt/$MAX_RETRY_ATTEMPTS 到 $ip:$port")
+        for (attempt in 1..maxRetryAttempts) {
+            onStatusUpdate("正在连接... (尝试 $attempt/$maxRetryAttempts)")
+            Log.d(TAG, "连接尝试 $attempt/$maxRetryAttempts 到 $ip:$port")
 
             when (val result = connectionValidator.validateConnection(ip, port)) {
                 is RoonConnectionValidator.ConnectionResult.Success -> {
@@ -67,10 +81,10 @@ class SmartConnectionManager(private val context: Context) {
                     lastError = result.message
                     Log.w(TAG, "网络错误 (尝试 $attempt): $lastError")
                     
-                    if (attempt < MAX_RETRY_ATTEMPTS) {
+                    if (attempt < maxRetryAttempts) {
                         onStatusUpdate("连接失败，${retryDelay/1000}秒后重试...")
                         delay(retryDelay)
-                        retryDelay = min(retryDelay * 2, MAX_RETRY_DELAY)
+                        retryDelay = min(retryDelay * 2, maxRetryDelayMs)
                     }
                 }
                 
@@ -78,10 +92,10 @@ class SmartConnectionManager(private val context: Context) {
                     lastError = result.message
                     Log.w(TAG, "连接超时 (尝试 $attempt): $lastError")
                     
-                    if (attempt < MAX_RETRY_ATTEMPTS) {
+                    if (attempt < maxRetryAttempts) {
                         onStatusUpdate("连接超时，${retryDelay/1000}秒后重试...")
                         delay(retryDelay)
-                        retryDelay = min(retryDelay * 2, MAX_RETRY_DELAY)
+                        retryDelay = min(retryDelay * 2, maxRetryDelayMs)
                     }
                 }
                 

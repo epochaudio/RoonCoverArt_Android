@@ -6,12 +6,14 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.charset.Charset
 
 // WebSocket客户端实现 - 使用Roon的官方WebSocket API
 class SimpleWebSocketClient(
     private val host: String,
     private val port: Int,
+    private val connectTimeoutMs: Int,
+    private val handshakeTimeoutMs: Int,
+    private val readTimeoutMs: Int,
     private val onMessage: (String) -> Unit
 ) {
     private var socket: Socket? = null
@@ -21,27 +23,46 @@ class SimpleWebSocketClient(
         private const val DEBUG_ENABLED = true
         private const val FRAME_VERBOSE_LOG = false
         private const val LOG_TAG = "RoonPlayer"
+        private const val OPCODE_CONTINUATION = 0x0
+        private const val OPCODE_TEXT = 0x1
+        private const val OPCODE_BINARY = 0x2
+        private const val OPCODE_CLOSE = 0x8
+        private const val OPCODE_PING = 0x9
+        private const val OPCODE_PONG = 0xA
+        private const val PAYLOAD_EXTENDED_16 = 126
+        private const val PAYLOAD_EXTENDED_64 = 127
+        private const val FIN_BIT = 0x80
+        private const val MASK_BIT = 0x80
+    }
+
+    private inline fun safeAndroidLog(logCall: () -> Unit) {
+        try {
+            logCall()
+        } catch (_: RuntimeException) {
+            // JVM unit tests load a mock android.jar where android.util.Log throws.
+            // Logging must never影响协议处理路径，否则会把可恢复事件误判为连接失败。
+        }
     }
     
     // Logging methods for SimpleWebSocketClient
     private fun logDebug(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.d(LOG_TAG, message)
+        if (DEBUG_ENABLED) safeAndroidLog { android.util.Log.d(LOG_TAG, message) }
     }
 
     private fun logFrameVerbose(message: String) {
-        if (DEBUG_ENABLED && FRAME_VERBOSE_LOG) android.util.Log.d(LOG_TAG, message)
+        if (DEBUG_ENABLED && FRAME_VERBOSE_LOG) safeAndroidLog { android.util.Log.d(LOG_TAG, message) }
     }
     
     private fun logInfo(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.i(LOG_TAG, message)
+        if (DEBUG_ENABLED) safeAndroidLog { android.util.Log.i(LOG_TAG, message) }
     }
     
     private fun logWarning(message: String) {
-        if (DEBUG_ENABLED) android.util.Log.w(LOG_TAG, message)
+        if (DEBUG_ENABLED) safeAndroidLog { android.util.Log.w(LOG_TAG, message) }
     }
     
     private fun logError(message: String, e: Exception? = null) {
-        if (DEBUG_ENABLED) android.util.Log.e(LOG_TAG, message, e)
+        if (DEBUG_ENABLED) safeAndroidLog { android.util.Log.e(LOG_TAG, message, e) }
     }
 
     private fun logLifecycle(event: String, details: String = "") {
@@ -75,7 +96,7 @@ class SimpleWebSocketClient(
             logDebug("Socket object created")
             
             try {
-                newSocket.connect(InetSocketAddress(host, port), 5000)
+                newSocket.connect(InetSocketAddress(host, port), connectTimeoutMs)
                 logDebug("Socket connected successfully")
             } catch (e: Exception) {
                 try { newSocket.close() } catch (ignore: Exception) {}
@@ -89,7 +110,7 @@ class SimpleWebSocketClient(
                 // Configure socket for reliable WebSocket communication
                 sock.tcpNoDelay = true
                 sock.keepAlive = true
-                sock.soTimeout = 5000 // Temporary timeout for handshake
+                sock.soTimeout = handshakeTimeoutMs
                 
                 // 发送WebSocket握手 - 使用标准Roon API路径
                 val websocketKey = "dGhlIHNhbXBsZSBub25jZQ==" // Standard sample nonce
@@ -153,7 +174,7 @@ class SimpleWebSocketClient(
                         while (isActive && connected && !sock.isClosed && sock.isConnected) {
                             try {
                                 // Set timeout for each read operation
-                                sock.soTimeout = 15000 // 15 second timeout per read
+                                sock.soTimeout = readTimeoutMs
                                 
                                 val message = readMooMessage(input)
                                 if (message != null) {
@@ -233,8 +254,8 @@ class SimpleWebSocketClient(
                 logFrameVerbose("Sending WebSocket frame: $message")
                 val messageBytes = message.toByteArray(Charsets.UTF_8)
                 
-                // Create WebSocket frame (simple text frame)
-                val frame = createWebSocketFrame(messageBytes)
+                // Roon 侧消息按二进制帧更稳定，保留既有行为。
+                val frame = createWebSocketFrame(messageBytes, OPCODE_BINARY)
                 
                 val outputStream = sock.getOutputStream()
                 outputStream.write(frame)
@@ -247,9 +268,22 @@ class SimpleWebSocketClient(
             }
         } ?: logError("Cannot send WebSocket frame: socket is null")
     }
+
+    private fun sendPongFrame(payload: ByteArray) {
+        socket?.let { sock ->
+            try {
+                val pongFrame = createWebSocketFrame(payload, OPCODE_PONG)
+                sock.getOutputStream().write(pongFrame)
+                sock.getOutputStream().flush()
+                logFrameVerbose("Sent WebSocket pong frame (${payload.size} bytes)")
+            } catch (e: Exception) {
+                logWarning("Failed to send pong frame: ${e.message}")
+            }
+        } ?: logWarning("Cannot send pong frame: socket is null")
+    }
     
-    private fun createWebSocketFrame(payload: ByteArray): ByteArray {
-        // Create a properly masked WebSocket text frame
+    private fun createWebSocketFrame(payload: ByteArray, opcode: Int): ByteArray {
+        // 客户端发送的 WS 帧必须带 mask；此处统一封装，避免分散实现导致协议不一致。
         val payloadLength = payload.size
         
         // Generate random mask key (required for client-to-server frames)
@@ -267,14 +301,13 @@ class SimpleWebSocketClient(
         }
         
         val frame = when {
-            payloadLength < 126 -> {
-                // Small payload (0-125 bytes) - Use binary frame (0x82) instead of text (0x81)
-                byteArrayOf(0x82.toByte(), (payloadLength or 0x80).toByte()) + 
+            payloadLength < PAYLOAD_EXTENDED_16 -> {
+                val frameHeader = (MASK_BIT or payloadLength).toByte()
+                byteArrayOf((FIN_BIT or opcode).toByte(), frameHeader) +
                 maskKey + maskedPayload
             }
             payloadLength < 65536 -> {
-                // Medium payload (126-65535 bytes) - Use binary frame (0x82)
-                byteArrayOf(0x82.toByte(), (126 or 0x80).toByte()) +
+                byteArrayOf((FIN_BIT or opcode).toByte(), (PAYLOAD_EXTENDED_16 or MASK_BIT).toByte()) +
                 byteArrayOf((payloadLength shr 8).toByte(), payloadLength.toByte()) +
                 maskKey + maskedPayload
             }
@@ -361,55 +394,30 @@ class SimpleWebSocketClient(
             
             val fin = (firstByte and 0x80) != 0
             val opcode = firstByte and 0x0F
-            val masked = (secondByte and 0x80) != 0
+            val masked = (secondByte and MASK_BIT) != 0
             var payloadLength = (secondByte and 0x7F).toLong()
             
             logFrameVerbose("WebSocket frame: fin=$fin, opcode=$opcode, masked=$masked, initial_length=$payloadLength")
-            
-            // Handle different WebSocket frame types
-            when (opcode) {
-                0 -> {
-                    // Continuation frame - part of fragmented message
-                    logFrameVerbose("Received WebSocket continuation frame")
-                    if (!framingInProgress) {
-                        logWarning("Received continuation frame but no fragmentation in progress")
-                        return readMooMessage(input) // Skip this frame and read next
-                    }
+            val isUnexpectedContinuation = opcode == OPCODE_CONTINUATION && !framingInProgress
+            if (isUnexpectedContinuation) {
+                logWarning("Received continuation frame but no fragmentation in progress")
+            }
+            if (opcode == OPCODE_TEXT || opcode == OPCODE_BINARY) {
+                if (framingInProgress) {
+                    logWarning("Starting new frame while fragmentation in progress, resetting buffer")
+                    frameBuffer?.reset()
+                    framingInProgress = false
                 }
-                1, 2 -> {
-                    // Text or binary frame - start of new message
-                    if (framingInProgress) {
-                        logWarning("Starting new frame while fragmentation in progress, resetting buffer")
-                        frameBuffer?.reset()
-                        framingInProgress = false
-                    }
-                    expectedFrameType = opcode
-                }
-                8 -> {
-                    // Close frame
-                    logWarning("[WS][REMOTE_CLOSE_FRAME] close frame received")
-                    return null
-                }
-                9 -> {
-                    // Ping frame
-                    logFrameVerbose("Received WebSocket ping frame")
-                }
-                10 -> {
-                    // Pong frame
-                    logFrameVerbose("Received WebSocket pong frame")
-                }
-                else -> {
-                    logWarning("Unknown WebSocket opcode: $opcode")
-                }
+                expectedFrameType = opcode
             }
             
             // Handle extended payload length
-            if (payloadLength == 126L) {
+            if (payloadLength == PAYLOAD_EXTENDED_16.toLong()) {
                 val byte1 = input.read()
                 val byte2 = input.read()
                 if (byte1 == -1 || byte2 == -1) return null
                 payloadLength = ((byte1 shl 8) or byte2).toLong()
-            } else if (payloadLength == 127L) {
+            } else if (payloadLength == PAYLOAD_EXTENDED_64.toLong()) {
                 // 64-bit length (not expected for Roon)
                 for (i in 0..7) {
                     if (input.read() == -1) return null
@@ -418,78 +426,72 @@ class SimpleWebSocketClient(
                 return null
             }
             
-            // Read mask key if present (server shouldn't send masked frames)
+            // Read mask key if present (server 按协议不该 mask，但做兼容读取避免解析错位)
+            var maskKey: ByteArray? = null
             if (masked) {
-                for (i in 0..3) {
-                    if (input.read() == -1) return null
+                maskKey = ByteArray(4)
+                for (i in 0 until maskKey.size) {
+                    val maskByte = input.read()
+                    if (maskByte == -1) return null
+                    maskKey[i] = maskByte.toByte()
+                }
+            }
+
+            val payload = readPayload(input, payloadLength) ?: return null
+            if (masked && maskKey != null) {
+                for (i in payload.indices) {
+                    payload[i] = (payload[i].toInt() xor maskKey[i % maskKey.size].toInt()).toByte()
                 }
             }
             
-            // Read payload only for data frames and continuation frames
-            if (opcode == 0 || opcode == 1 || opcode == 2) {
-                if (payloadLength > Int.MAX_VALUE) {
-                    logError("Payload too large: $payloadLength")
+            when (opcode) {
+                OPCODE_CLOSE -> {
+                    logWarning("[WS][REMOTE_CLOSE_FRAME] close frame received")
                     return null
                 }
-                
-                val payload = ByteArray(payloadLength.toInt())
-                var totalRead = 0
-                while (totalRead < payloadLength) {
-                    val bytesRead = input.read(payload, totalRead, (payloadLength - totalRead).toInt())
-                    if (bytesRead == -1) {
-                        logWarning("End of stream while reading payload")
-                        return null
-                    }
-                    totalRead += bytesRead
+                OPCODE_PING -> {
+                    logFrameVerbose("Received WebSocket ping frame")
+                    sendPongFrame(payload)
+                    return readMooMessage(input)
                 }
-                
-                logFrameVerbose("WebSocket payload read: ${payload.size} bytes")
-                
-                // Handle frame reassembly for fragmented messages
-                if (opcode == 1 || opcode == 2) {
-                    // Start of new message
+                OPCODE_PONG -> {
+                    logFrameVerbose("Received WebSocket pong frame")
+                    return readMooMessage(input)
+                }
+                OPCODE_TEXT, OPCODE_BINARY -> {
+                    logFrameVerbose("WebSocket payload read: ${payload.size} bytes")
                     if (!fin) {
-                        // This is the first frame of a fragmented message
                         logFrameVerbose("Starting fragmented message reassembly")
                         frameBuffer = ByteArrayOutputStream()
                         frameBuffer!!.write(payload)
                         framingInProgress = true
-                        return readMooMessage(input) // Continue reading next frame
-                    } else {
-                        // Complete single frame message
-                        return processCompleteMessage(payload, opcode)
+                        return readMooMessage(input)
                     }
-                } else if (opcode == 0) {
-                    // Continuation frame
+                    return processCompleteMessage(payload, opcode)
+                }
+                OPCODE_CONTINUATION -> {
+                    if (isUnexpectedContinuation) {
+                        return readMooMessage(input)
+                    }
                     if (frameBuffer == null) {
                         frameBuffer = ByteArrayOutputStream()
                     }
                     frameBuffer!!.write(payload)
-                    
                     if (fin) {
-                        // This is the final frame, reassemble complete message
                         logFrameVerbose("Fragmented message reassembly complete")
                         val completePayload = frameBuffer!!.toByteArray()
                         frameBuffer!!.close()
                         frameBuffer = null
                         framingInProgress = false
-                        
                         return processCompleteMessage(completePayload, expectedFrameType)
-                    } else {
-                        // More frames to come
-                        return readMooMessage(input) // Continue reading next frame
                     }
+                    return readMooMessage(input)
+                }
+                else -> {
+                    logWarning("Unknown WebSocket opcode: $opcode")
+                    return readMooMessage(input)
                 }
             }
-            
-            // Handle close frames specially
-            if (opcode == 8) {
-                logWarning("[WS][REMOTE_CLOSED] connection closed by server")
-                return null
-            }
-            
-            // For other frame types (ping, pong, etc), continue reading
-            return readMooMessage(input)
             
         } catch (e: java.net.SocketTimeoutException) {
             // Re-throw timeout so caller can handle it (e.g. check loop condition)
@@ -504,6 +506,25 @@ class SimpleWebSocketClient(
             framingInProgress = false
             return null
         }
+    }
+
+    private fun readPayload(input: InputStream, payloadLength: Long): ByteArray? {
+        if (payloadLength == 0L) return ByteArray(0)
+        if (payloadLength > Int.MAX_VALUE) {
+            logError("Payload too large: $payloadLength")
+            return null
+        }
+        val payload = ByteArray(payloadLength.toInt())
+        var totalRead = 0
+        while (totalRead < payloadLength) {
+            val bytesRead = input.read(payload, totalRead, (payloadLength - totalRead).toInt())
+            if (bytesRead == -1) {
+                logWarning("End of stream while reading payload")
+                return null
+            }
+            totalRead += bytesRead
+        }
+        return payload
     }
     
     private fun processCompleteMessage(payload: ByteArray, frameType: Int): String {

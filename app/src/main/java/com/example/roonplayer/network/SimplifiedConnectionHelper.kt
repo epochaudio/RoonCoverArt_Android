@@ -7,10 +7,11 @@ import kotlinx.coroutines.*
  * 简化的连接辅助类
  * 
  * 用途：替换复杂的发现和连接逻辑
- * 原则：用户提供IP，直接连接到9330端口
+ * 原则：用户提供IP，直接连接到配置注入的默认端口
  */
 class SimplifiedConnectionHelper(
-    private val connectionValidator: RoonConnectionValidator
+    private val connectionValidator: RoonConnectionValidator,
+    private val defaultPort: Int
 ) {
     companion object {
         private const val TAG = "SimplifiedConnectionHelper"
@@ -30,8 +31,9 @@ class SimplifiedConnectionHelper(
 
         val (host, port) = parseHostAndPort(userInput)
         
-        // 确定端口并验证连接
-        val finalPort = if (port > 0) port else 9330
+        // 为什么在这里统一补默认端口：
+        // 用户输入允许省略端口，但连接验证必须是完整目标，避免调用方重复兜底。
+        val finalPort = if (port > 0) port else defaultPort
         
         return when (connectionValidator.validateConnection(host, finalPort)) {
             is RoonConnectionValidator.ConnectionResult.Success -> {

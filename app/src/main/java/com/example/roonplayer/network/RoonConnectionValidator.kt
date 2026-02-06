@@ -13,11 +13,12 @@ import java.net.*
  * - 显式胜于隐式  
  * - 单一职责：验证给定IP的Roon Core是否可连接
  */
-class RoonConnectionValidator {
+class RoonConnectionValidator(
+    private val defaultPort: Int,
+    private val defaultTimeoutMs: Int
+) {
     companion object {
         private const val TAG = "RoonConnectionValidator"
-        private const val ROON_API_PORT = 9330
-        private const val CONNECTION_TIMEOUT_MS = 3000
     }
 
     /**
@@ -34,11 +35,15 @@ class RoonConnectionValidator {
      * 验证指定IP和端口的Roon Core连接性
      * 
      * @param ip Roon Core IP地址
-     * @param port 端口号，默认为9330
-     * @param customTimeout 自定义超时时间(毫秒)，默认使用CONNECTION_TIMEOUT_MS
+     * @param port 端口号，默认使用配置注入的 API 端口
+     * @param customTimeout 自定义超时时间(毫秒)，默认使用配置注入的连接超时
      * @return 连接验证结果
      */
-    suspend fun validateConnection(ip: String, port: Int = ROON_API_PORT, customTimeout: Int = CONNECTION_TIMEOUT_MS): ConnectionResult = withContext(Dispatchers.IO) {
+    suspend fun validateConnection(
+        ip: String,
+        port: Int = defaultPort,
+        customTimeout: Int = defaultTimeoutMs
+    ): ConnectionResult = withContext(Dispatchers.IO) {
         Log.d(TAG, "Validating Roon Core connection to: $ip:$port")
 
         if (!isValidIpAddress(ip)) {
@@ -82,8 +87,8 @@ class RoonConnectionValidator {
     /**
      * 获取Roon Core WebSocket连接URL
      */
-    fun getWebSocketUrl(ip: String): String {
-        return "ws://$ip:$ROON_API_PORT/api"
+    fun getWebSocketUrl(ip: String, port: Int = defaultPort): String {
+        return "ws://$ip:$port/api"
     }
 
     /**

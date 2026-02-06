@@ -4,17 +4,18 @@ import android.content.Context
 import android.net.*
 import android.util.Log
 import kotlinx.coroutines.*
-import java.io.IOException
-import java.net.InetAddress
 import java.net.Socket
 import java.net.InetSocketAddress
 
-class NetworkReadinessDetector(private val context: Context) {
+class NetworkReadinessDetector(
+    private val context: Context,
+    private val networkReadyPollIntervalMs: Long,
+    private val connectivityCheckTimeoutMs: Int,
+    private val dnsTestHost: String,
+    private val dnsTestPort: Int
+) {
     companion object {
         private const val TAG = "NetworkReadinessDetector"
-        private const val CONNECTIVITY_CHECK_TIMEOUT = 3000
-        private const val DNS_TEST_HOST = "8.8.8.8"
-        private const val DNS_TEST_PORT = 53
     }
 
     sealed class NetworkState {
@@ -26,8 +27,9 @@ class NetworkReadinessDetector(private val context: Context) {
 
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    suspend fun waitForNetworkReady(timeoutMs: Long = 30000): NetworkState = withContext(Dispatchers.IO) {
+    suspend fun waitForNetworkReady(timeoutMs: Long): NetworkState = withContext(Dispatchers.IO) {
         Log.d(TAG, "开始检测网络就绪状态")
 
         val currentState = getCurrentNetworkState()
@@ -55,7 +57,7 @@ class NetworkReadinessDetector(private val context: Context) {
                             Log.w(TAG, "网络检测错误: ${state.message}")
                         }
                     }
-                    delay(1000)
+                    delay(networkReadyPollIntervalMs)
                 }
                 @Suppress("UNREACHABLE_CODE")
                 NetworkState.Error("检测循环异常退出")
@@ -99,9 +101,9 @@ class NetworkReadinessDetector(private val context: Context) {
 
     private suspend fun isConnectivityTestPassed(): Boolean = withContext(Dispatchers.IO) {
         try {
-            withTimeout(CONNECTIVITY_CHECK_TIMEOUT.toLong()) {
+            withTimeout(connectivityCheckTimeoutMs.toLong()) {
                 val socket = Socket()
-                socket.connect(InetSocketAddress(DNS_TEST_HOST, DNS_TEST_PORT), CONNECTIVITY_CHECK_TIMEOUT)
+                socket.connect(InetSocketAddress(dnsTestHost, dnsTestPort), connectivityCheckTimeoutMs)
                 socket.close()
                 true
             }
@@ -112,6 +114,9 @@ class NetworkReadinessDetector(private val context: Context) {
     }
 
     fun registerNetworkCallback(onNetworkChange: (NetworkState) -> Unit) {
+        // 先清掉旧回调和旧任务，避免重复注册导致状态通知重入。
+        unregisterNetworkCallback()
+
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
@@ -119,7 +124,7 @@ class NetworkReadinessDetector(private val context: Context) {
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.d(TAG, "网络变为可用")
-                CoroutineScope(Dispatchers.IO).launch {
+                callbackScope.launch {
                     val state = getCurrentNetworkState()
                     onNetworkChange(state)
                 }
@@ -132,7 +137,7 @@ class NetworkReadinessDetector(private val context: Context) {
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 Log.d(TAG, "网络能力发生变化")
-                CoroutineScope(Dispatchers.IO).launch {
+                callbackScope.launch {
                     val state = getCurrentNetworkState()
                     onNetworkChange(state)
                 }
@@ -143,6 +148,7 @@ class NetworkReadinessDetector(private val context: Context) {
     }
 
     fun unregisterNetworkCallback() {
+        callbackScope.coroutineContext.cancelChildren()
         networkCallback?.let {
             connectivityManager.unregisterNetworkCallback(it)
             networkCallback = null

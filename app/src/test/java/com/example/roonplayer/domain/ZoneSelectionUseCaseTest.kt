@@ -1,6 +1,5 @@
 package com.example.roonplayer.domain
 
-import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -124,12 +123,10 @@ class ZoneSelectionUseCaseTest {
         assertEquals("zone_x", noPlaybackDecision.zoneId)
     }
 
-    private fun zone(state: String, nowPlaying: Boolean = false): JSONObject {
-        return JSONObject().apply {
-            put("state", state)
-            if (nowPlaying) {
-                put("now_playing", JSONObject().put("three_line", JSONObject().put("line1", "song")))
-            }
-        }
+    private fun zone(state: String, nowPlaying: Boolean = false): ZoneSnapshot {
+        return ZoneSnapshot(
+            state = state,
+            hasNowPlaying = nowPlaying
+        )
     }
 }

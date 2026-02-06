@@ -30,8 +30,14 @@
    - Launch CoverArt. Enter Core IP or wait for auto-discovery.
    - The app follows `info → register → subscribe` flow and caches the token for future auto-login.
 
+### ⚙️ Runtime Config Overrides
+- Override keys are read from Android `SharedPreferences` with prefix `runtime_config.`.
+- Values are validated and clamped to safe ranges by `RuntimeConfigResolver`.
+- Startup logs include a config snapshot, applied overrides, and validation warnings.
+- Contract doc: `docs/runtime-config-contract.md`.
+
 ### 📦 Version History
-- **2.17 (Latest)**:
+- **2.18 (Latest)**:
   - **Protocol Hardening**: Integrated `SimpleWebSocketClient` with synchronous handshake logic for more reliable connections.
   - **Moo Protocol**: Implemented `MooParser` and `MooMessage` for robust message parsing and handling.
   - **Stability**: Fixed race conditions during Roon Core discovery and registration phases.
@@ -73,6 +79,12 @@
    - 启动 CoverArt 后输入 Core 地址或等待自动发现。
    - 应用会按 `info → register → subscribe` 流程完成注册，并缓存 token 以便下次免授权。
 
+### ⚙️ 运行时配置覆盖
+- 应用会从 Android `SharedPreferences` 读取 `runtime_config.` 前缀键作为覆盖配置。
+- 覆盖值会经 `RuntimeConfigResolver` 做校验和边界夹紧，非法值自动回退默认值。
+- 启动日志会输出配置快照、已应用覆盖项和校验告警。
+- 配置契约见：`docs/runtime-config-contract.md`。
+
 ### 🎯 日常使用
 - **区域选择**：默认自动选择“正在播放 → 有曲目信息 → 首个区域”的优先级，可在 Roon *扩展 > CoverArt_Android* 中手动指定。
 - **播放控制**：物理播放键支持多击逻辑，传统媒体键（Play/Pause/Next/Prev）同样适用。
@@ -80,7 +92,7 @@
 - **状态提示**：底部状态栏展示连接、授权、区域选择等细节，出现告警（网络中断、区域失效）时便于定位。
 
 ### 📦 版本信息
-- **2.17 (Latest)**:
+- **2.18 (Latest)**:
   - **协议强化**: 引入 `SimpleWebSocketClient` 配合同步握手逻辑，连接更稳定。
   - **Moo 协议**: 实现 `MooParser` 和 `MooMessage`，提升消息解析的安全性和准确性。
   - **稳定性修复**: 修复了 Roon Core 发现与注册阶段的竞态条件问题。

@@ -1,7 +1,5 @@
 package com.example.roonplayer.domain
 
-import org.json.JSONObject
-
 data class ZoneSelectionDecision(
     val zoneId: String?,
     val reason: String,
@@ -9,10 +7,19 @@ data class ZoneSelectionDecision(
     val statusMessage: String? = null
 )
 
+/**
+ * 领域层只关心“可选择的业务事实”，不关心 JSON/协议字段细节。
+ * 这样做是为了让用例可测试、可复用，不被传输层实现绑死。
+ */
+data class ZoneSnapshot(
+    val state: String,
+    val hasNowPlaying: Boolean
+)
+
 class ZoneSelectionUseCase {
 
     fun selectZone(
-        availableZones: Map<String, JSONObject>,
+        availableZones: Map<String, ZoneSnapshot>,
         storedZoneId: String?,
         currentZoneId: String?
     ): ZoneSelectionDecision {
@@ -58,18 +65,15 @@ class ZoneSelectionUseCase {
         )
     }
 
-    private fun autoSelectZoneId(availableZones: Map<String, JSONObject>): String? {
+    private fun autoSelectZoneId(availableZones: Map<String, ZoneSnapshot>): String? {
         for ((zoneId, zone) in availableZones) {
-            val state = zone.optString("state", "")
-            val nowPlaying = zone.optJSONObject("now_playing")
-            if (state == "playing" && nowPlaying != null) {
+            if (zone.state == "playing" && zone.hasNowPlaying) {
                 return zoneId
             }
         }
 
         for ((zoneId, zone) in availableZones) {
-            val nowPlaying = zone.optJSONObject("now_playing")
-            if (nowPlaying != null) {
+            if (zone.hasNowPlaying) {
                 return zoneId
             }
         }
