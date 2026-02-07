@@ -37,11 +37,12 @@
 - Contract doc: `docs/runtime-config-contract.md`.
 
 ### 📦 Version History
-- **2.19 (Latest)**:
+- **2.20 (Latest)**:
   - **Settings Fix**: Fixed settings service request routing so Zone selector is correctly rendered in Roon extension settings.
   - **Settings Compatibility**: Improved `get_settings/save_settings` payload compatibility to prevent empty settings dialogs.
   - **Settings Protocol Alignment**: Aligned `subscribe_settings/unsubscribe_settings` handshake with Roon behavior (`CONTINUE Subscribed`, `COMPLETE Unsubscribed`) for stable settings rendering.
   - **Zone Save Effectiveness**: Use `zone` as the canonical settings key so selected zone is applied to the app immediately after saving.
+  - **Settings UI Persistence**: Persist selected output name and mirror `name/display_name` to improve settings dialog value restore after restart.
   - **Protocol Hardening**: Integrated `SimpleWebSocketClient` with synchronous handshake logic for more reliable connections.
   - **Moo Protocol**: Implemented `MooParser` and `MooMessage` for robust message parsing and handling.
   - **Stability**: Fixed race conditions during Roon Core discovery and registration phases.
@@ -96,11 +97,12 @@
 - **状态提示**：底部状态栏展示连接、授权、区域选择等细节，出现告警（网络中断、区域失效）时便于定位。
 
 ### 📦 版本信息
-- **2.19 (Latest)**:
+- **2.20 (Latest)**:
   - **Settings 修复**: 修复 settings 服务请求路由，Roon 扩展设置页可正确渲染 Zone 选择器。
   - **Settings 兼容性**: 增强 `get_settings/save_settings` 载荷兼容，避免设置弹窗出现空白配置。
   - **Settings 协议对齐**: 将 `subscribe_settings/unsubscribe_settings` 对齐到 Roon 期望握手（`CONTINUE Subscribed`、`COMPLETE Unsubscribed`），设置页渲染更稳定。
   - **Zone 保存生效**: 以 `zone` 作为设置主键，保存后可立即在 App 端应用所选 Zone。
+  - **设置回显持久化**: 持久化所选 output 名称，并镜像补齐 `name/display_name`，提升重启后设置弹窗的回显稳定性。
   - **协议强化**: 引入 `SimpleWebSocketClient` 配合同步握手逻辑，连接更稳定。
   - **Moo 协议**: 实现 `MooParser` 和 `MooMessage`，提升消息解析的安全性和准确性。
   - **稳定性修复**: 修复了 Roon Core 发现与注册阶段的竞态条件问题。

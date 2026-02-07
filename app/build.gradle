@@ -9,8 +9,9 @@ android {
         applicationId "com.example.roonplayer"
         minSdk 26
         targetSdk 33
-        versionCode 10
-        versionName "2.19"
+        // Android 以 versionCode 判断是否允许“升级安装”，必须单调递增；否则会被视为降级并拒绝安装。
+        versionCode 11
+        versionName "2.20"
     }
 
     buildTypes {

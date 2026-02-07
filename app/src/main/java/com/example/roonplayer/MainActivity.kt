@@ -573,6 +573,8 @@ class MainActivity : Activity() {
 
         // Initialize RoonApiSettings after host input is available
         initializeRoonApiSettings()
+        // 单 Core 模式下，启动即恢复上次保存的 zone/output 映射，避免重启后丢失选择上下文。
+        loadZoneConfiguration()
         
         // 初始化艺术墙轮换优化
         initializeAllImagePaths()
@@ -4058,7 +4060,6 @@ class MainActivity : Activity() {
     
     private fun initializeRoonApiSettings() {
         roonApiSettings = RoonApiSettings(
-            getHostInput = { getHostInput() },
             zoneConfigRepository = zoneConfigRepository,
             onZoneConfigChanged = { zoneId ->
                 handleZoneConfigurationChange(zoneId)
@@ -4304,11 +4305,10 @@ class MainActivity : Activity() {
     }
     
     /**
-     * 加载存储的Zone配置（按Core ID）
+     * 加载存储的 Zone 配置（单 Core 模式）。
      */
     private fun loadStoredZoneConfiguration(): String? {
         val zoneId = zoneConfigRepository.loadZoneConfiguration(
-            hostInput = getHostInput(),
             findZoneIdByOutputId = ::findZoneIdByOutputId
         )
         if (zoneId != null) {

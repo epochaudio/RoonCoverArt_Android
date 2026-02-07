@@ -9,7 +9,6 @@ import org.json.JSONObject
  * 参考：https://github.com/epochaudio/RoonCoverArt/blob/main/app.js
  */
 class RoonApiSettings(
-    private val getHostInput: () -> String,
     private val zoneConfigRepository: ZoneConfigRepository,
     private val onZoneConfigChanged: (String?) -> Unit,
     private val getAvailableZones: () -> Map<String, JSONObject>
@@ -27,12 +26,23 @@ class RoonApiSettings(
         private const val KEY_OUTPUT = "output"
         private const val KEY_ZONE = "zone"
         private const val KEY_OUTPUT_ID = "output_id"
+        /**
+         * 社区与官方示例中，zone 控件的值对象通常包含 `name` 用于 UI 回显。
+         * 仅返回 output_id 往往会导致“已保存但下次打开设置显示为空”的错觉。
+         */
+        private const val KEY_NAME = "name"
         private const val KEY_DISPLAY_NAME = "display_name"
         private const val KEY_LAYOUT = "layout"
         private const val KEY_HAS_ERROR = "has_error"
         private const val LAYOUT_TYPE_ZONE = "zone"
         private const val OUTPUT_SETTING = KEY_ZONE
         private const val OUTPUT_TITLE = "选择播放区域"
+
+        /**
+         * 当我们只有 output_id（例如首次升级到该版本）时，仍然需要给 zone 控件一个可显示的名称，
+         * 否则 Roon UI 可能会把当前选择显示成空白，影响可用性与信任感。
+         */
+        private const val FALLBACK_OUTPUT_NAME = "上次选择"
     }
     
     private var currentSettings = mutableMapOf<String, Any>()
@@ -56,7 +66,10 @@ class RoonApiSettings(
         val settingsValues = JSONObject().apply {
             // zone 控件只读取与其同名 setting 的值；输出单一 source-of-truth 可避免保存时回传旧值。
             normalizedValues.optJSONObject(KEY_ZONE)?.let { zoneValue ->
-                put(KEY_ZONE, JSONObject(zoneValue.toString()))
+                // 兼容不同 Roon 客户端/版本对字段名的偏好：
+                // 有的 UI 读取 `name`，有的读取 `display_name`。
+                // 若只回填其中一个，可能出现“实际已保存，但下次打开设置显示空白”的错觉。
+                put(KEY_ZONE, normalizeZoneDisplayFields(JSONObject(zoneValue.toString())))
             }
         }
 
@@ -73,6 +86,24 @@ class RoonApiSettings(
             })
             put(KEY_HAS_ERROR, false)
         }
+    }
+
+    /**
+     * zone 控件的值对象至少需要 output_id +（name/display_name 任一）才能稳定回显。
+     * 为什么要补齐：
+     * - save_settings 回传的对象有时只带 `name`
+     * - 我们启动回填时可能只持久化了一个名称字段
+     * 这里做“字段镜像”，保证 UI 取哪个字段都能显示一致文本。
+     */
+    private fun normalizeZoneDisplayFields(zoneValue: JSONObject): JSONObject {
+        val name = zoneValue.optString(KEY_NAME).takeIf { it.isNotBlank() }
+        val displayName = zoneValue.optString(KEY_DISPLAY_NAME).takeIf { it.isNotBlank() }
+
+        when {
+            name != null && displayName == null -> zoneValue.put(KEY_DISPLAY_NAME, name)
+            name == null && displayName != null -> zoneValue.put(KEY_NAME, displayName)
+        }
+        return zoneValue
     }
     
     /**
@@ -277,9 +308,10 @@ class RoonApiSettings(
         val normalized = JSONObject(values.toString())
 
         // zone 是当前布局(setting=zone)的权威值；若与 output 冲突，用 zone 覆盖 output。
-        val zoneOutputId = normalized.optJSONObject(KEY_ZONE)?.optString(KEY_OUTPUT_ID)?.takeIf { it.isNotBlank() }
+        val zoneObject = normalized.optJSONObject(KEY_ZONE)
+        val zoneOutputId = zoneObject?.optString(KEY_OUTPUT_ID)?.takeIf { it.isNotBlank() }
         if (zoneOutputId != null) {
-            normalized.put(KEY_OUTPUT, JSONObject(normalized.optJSONObject(KEY_ZONE).toString()))
+            normalized.put(KEY_OUTPUT, JSONObject(zoneObject.toString()))
         }
 
         if (!normalized.has(KEY_ZONE)) {
@@ -290,9 +322,9 @@ class RoonApiSettings(
         }
 
         if (!normalized.has(KEY_OUTPUT)) {
-            normalized.optJSONObject(KEY_ZONE)?.let { zoneObject ->
+            normalized.optJSONObject(KEY_ZONE)?.let { normalizedZoneObject ->
                 // 官方示例常用 "zone"，内部统一成 "output" 方便复用原有存储键。
-                normalized.put(KEY_OUTPUT, JSONObject(zoneObject.toString()))
+                normalized.put(KEY_OUTPUT, JSONObject(normalizedZoneObject.toString()))
             }
         }
 
@@ -319,19 +351,54 @@ class RoonApiSettings(
         }
         return settingsValues.optString(KEY_OUTPUT_ID).takeIf { it.isNotBlank() }
     }
+
+    /**
+     * 从 settings.values 中提取 output 的展示名称。
+     * 为什么需要：Roon 的 zone 控件在回显时依赖 name/display_name，否则 UI 可能显示为空。
+     */
+    private fun extractOutputName(settingsValues: JSONObject): String? {
+        val outputObject = settingsValues.optJSONObject(KEY_ZONE)
+            ?: settingsValues.optJSONObject(KEY_OUTPUT)
+        val name = outputObject?.optString(KEY_NAME)?.takeIf { it.isNotBlank() }
+        if (name != null) return name
+        return outputObject?.optString(KEY_DISPLAY_NAME)?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 在输出名称缺失时，尝试从已订阅的 transport zones 快照中反查 output 的 display_name。
+     * 为什么这样做：我们希望“重启后立即打开设置”也能稳定显示当前选择，
+     * 即使 save_settings 回包里没有带 name 字段，也尽量从运行期数据推导。
+     */
+    private fun lookupOutputNameFromZones(outputId: String): String? {
+        val zones = getAvailableZones()
+        for ((_, zone) in zones) {
+            val outputs = zone.optJSONArray("outputs") ?: continue
+            for (i in 0 until outputs.length()) {
+                val output = outputs.optJSONObject(i) ?: continue
+                if (output.optString(KEY_OUTPUT_ID) == outputId) {
+                    output.optString(KEY_DISPLAY_NAME).takeIf { it.isNotBlank() }?.let { return it }
+                    output.optString(KEY_NAME).takeIf { it.isNotBlank() }?.let { return it }
+                }
+            }
+        }
+        return null
+    }
     
     /**
      * 加载保存的设置
      */
     private fun loadSavedSettings() {
-        val hostInput = getHostInput().trim()
-        val savedOutput = zoneConfigRepository.getStoredOutputId(hostInput)
+        val savedOutput = zoneConfigRepository.getStoredOutputId()
+        val savedOutputName = zoneConfigRepository.getStoredOutputName()
         
         if (savedOutput != null) {
             // 创建output对象
             val outputObj = JSONObject().apply {
                 put(KEY_OUTPUT_ID, savedOutput)
-                put(KEY_DISPLAY_NAME, "Saved Zone")
+                val outputName = savedOutputName ?: FALLBACK_OUTPUT_NAME
+                // 同时写入 name/display_name，最大化兼容不同版本/实现对字段名的偏好。
+                put(KEY_NAME, outputName)
+                put(KEY_DISPLAY_NAME, outputName)
             }
             currentSettings[KEY_OUTPUT] = outputObj
             currentSettings[KEY_ZONE] = JSONObject(outputObj.toString())
@@ -355,6 +422,13 @@ class RoonApiSettings(
         // 保存output设置（兼容 output/zone 两种字段）
         val outputId = extractOutputId(settingsAsJson)
         if (outputId != null) {
+            // 保存 output 名称用于重启后的 settings 回显（避免 UI 为空）。
+            val outputName = extractOutputName(settingsAsJson)
+                ?: lookupOutputNameFromZones(outputId)
+            if (outputName != null) {
+                zoneConfigRepository.saveOutputName(outputName)
+            }
+
             // 找到对应的zone_id
             val zoneId = findZoneIdByOutputId(outputId)
             if (zoneId != null) {
@@ -393,9 +467,7 @@ class RoonApiSettings(
      * 加载Zone配置
      */
     fun loadZoneConfiguration(): String? {
-        val hostInput = getHostInput().trim()
         val zoneId = zoneConfigRepository.loadZoneConfiguration(
-            hostInput = hostInput,
             findZoneIdByOutputId = ::findZoneIdByOutputId
         )
 
