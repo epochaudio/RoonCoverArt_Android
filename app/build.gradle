@@ -10,8 +10,8 @@ android {
         minSdk 26
         targetSdk 33
         // Android 以 versionCode 判断是否允许“升级安装”，必须单调递增；否则会被视为降级并拒绝安装。
-        versionCode 13
-        versionName "2.21"
+        versionCode 14
+        versionName "2.22"
     }
 
     buildTypes {
