@@ -25,7 +25,8 @@ class RuntimeConfigResolverTest {
             overrides = mapOf(
                 RuntimeConfigKeys.CONNECTION_WEB_SOCKET_PORT to "9331",
                 RuntimeConfigKeys.DISCOVERY_NETWORK_MULTICAST_GROUP to "239.255.90.91",
-                RuntimeConfigKeys.UI_TIMING_SINGLE_CLICK_DELAY_MS to "750"
+                RuntimeConfigKeys.UI_TIMING_SINGLE_CLICK_DELAY_MS to "750",
+                RuntimeConfigKeys.FEATURE_NEW_MOO_ROUTER to "true"
             ),
             sourceName = "test"
         )
@@ -33,7 +34,8 @@ class RuntimeConfigResolverTest {
         assertEquals(9331, result.config.connection.webSocketPort)
         assertEquals("239.255.90.91", result.config.discoveryNetwork.multicastGroup)
         assertEquals(750L, result.config.uiTiming.singleClickDelayMs)
-        assertEquals(3, result.overrides.size)
+        assertEquals(true, result.config.featureFlags.newMooRouter)
+        assertEquals(4, result.overrides.size)
         assertTrue(result.overrides.all { it.source == "test" })
     }
 
@@ -44,7 +46,8 @@ class RuntimeConfigResolverTest {
             overrides = mapOf(
                 RuntimeConfigKeys.CONNECTION_WEB_SOCKET_PORT to "70000",
                 RuntimeConfigKeys.CONNECTION_SMART_RETRY_MAX_ATTEMPTS to "abc",
-                RuntimeConfigKeys.DISCOVERY_NETWORK_MULTICAST_GROUP to "invalid_ip"
+                RuntimeConfigKeys.DISCOVERY_NETWORK_MULTICAST_GROUP to "invalid_ip",
+                RuntimeConfigKeys.FEATURE_NEW_ZONE_STORE to "invalid_bool"
             ),
             sourceName = "test"
         )
@@ -58,9 +61,11 @@ class RuntimeConfigResolverTest {
             defaults.discoveryNetwork.multicastGroup,
             result.config.discoveryNetwork.multicastGroup
         )
+        assertEquals(defaults.featureFlags.newZoneStore, result.config.featureFlags.newZoneStore)
         assertTrue(result.warnings.any { it.contains("clamped") })
         assertTrue(result.warnings.any { it.contains("Invalid int override") })
         assertTrue(result.warnings.any { it.contains("Invalid string override") })
+        assertTrue(result.warnings.any { it.contains("Invalid boolean override") })
     }
 
     @Test

@@ -6,11 +6,13 @@ import org.json.JSONObject
  * Data model representing a parsed MOO protocol message.
  */
 data class MooMessage(
-    val verb: String,         // RESPONSE, CONTINUE, COMPLETE
-    val servicePath: String,  // e.g. "service/method"
+    val verb: String,         // REQUEST, RESPONSE, CONTINUE, COMPLETE
+    val servicePath: String,  // e.g. "service/method" or status (Success/InvalidRequest)
     val requestId: String?,
     val contentLength: Int,
+    val contentType: String?,
     val jsonBody: JSONObject?,
+    val headers: Map<String, String>,
     val originalMessage: String // Keep raw message if needed (e.g. for forwarding)
 )
 
@@ -26,91 +28,112 @@ class MooParser {
      */
     fun parse(message: String): MooMessage? {
         try {
-            // Handle both \r\n and \n line endings
-            val lines = message.split("\r\n", "\n")
+            val headerBoundary = findHeaderBoundary(message) ?: return null
+            val headerSection = message.substring(0, headerBoundary.first)
+            val bodySection = message.substring(headerBoundary.first + headerBoundary.second)
+            val lines = headerSection.split("\r\n", "\n")
             if (lines.isEmpty()) return null
-            
-            val firstLine = lines[0]
-            
-            // Skip HTTP messages (Handled by caller before parsing as MOO, or we can handle here if we want)
-            // But for pure MOO parsing, we expect MOO format.
-            // MainActivity currently checks for HTTP 101/404 before parsing. 
-            // We will assume that check happens before calling this, or we handle it gracefully.
+
+            val firstLine = lines[0].trim()
             if (firstLine.startsWith("HTTP/1.1")) {
-                return null 
+                return null
             }
-            
-            // Parse first line: "MOO/1 RESPONSE service/method" or "MOO/1 COMPLETE"
-            val parts = firstLine.split(" ", limit = 3)
-            if (parts.size < 2) return null
-            
-            // parts[0] is "MOO/1", we can optionally validate it
-            
-            val verb = parts[1] // RESPONSE, COMPLETE, etc.
-            val servicePath = if (parts.size > 2) parts[2] else ""
-            
-            // Parse headers
+
+            val firstLineParts = firstLine.split(" ", limit = 3)
+            if (firstLineParts.size < 2) return null
+            if (firstLineParts[0] != "MOO/1") return null
+
+            val verb = firstLineParts[1]
+            val servicePath = firstLineParts.getOrNull(2).orEmpty()
+            if (verb !in SUPPORTED_VERBS) return null
+
             var contentLength = 0
             var requestId: String? = null
-            var headerEndIndex = 1
-            
+            var contentType: String? = null
+            val headers = linkedMapOf<String, String>()
+
             for (i in 1 until lines.size) {
                 val line = lines[i]
-                if (line.isEmpty()) {
-                    headerEndIndex = i + 1
-                    break
-                }
-                
+                if (line.isBlank()) continue
                 val colonIndex = line.indexOf(':')
-                if (colonIndex > 0) {
-                    val headerName = line.substring(0, colonIndex).trim()
-                    val headerValue = line.substring(colonIndex + 1).trim()
-                    
-                    when (headerName.lowercase()) {
-                        "content-length" -> contentLength = headerValue.toIntOrNull() ?: 0
-                        "request-id" -> requestId = headerValue
+                if (colonIndex <= 0) {
+                    return null
+                }
+
+                val headerName = line.substring(0, colonIndex).trim().lowercase()
+                val headerValue = line.substring(colonIndex + 1).trim()
+                headers[headerName] = headerValue
+
+                when (headerName) {
+                    HEADER_CONTENT_LENGTH -> {
+                        val parsedLength = headerValue.toIntOrNull() ?: return null
+                        if (parsedLength < 0) return null
+                        contentLength = parsedLength
+                    }
+                    HEADER_REQUEST_ID -> {
+                        requestId = headerValue.takeIf { it.isNotBlank() }
+                    }
+                    HEADER_CONTENT_TYPE -> {
+                        contentType = headerValue.takeIf { it.isNotBlank() }
                     }
                 }
             }
-            
-            // Parse JSON body if present
+
+            if (verb in REQUIRE_REQUEST_ID_VERBS && requestId.isNullOrBlank()) {
+                return null
+            }
+
+            val bodyBytes = bodySection.toByteArray(Charsets.ISO_8859_1)
+            if (contentLength > bodyBytes.size) {
+                return null
+            }
+
+            if (contentLength > 0 && contentType.isNullOrBlank()) {
+                return null
+            }
+
+            val effectiveBodyBytes = if (contentLength == 0) ByteArray(0) else bodyBytes.copyOf(contentLength)
             var jsonBody: JSONObject? = null
-            if (contentLength > 0 && headerEndIndex < lines.size) {
-                // Join remaining lines to form the body string
-                // Note: subList(from, to) where 'to' is exclusive. 
-                // But lines.size is the count, so it covers up to valid index.
-                val bodyLines = lines.subList(headerEndIndex, lines.size)
-                
-                // We need to rejoin with original separators or best guess.
-                // Since we split by regex for \r\n or \n, the original separators are lost in the list strings.
-                // However, JSON parsing usually tolerates whitespace.
-                // A safer way is to find the index in original string, but for now joinToString("\n") works 
-                // because we are just parsing JSON.
-                val bodyString = bodyLines.joinToString("\n")
-                
-                if (bodyString.isNotEmpty()) {
-                    try {
-                        jsonBody = JSONObject(bodyString)
-                    } catch (e: Exception) {
-                        // Failed to parse JSON body, but we still return the message with null body
-                        // or should we fail? MainActivity logged error but proceeded.
-                        // We'll proceed with null details.
-                    }
+            if (contentLength > 0 && contentType?.contains("application/json", ignoreCase = true) == true) {
+                val bodyString = String(effectiveBodyBytes, Charsets.UTF_8)
+                if (bodyString.isNotBlank()) {
+                    jsonBody = JSONObject(bodyString)
                 }
             }
-            
+
             return MooMessage(
                 verb = verb,
                 servicePath = servicePath,
                 requestId = requestId,
                 contentLength = contentLength,
+                contentType = contentType,
                 jsonBody = jsonBody,
+                headers = headers,
                 originalMessage = message
             )
-            
         } catch (e: Exception) {
             // Parsing failed
             return null
         }
+    }
+
+    private fun findHeaderBoundary(message: String): Pair<Int, Int>? {
+        val crlfBoundary = message.indexOf("\r\n\r\n")
+        if (crlfBoundary >= 0) {
+            return crlfBoundary to 4
+        }
+        val lfBoundary = message.indexOf("\n\n")
+        if (lfBoundary >= 0) {
+            return lfBoundary to 2
+        }
+        return null
+    }
+
+    companion object {
+        private val SUPPORTED_VERBS = setOf("REQUEST", "RESPONSE", "CONTINUE", "COMPLETE")
+        private val REQUIRE_REQUEST_ID_VERBS = setOf("REQUEST", "RESPONSE", "CONTINUE", "COMPLETE")
+        private const val HEADER_REQUEST_ID = "request-id"
+        private const val HEADER_CONTENT_LENGTH = "content-length"
+        private const val HEADER_CONTENT_TYPE = "content-type"
     }
 }

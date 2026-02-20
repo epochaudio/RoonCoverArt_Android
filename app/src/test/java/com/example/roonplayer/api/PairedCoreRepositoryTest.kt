@@ -134,12 +134,49 @@ class PairedCoreRepositoryTest {
         assertFalse(prefs.contains("roon_core_token_192.168.1.10:9330"))
         assertFalse(prefs.contains("roon_last_connected_192.168.1.10:9330"))
         assertEquals("new_token", repo.getSavedToken("192.168.1.10:9330"))
+        assertEquals("core_a", repo.getPairedCoreId())
     }
 
     @Test
     fun `getSavedToken returns null when neither core-id nor host token exists`() {
         val repo = PairedCoreRepository(FakeSharedPreferences())
         assertNull(repo.getSavedToken("192.168.1.10:9330"))
+    }
+
+    @Test
+    fun `savePairedCoreId supports set and clear`() {
+        val prefs = FakeSharedPreferences()
+        val repo = PairedCoreRepository(prefs)
+
+        repo.savePairedCoreId("core_a")
+        assertEquals("core_a", repo.getPairedCoreId())
+
+        repo.savePairedCoreId(null)
+        assertNull(repo.getPairedCoreId())
+    }
+
+    @Test
+    fun `legacy storage migration is idempotent with secure preference fallback`() {
+        val securePrefs = FakeSharedPreferences()
+        val legacyPrefs = FakeSharedPreferences(
+            mutableMapOf(
+                "roon_core_token_by_core_id_core_a" to "token_a",
+                "roon_core_id_192.168.1.10:9330" to "core_a",
+                "roon_last_connected_by_core_id_core_a" to 600L
+            )
+        )
+        val repo = PairedCoreRepository(
+            sharedPreferences = securePrefs,
+            legacySharedPreferences = legacyPrefs
+        )
+
+        val firstRead = repo.getSavedToken("192.168.1.10:9330")
+        val secondRead = repo.getSavedToken("192.168.1.10:9330")
+
+        assertEquals("token_a", firstRead)
+        assertEquals("token_a", secondRead)
+        assertEquals("token_a", securePrefs.getString("roon_core_token_by_core_id_core_a", null))
+        assertTrue(securePrefs.getBoolean("roon_secure_storage_migrated_v1", false))
     }
 
     private class FakeSharedPreferences(

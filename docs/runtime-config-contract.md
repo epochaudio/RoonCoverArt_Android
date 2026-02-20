@@ -81,6 +81,15 @@
 | `cache.max_preload_cache` | `5` | `1..500` | 预加载缓存上限 | 过大增加内存占用 |
 | `cache.memory_threshold_bytes` | `52428800` | `1048576..1073741824` | 内存阈值 | 过高可能触发 OOM 风险 |
 
+### 4.6 Feature Flags（网络改造灰度）
+| 覆盖键 | 默认值 | 取值 | 用途 | 风险说明 |
+|---|---:|---|---|---|
+| `feature_flags.new_sood_codec` | `true` | `true/false` | 启用新版 SOOD 编解码与发现报文字段 | 关闭后回退旧 SOOD 编解码行为 |
+| `feature_flags.new_moo_router` | `false` | `true/false` | 启用 request-id 驱动的 MOO 路由 | 早期开启可能暴露历史非标准报文问题 |
+| `feature_flags.new_subscription_registry` | `false` | `true/false` | 启用统一订阅注册表（zones/queue） | 早期开启可能与旧订阅状态并存 |
+| `feature_flags.new_zone_store` | `false` | `true/false` | 启用 reducer 驱动的 zone 状态管理 | 早期开启可能改变 zone 事件合并顺序 |
+| `feature_flags.strict_moo_unknown_request_id_disconnect` | `false` | `true/false` | 未知 Request-Id 响应时断连（严格模式） | 可能对兼容性差的 Core 过于严格 |
+
 ## 5. 当前未开放覆盖项
 - 发现策略列表（网段、IP 后缀、端口池列表）仍在默认策略中维护。
 - 若要开放覆盖，需额外补充“列表解析 + 安全上限 + 审计日志”。
@@ -91,5 +100,5 @@ runtime_config.connection.web_socket_port=9331
 runtime_config.connection.ws_connect_timeout_ms=8000
 runtime_config.discovery.timing.announcement_listen_window_ms=30000
 runtime_config.cache.max_cached_images=1200
+runtime_config.feature_flags.new_moo_router=true
 ```
-

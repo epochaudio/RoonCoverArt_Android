@@ -15,12 +15,16 @@ import android.widget.*
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.app.Activity
+import android.animation.Animator
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.PathInterpolator
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.random.Random
@@ -45,15 +49,19 @@ import android.media.AudioManager
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import com.example.roonplayer.application.DiscoveredCoreEndpoint
 import com.example.roonplayer.application.DiscoveryOrchestrator
+import com.example.roonplayer.application.connection.RoonConnectionOrchestrator
+import com.example.roonplayer.application.connection.RoonConnectionState
 import com.example.roonplayer.api.ConnectionHistoryRepository
 import com.example.roonplayer.api.PairedCoreRepository
 import com.example.roonplayer.api.RoonApiSettings
+import com.example.roonplayer.api.SecurePrefsProvider
 import com.example.roonplayer.api.TokenMigrationStatus
 import com.example.roonplayer.api.ZoneConfigRepository
 import com.example.roonplayer.config.AppRuntimeConfig
@@ -78,7 +86,36 @@ import com.example.roonplayer.network.ConnectionHealthMonitor
 import com.example.roonplayer.network.SimpleWebSocketClient
 import com.example.roonplayer.network.SoodDiscoveryClient
 import com.example.roonplayer.network.SoodProtocolCodec
+import com.example.roonplayer.network.moo.MooRequestCategory
+import com.example.roonplayer.network.moo.MooRouter
+import com.example.roonplayer.network.moo.MooSession
+import com.example.roonplayer.network.subscription.SubscriptionRegistry
+import com.example.roonplayer.state.queue.QueueStore
+import com.example.roonplayer.state.transition.CommittedPlaybackSnapshotRepository
+import com.example.roonplayer.state.transition.CorrelationKey
+import com.example.roonplayer.state.transition.CorrelationKeyFactory
+import com.example.roonplayer.state.transition.DirectionalMotion
+import com.example.roonplayer.state.transition.DirectionalVectorPolicy
+import com.example.roonplayer.state.transition.EngineEvent
+import com.example.roonplayer.state.transition.IdempotentTrackTransitionEffectHandler
+import com.example.roonplayer.state.transition.InMemoryCommittedPlaybackSnapshotRepository
+import com.example.roonplayer.state.transition.HandoffGate
+import com.example.roonplayer.state.transition.SharedPreferencesCommittedPlaybackSnapshotRepository
+import com.example.roonplayer.state.transition.TrackTransitionDesignTokens
+import com.example.roonplayer.state.transition.TrackTransitionEffect
+import com.example.roonplayer.state.transition.TrackTransitionEffectHandler
+import com.example.roonplayer.state.transition.TrackTransitionIntent
+import com.example.roonplayer.state.transition.TrackTransitionReducer
+import com.example.roonplayer.state.transition.TrackTransitionState
+import com.example.roonplayer.state.transition.TrackTransitionStore
+import com.example.roonplayer.state.transition.TextCascadeField
+import com.example.roonplayer.state.transition.TransitionAnimationSession
+import com.example.roonplayer.state.transition.TransitionDirection
+import com.example.roonplayer.state.transition.TransitionTrack
+import com.example.roonplayer.state.transition.UiPhase
+import com.example.roonplayer.state.zone.ZoneStateStore
 import kotlin.concurrent.withLock
+import kotlinx.coroutines.flow.collect
 
 class MainActivity : Activity() {
     
@@ -114,7 +151,6 @@ class MainActivity : Activity() {
         private const val SWIPE_MAX_OFF_AXIS_DP = 120f
         private const val SWIPE_MIN_VELOCITY_DP = 220f
         private const val GESTURE_COMMAND_COOLDOWN_MS = 350L
-        private const val TRACK_TRANSITION_WINDOW_MS = 10000L
         private const val COVER_DRAG_DOWN_SCALE = 0.95f
         private const val COVER_DRAG_MIN_SCALE = 0.92f
         private const val COVER_DRAG_PREVIEW_SIZE_DP = 92
@@ -126,6 +162,7 @@ class MainActivity : Activity() {
         private const val TRACK_PREVIEW_HISTORY_LIMIT = 20
         private const val QUEUE_PREFETCH_ITEM_COUNT = 12
         private const val PREVIEW_IMAGE_REQUEST_SIZE_PX = 420
+        private const val QUEUE_RESUBSCRIBE_DEBOUNCE_MS = 1000L
     }
 
     private lateinit var runtimeConfig: AppRuntimeConfig
@@ -135,6 +172,7 @@ class MainActivity : Activity() {
     private val discoveryTimingConfig get() = runtimeConfig.discoveryTiming
     private val uiTimingConfig get() = runtimeConfig.uiTiming
     private val cacheConfig get() = runtimeConfig.cache
+    private val featureFlags get() = runtimeConfig.featureFlags
     private val webSocketPort get() = connectionConfig.webSocketPort
     private val registrationDisplayVersion: String by lazy {
         resolveAppVersionName()
@@ -181,6 +219,13 @@ class MainActivity : Activity() {
     private data class QueueSnapshot(
         val items: List<QueueTrackInfo>,
         val currentIndex: Int
+    )
+
+    private data class PendingTrackTransition(
+        val key: CorrelationKey,
+        val direction: TrackTransitionDirection,
+        val requestedAtMs: Long,
+        val deadlineMs: Long
     )
 
     private enum class ImageRequestPurpose {
@@ -353,6 +398,41 @@ class MainActivity : Activity() {
         android.util.Log.w(LOG_TAG, message)
     }
 
+    private fun nextConnectionId(): String {
+        val nextId = "conn-${connectionIdGenerator.getAndIncrement()}"
+        currentConnectionId = nextId
+        return nextId
+    }
+
+    private fun logStructuredNetworkEvent(
+        event: String,
+        requestId: String? = null,
+        subscriptionKey: String? = null,
+        zoneId: String? = null,
+        coreId: String? = null,
+        details: String = ""
+    ) {
+        val builder = StringBuilder()
+        builder.append("[NET] event=").append(event)
+        builder.append(" connection_id=").append(currentConnectionId)
+        if (!requestId.isNullOrBlank()) {
+            builder.append(" request_id=").append(requestId)
+        }
+        if (!subscriptionKey.isNullOrBlank()) {
+            builder.append(" subscription_key=").append(subscriptionKey)
+        }
+        if (!zoneId.isNullOrBlank()) {
+            builder.append(" zone_id=").append(zoneId)
+        }
+        if (!coreId.isNullOrBlank()) {
+            builder.append(" core_id=").append(coreId)
+        }
+        if (details.isNotBlank()) {
+            builder.append(" details=").append(details)
+        }
+        logRuntimeInfo(builder.toString())
+    }
+
     private fun detachFromParent(view: View) {
         (view.parent as? ViewGroup)?.removeView(view)
     }
@@ -406,6 +486,27 @@ class MainActivity : Activity() {
         // 请求可能从多个协程并发发出，使用原子递增保证 Request-Id 唯一，
         // 避免响应关联到错误请求。
         return requestIdGenerator.getAndIncrement()
+    }
+
+    private fun registerMooPendingRequest(
+        requestId: Int,
+        endpoint: String,
+        category: MooRequestCategory,
+        timeoutMs: Long = connectionConfig.webSocketReadTimeoutMs.toLong()
+    ) {
+        if (!featureFlags.newMooRouter) return
+        mooSession.registerPending(
+            requestId = requestId.toString(),
+            endpoint = endpoint,
+            category = category,
+            timeoutMs = timeoutMs
+        ) { pending ->
+            logStructuredNetworkEvent(
+                event = "MOO_TIMEOUT",
+                requestId = pending.requestId,
+                details = "endpoint=${pending.endpoint} category=${pending.category}"
+            )
+        }
     }
 
     private fun renderState(state: TrackState) {
@@ -470,6 +571,276 @@ class MainActivity : Activity() {
             
         }
     }
+
+    private fun startTrackTransitionRuntime() {
+        observeTrackTransitionState()
+        hydrateTrackTransitionFromSnapshot()
+    }
+
+    private fun hydrateTrackTransitionFromSnapshot() {
+        activityScope.launch {
+            val snapshot = try {
+                trackTransitionSnapshotRepository.read()
+            } catch (e: Exception) {
+                logRuntimeWarning("Failed to read transition snapshot: ${e.message}")
+                null
+            }
+            if (snapshot != null) {
+                trackTransitionStore.dispatch(
+                    TrackTransitionIntent.HydrateCommittedSnapshot(snapshot)
+                )
+            }
+        }
+    }
+
+    private fun observeTrackTransitionState() {
+        activityScope.launch(Dispatchers.Main.immediate) {
+            var previousState: TrackTransitionState? = null
+            trackTransitionStore.state.collect { state ->
+                renderTrackTransitionState(previous = previousState, current = state)
+                previousState = state
+            }
+        }
+    }
+
+    private fun renderTrackTransitionState(
+        previous: TrackTransitionState?,
+        current: TrackTransitionState
+    ) {
+        val shouldStartTransitionSession = when (current.phase) {
+            UiPhase.OPTIMISTIC_MORPHING,
+            UiPhase.ROLLING_BACK -> {
+                previous?.phase != current.phase || previous.currentKey != current.currentKey
+            }
+
+            UiPhase.AWAITING_ENGINE,
+            UiPhase.STABLE -> false
+        }
+
+        if (shouldStartTransitionSession) {
+            val targetTrack = resolveTransitionTargetTrack(current) ?: return
+            val session = TransitionAnimationSession(
+                sessionId = transitionSessionIdGenerator.incrementAndGet(),
+                key = current.currentKey,
+                phase = current.phase,
+                direction = current.transitionDirection,
+                targetTrack = targetTrack,
+                startedAtMs = System.currentTimeMillis()
+            )
+            activeTransitionSession = session
+            recordTapToVisualMetric(current.currentKey)
+            startTransitionChoreography(
+                session = session,
+                motion = DirectionalVectorPolicy.resolve(
+                    phase = current.phase,
+                    direction = current.transitionDirection
+                )
+            )
+            return
+        }
+
+        if (current.phase == UiPhase.STABLE) {
+            if (activeTransitionSession?.key != current.currentKey) {
+                activeTransitionSession = null
+            }
+
+            val stableTrack = current.displayTrack ?: current.committedTrack
+            if (stableTrack != null && activeTransitionSession == null && stableTrack.id != lastRenderedTransitionTrackId) {
+                applyTrackBinding(stableTrack)
+            }
+        }
+    }
+
+    private fun resolveTransitionTargetTrack(state: TrackTransitionState): TransitionTrack? {
+        return when (state.phase) {
+            UiPhase.OPTIMISTIC_MORPHING -> state.optimisticTrack ?: state.displayTrack ?: state.committedTrack
+            UiPhase.ROLLING_BACK -> state.committedTrack ?: state.displayTrack
+            UiPhase.AWAITING_ENGINE,
+            UiPhase.STABLE -> state.displayTrack ?: state.committedTrack
+        }
+    }
+
+    private fun startTransitionChoreography(
+        session: TransitionAnimationSession,
+        motion: DirectionalMotion
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { startTransitionChoreography(session, motion) }
+            return
+        }
+
+        if (session.phase == UiPhase.ROLLING_BACK) {
+            animateRollbackTintCue()
+        }
+
+        animateTrackTransition(session, motion)
+        animateTrackTextTransition(session, motion)
+    }
+
+    private fun isSessionActive(session: TransitionAnimationSession): Boolean {
+        val active = activeTransitionSession ?: return false
+        if (active.sessionId != session.sessionId) return false
+        return handoffGate.canCommit(session.key)
+    }
+
+    private fun applyTrackBinding(track: TransitionTrack) {
+        updateTrackInfo(track.title, track.artist, track.album)
+        lastRenderedTransitionTrackId = track.id
+    }
+
+    private fun commitTrackStateOnly(track: TransitionTrack) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { commitTrackStateOnly(track) }
+            return
+        }
+        stateLock.withLock {
+            val newState = currentState.get().copy(
+                trackText = track.title,
+                artistText = track.artist,
+                albumText = track.album,
+                timestamp = System.currentTimeMillis()
+            )
+            currentState.set(newState)
+        }
+    }
+
+    private fun toTransitionDirection(direction: TrackTransitionDirection): TransitionDirection {
+        return when (direction) {
+            TrackTransitionDirection.NEXT -> TransitionDirection.NEXT
+            TrackTransitionDirection.PREVIOUS -> TransitionDirection.PREVIOUS
+            TrackTransitionDirection.UNKNOWN -> TransitionDirection.UNKNOWN
+        }
+    }
+
+    private fun nextTrackTransitionKey(): CorrelationKey {
+        return trackTransitionKeyFactory.next()
+    }
+
+    private fun dispatchTrackTransitionIntent(intent: TrackTransitionIntent) {
+        activityScope.launch {
+            trackTransitionStore.dispatch(intent)
+        }
+    }
+
+    private fun currentTrackAsTransitionTrack(): TransitionTrack {
+        val snapshot = currentState.get()
+        val normalizedTrack = snapshot.trackText.ifBlank { "Unknown title" }
+        val normalizedArtist = snapshot.artistText.ifBlank { "Unknown artist" }
+        val normalizedAlbum = snapshot.albumText.ifBlank { "Unknown album" }
+        return TransitionTrack(
+            id = buildTrackPreviewId(
+                track = normalizedTrack,
+                artist = normalizedArtist,
+                album = normalizedAlbum,
+                imageRef = snapshot.imageUri
+            ),
+            title = normalizedTrack,
+            artist = normalizedArtist,
+            album = normalizedAlbum,
+            imageKey = snapshot.imageUri
+        )
+    }
+
+    private fun queueTrackToTransitionTrack(item: QueueTrackInfo): TransitionTrack {
+        val title = item.title ?: "Unknown title"
+        val artist = item.artist ?: "Unknown artist"
+        val album = item.album ?: "Unknown album"
+        val stableId = item.stableId
+            ?: item.queueItemId
+            ?: item.itemKey
+            ?: buildTrackPreviewId(
+                track = title,
+                artist = artist,
+                album = album,
+                imageRef = item.imageKey
+            )
+        return TransitionTrack(
+            id = "queue:$stableId",
+            title = title,
+            artist = artist,
+            album = album,
+            imageKey = item.imageKey
+        )
+    }
+
+    private fun playbackInfoToTransitionTrack(playbackInfo: ZonePlaybackInfo): TransitionTrack {
+        val title = playbackInfo.title ?: "Unknown title"
+        val artist = playbackInfo.artist ?: "Unknown artist"
+        val album = playbackInfo.album ?: "Unknown album"
+        val stableId = playbackInfo.queueItemId
+            ?: playbackInfo.itemKey
+            ?: buildTrackPreviewId(
+                track = title,
+                artist = artist,
+                album = album,
+                imageRef = playbackInfo.imageKey
+            )
+        return TransitionTrack(
+            id = "playback:$stableId",
+            title = title,
+            artist = artist,
+            album = album,
+            imageKey = playbackInfo.imageKey
+        )
+    }
+
+    private fun resolveOptimisticTransitionTrack(
+        direction: TrackTransitionDirection
+    ): TransitionTrack {
+        val snapshot = queueSnapshot
+        val queueTrack = when (direction) {
+            TrackTransitionDirection.NEXT -> snapshot?.let { resolveNextQueueTrack(it) }
+            TrackTransitionDirection.PREVIOUS -> snapshot?.let { resolvePreviousQueueTrack(it) }
+            TrackTransitionDirection.UNKNOWN -> null
+        }
+        return queueTrack?.let { queueTrackToTransitionTrack(it) } ?: currentTrackAsTransitionTrack()
+    }
+
+    private fun recordTransitionIntentStart(key: CorrelationKey) {
+        transitionIntentStartedAtMs[key.token()] = System.currentTimeMillis()
+    }
+
+    private fun recordTapToVisualMetric(key: CorrelationKey) {
+        val token = key.token()
+        val startedAt = transitionIntentStartedAtMs[token] ?: return
+        if (!tapToVisualLoggedTokens.add(token)) return
+        val elapsedMs = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
+        logRuntimeInfo("[UX] metric=tap_to_visual_ms value=$elapsedMs key=$token")
+    }
+
+    private suspend fun handleTrackTransitionEffect(effect: TrackTransitionEffect) {
+        when (effect) {
+            is TrackTransitionEffect.CommandEngine -> {
+                // MainActivity currently owns transport command dispatch.
+                logDebug("Transition effect command observed: ${effect.command} key=${effect.correlationKey.token()}")
+            }
+
+            is TrackTransitionEffect.PersistCommittedSnapshot -> {
+                try {
+                    trackTransitionSnapshotRepository.write(effect.snapshot)
+                } catch (e: Exception) {
+                    logRuntimeWarning("Persist transition snapshot failed: ${e.message}")
+                }
+            }
+
+            is TrackTransitionEffect.EmitMetric -> {
+                val token = effect.correlationKey.token()
+                if (effect.name == "track_transition_playing_confirmed") {
+                    val startedAt = transitionIntentStartedAtMs.remove(token)
+                    val tapToSoundMs = if (startedAt != null) {
+                        (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
+                    } else {
+                        -1L
+                    }
+                    if (tapToSoundMs >= 0L) {
+                        logRuntimeInfo("[UX] metric=tap_to_sound_ms value=$tapToSoundMs key=$token")
+                    }
+                    tapToVisualLoggedTokens.remove(token)
+                }
+                logRuntimeInfo("[UX] metric=${effect.name} value=${effect.value} key=$token")
+            }
+        }
+    }
     
     private lateinit var statusText: TextView
     private lateinit var trackText: TextView
@@ -491,18 +862,56 @@ class MainActivity : Activity() {
     private lateinit var discoveryCandidateUseCase: DiscoveryCandidateUseCase
     private val soodProtocolCodec = SoodProtocolCodec()
     private val soodDiscoveryClient = SoodDiscoveryClient(soodProtocolCodec)
+    private val subscriptionRegistry = SubscriptionRegistry()
+    private val zoneStateStore = ZoneStateStore()
+    private val queueStore = QueueStore()
+    private val connectionOrchestrator = RoonConnectionOrchestrator(
+        zoneStateStore = zoneStateStore,
+        queueStore = queueStore
+    )
     
     // Manual CoroutineScope bound to Activity lifecycle
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val mooSession = MooSession(scope = activityScope)
+    private lateinit var mooRouter: MooRouter
     
     private lateinit var smartConnectionManager: SmartConnectionManager
     private lateinit var healthMonitor: ConnectionHealthMonitor
     private val requestIdGenerator = AtomicInteger(1)
+    private val connectionIdGenerator = AtomicInteger(1)
+    @Volatile
+    private var currentConnectionId: String = "conn-0"
     private val infoRequestSent = AtomicBoolean(false)
     private val connectionGuard = InFlightOperationGuard()
     private val discoveryGuard = InFlightOperationGuard()
     private val autoReconnectPolicy = AutoReconnectPolicy()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val trackTransitionReducer = TrackTransitionReducer()
+    private val transitionSessionIdGenerator = AtomicLong(0L)
+    private val transitionIntentStartedAtMs = ConcurrentHashMap<String, Long>()
+    private val tapToVisualLoggedTokens = Collections.synchronizedSet(mutableSetOf<String>())
+    private var trackTransitionSnapshotRepository: CommittedPlaybackSnapshotRepository =
+        InMemoryCommittedPlaybackSnapshotRepository()
+    private val trackTransitionKeyFactory = CorrelationKeyFactory(
+        sessionIdProvider = { currentConnectionId },
+        queueVersionProvider = { queueStore.snapshot().version }
+    )
+    private val trackTransitionEffectHandler = IdempotentTrackTransitionEffectHandler(
+        delegate = TrackTransitionEffectHandler { effect ->
+            handleTrackTransitionEffect(effect)
+        }
+    )
+    private val trackTransitionStore: TrackTransitionStore by lazy {
+        TrackTransitionStore(
+            initialState = TrackTransitionState.initial(sessionId = currentConnectionId),
+            reducer = trackTransitionReducer,
+            effectHandler = trackTransitionEffectHandler,
+            dispatcher = Dispatchers.Default
+        )
+    }
+    private val handoffGate = HandoffGate(
+        activeKeyProvider = { trackTransitionStore.state.value.currentKey }
+    )
     
     // 发现相关
     private val discoveredCores = ConcurrentHashMap<String, RoonCoreInfo>()
@@ -518,6 +927,11 @@ class MainActivity : Activity() {
     private var statusOverlayContainer: View? = null
     private var lastHealthyConnectionAtMs: Long = 0L
     private val statusOverlayDisconnectGraceMs: Long = 5_000L
+    private var discoveryStartedAtMs: Long = 0L
+    private var registrationStartedAtMs: Long = 0L
+    private var subscriptionRestoreStartedAtMs: Long = 0L
+    private var reconnectStartedAtMs: Long = 0L
+    private var reconnectCount: Int = 0
     
     // Enhanced lifecycle management variables
     private var isAppInBackground = false
@@ -554,9 +968,15 @@ class MainActivity : Activity() {
     private var swipeMaxOffAxisPx = 0f
     private var swipeMinVelocityPx = 0f
     private var lastGestureCommandAtMs = 0L
-    private var pendingTrackTransitionDirection: TrackTransitionDirection? = null
-    private var pendingTrackTransitionDeadlineMs = 0L
+    private var pendingTrackTransition: PendingTrackTransition? = null
     private var isTrackTransitionAnimating = false
+    private var activeTransitionSession: TransitionAnimationSession? = null
+    private var activeTrackTransitionAnimator: AnimatorSet? = null
+    private var activeTextTransitionAnimator: AnimatorSet? = null
+    private var activePaletteAnimator: ValueAnimator? = null
+    private var activeRollbackTintAnimator: ValueAnimator? = null
+    private val activeTextFieldAnimators = mutableListOf<Animator>()
+    private var lastRenderedTransitionTrackId: String? = null
     private var touchSlopPx = 0f
     private var isCoverDragArmed = false
     private var isCoverDragInProgress = false
@@ -574,10 +994,12 @@ class MainActivity : Activity() {
     private var expectedNextPreviewTrackId: String? = null
     private var expectedNextPreviewImageKey: String? = null
     private var queueSnapshot: QueueSnapshot? = null
+    private var lastQueueListFingerprint: String? = null
     private var currentNowPlayingQueueItemId: String? = null
     private var currentNowPlayingItemKey: String? = null
     private var currentQueueSubscriptionZoneId: String? = null
     private var currentQueueSubscriptionKey: String? = null
+    private var lastQueueSubscribeRequestAtMs: Long = 0L
     private val pendingImageRequests = ConcurrentHashMap<String, ImageRequestContext>()
     private val imageBitmapByImageKey = LinkedHashMap<String, Bitmap>(48, 0.75f, true)
     
@@ -669,9 +1091,17 @@ class MainActivity : Activity() {
         initializeTouchControls()
         
         sharedPreferences = getSharedPreferences("CoverArt", Context.MODE_PRIVATE)
+        trackTransitionSnapshotRepository = SharedPreferencesCommittedPlaybackSnapshotRepository(sharedPreferences)
         zoneConfigRepository = ZoneConfigRepository(sharedPreferences)
         connectionHistoryRepository = ConnectionHistoryRepository(sharedPreferences)
-        pairedCoreRepository = PairedCoreRepository(sharedPreferences)
+        val securePrefs = SecurePrefsProvider(
+            context = this,
+            fallbackPreferences = sharedPreferences
+        ).getSecurePreferences()
+        pairedCoreRepository = PairedCoreRepository(
+            sharedPreferences = securePrefs,
+            legacySharedPreferences = sharedPreferences
+        )
         initializeRuntimeConfiguration()
         
         // Initialize message processor for sequential handling
@@ -680,6 +1110,7 @@ class MainActivity : Activity() {
         setupWifiMulticast()
         initImageCache()
         createLayout()
+        startTrackTransitionRuntime()
         
         loadSavedIP()
         loadPairedCores()
@@ -2439,27 +2870,43 @@ class MainActivity : Activity() {
     private fun updateBackgroundColor(bitmap: Bitmap) {
         activityScope.launch(Dispatchers.IO) {
             val dominantColor = extractDominantColor(bitmap)
-            currentDominantColor = dominantColor
-            
-            // 计算动态Scrim透明度
-            val scrimOpacity = calculateScrimOpacity(dominantColor)
-            
             mainHandler.post {
-                // 应用优化后的主色作为背景，适用于横屏和竖屏
-                mainLayout.background = android.graphics.drawable.ColorDrawable(dominantColor)
-                
-                // 更新文字颜色以确保对比度，适用于所有方向
-                updateTextColors(dominantColor)
-                
-                // 新增：动态更新专辑封面阴影效果
-                updateAlbumArtShadow(dominantColor)
-                
-                // 更新Scrim透明度（横屏模式的额外处理）
-                if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-                    updateScrimOpacity(scrimOpacity)
+                if (!::mainLayout.isInitialized) return@post
+                val fromColor = currentDominantColor
+                val toColor = dominantColor
+                val colorDrawable = (mainLayout.background as? ColorDrawable)
+                    ?: ColorDrawable(fromColor).also { mainLayout.background = it }
+
+                activePaletteAnimator?.cancel()
+                val paletteAnimator = ValueAnimator.ofArgb(fromColor, toColor)
+                paletteAnimator.duration = TrackTransitionDesignTokens.Palette.COLOR_TRANSITION_DURATION_MS
+                paletteAnimator.startDelay = TrackTransitionDesignTokens.Palette.COLOR_TRANSITION_START_DELAY_MS
+                paletteAnimator.interpolator = DecelerateInterpolator()
+                paletteAnimator.addUpdateListener { animator ->
+                    val animatedColor = animator.animatedValue as Int
+                    colorDrawable.color = animatedColor
+                    updateTextColors(animatedColor)
+                    if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                        updateScrimOpacity(calculateScrimOpacity(animatedColor))
+                    }
                 }
-                
-                logDebug("Background and shadow updated with dominant color: ${String.format("#%06X", dominantColor and 0xFFFFFF)}, scrim opacity: $scrimOpacity")
+                paletteAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        if (activePaletteAnimator === paletteAnimator) {
+                            activePaletteAnimator = null
+                            currentDominantColor = toColor
+                            updateAlbumArtShadow(toColor)
+                        }
+                    }
+
+                    override fun onAnimationCancel(animation: android.animation.Animator) {
+                        if (activePaletteAnimator === paletteAnimator) {
+                            activePaletteAnimator = null
+                        }
+                    }
+                })
+                activePaletteAnimator = paletteAnimator
+                paletteAnimator.start()
             }
         }
     }
@@ -2478,14 +2925,14 @@ class MainActivity : Activity() {
                     val fadeOut = android.animation.ObjectAnimator.ofInt(
                         currentBackground, "alpha", 255, 0
                     ).apply {
-                        duration = 150
+                        duration = TrackTransitionDesignTokens.Palette.SHADOW_FADE_OUT_MS
                         addListener(object : android.animation.AnimatorListenerAdapter() {
                             override fun onAnimationEnd(animation: android.animation.Animator) {
                                 albumArtView.background = newShadowBackground
                                 val fadeIn = android.animation.ObjectAnimator.ofInt(
                                     newShadowBackground, "alpha", 0, 255
                                 ).apply {
-                                    duration = 300
+                                    duration = TrackTransitionDesignTokens.Palette.SHADOW_FADE_IN_MS
                                 }
                                 fadeIn.start()
                             }
@@ -2511,10 +2958,6 @@ class MainActivity : Activity() {
     }
     
     private fun calculateScrimOpacity(backgroundColor: Int): Float {
-        // 计算白色文字与背景的对比度
-        val whiteTextColor = 0xFFFFFFFF.toInt()
-        val contrastRatio = calculateContrastRatio(whiteTextColor, backgroundColor)
-        
         // 统一基准：40%不透明度，根据对比度微调
         val brightness = getBrightness(backgroundColor)
         
@@ -2640,6 +3083,10 @@ class MainActivity : Activity() {
             defaultPort = connectionConfig.webSocketPort
         )
         discoveryCandidateUseCase = DiscoveryCandidateUseCase(runtimeConfig.discoveryPolicy)
+        mooRouter = MooRouter(
+            session = mooSession,
+            strictUnknownResponseRequestId = featureFlags.strictMooUnknownRequestIdDisconnect
+        )
 
         logRuntimeConfigSnapshot(runtimeConfigResolution)
     }
@@ -2690,6 +3137,9 @@ class MainActivity : Activity() {
         }
 
         logDebug("Starting automatic discovery and pairing")
+        connectionOrchestrator.transition(RoonConnectionState.Discovering)
+        discoveryStartedAtMs = System.currentTimeMillis()
+        logStructuredNetworkEvent(event = "DISCOVERY_START")
 
         when (val strategy = connectionRoutingUseCase.strategyForDiscoveryStartup(toPairedCoreSnapshots())) {
             is ConnectionRecoveryStrategy.Connect -> {
@@ -2744,12 +3194,17 @@ class MainActivity : Activity() {
                     val selectedCore = orchestrationResult.selectedCore
                     if (selectedCore != null) {
                         logDebug("Auto-connecting to discovered core: ${selectedCore.ip}:${selectedCore.port}")
+                        logStructuredNetworkEvent(
+                            event = "DISCOVERY_SELECTED_CORE",
+                            details = "host=${selectedCore.ip} port=${selectedCore.port}"
+                        )
                         startConnectionTo(
                             ip = selectedCore.ip,
                             port = selectedCore.port,
                             statusMessage = "Found Roon Core. Connecting..."
                         )
                     } else {
+                        connectionOrchestrator.transition(RoonConnectionState.Failed, "no_core_discovered")
                         updateStatus("Roon Core not found. Please check your network.")
                         logWarning("No Roon Cores discovered, showing manual options")
                         
@@ -2758,6 +3213,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 logError("Automatic discovery failed: ${e.message}", e)
+                connectionOrchestrator.transition(RoonConnectionState.Failed, e.message)
                 mainHandler.post {
                     multicastLock?.release()
                     updateStatus("Auto-discovery failed. Check your network and try again.")
@@ -2780,6 +3236,13 @@ class MainActivity : Activity() {
             ConnectionRecoveryStrategy.NoOp -> return
             is ConnectionRecoveryStrategy.Connect -> {
                 autoReconnectAttempted = true
+                connectionOrchestrator.transition(RoonConnectionState.Reconnecting)
+                reconnectStartedAtMs = System.currentTimeMillis()
+                reconnectCount += 1
+                logStructuredNetworkEvent(
+                    event = "RECONNECT_START",
+                    details = "count=$reconnectCount target=${strategy.target.host}:${strategy.target.port}"
+                )
                 logDebug("Attempting auto-reconnection to ${strategy.target.host}:${strategy.target.port}")
                 startConnectionTo(
                     ip = strategy.target.host,
@@ -2790,6 +3253,7 @@ class MainActivity : Activity() {
             }
             ConnectionRecoveryStrategy.Discover -> {
                 autoReconnectAttempted = true
+                connectionOrchestrator.transition(RoonConnectionState.Discovering)
                 logDebug("No paired cores found, starting auto-discovery")
                 updateStatus(STATUS_START_AUTO_DISCOVERY)
                 mainHandler.postDelayed({
@@ -3111,6 +3575,7 @@ class MainActivity : Activity() {
                 discoveryPort = discoveryNetworkConfig.discoveryPort,
                 socketTimeoutMs = discoveryTimingConfig.activeSoodSocketTimeoutMs,
                 listenWindowMs = discoveryTimingConfig.activeSoodListenWindowMs,
+                includeInterfaceBroadcastTargets = featureFlags.newSoodCodec,
                 onResponse = { payload, sourceIp ->
                     if (payload.isNotEmpty()) {
                         logDebug("📨 SOOD response from $sourceIp")
@@ -3307,6 +3772,7 @@ class MainActivity : Activity() {
         statusMessage: String = "✅ Found Roon Core: $ip:$port"
     ) {
         val normalizedKey = "$ip:$port"
+        val isFirstDiscovery = discoveredCores.isEmpty()
         val coreInfo = RoonCoreInfo(
             ip = ip,
             name = name,
@@ -3319,6 +3785,13 @@ class MainActivity : Activity() {
         // 发现结果、连接历史、自动重连都依赖同一标识，统一口径可避免“同 Core 多份状态”。
         discoveredCores[normalizedKey] = coreInfo
         saveSuccessfulConnection(ip, port)
+        if (isFirstDiscovery && discoveryStartedAtMs > 0L) {
+            val discoveryLatencyMs = System.currentTimeMillis() - discoveryStartedAtMs
+            logStructuredNetworkEvent(
+                event = "DISCOVERY_FIRST_CORE",
+                details = "latency_ms=$discoveryLatencyMs method=$detectionMethod host=$ip:$port"
+            )
+        }
         mainHandler.post {
             updateStatus(statusMessage)
         }
@@ -3344,6 +3817,13 @@ class MainActivity : Activity() {
             updateStatus("Connecting. Please wait...")
             return
         }
+
+        val connectionId = nextConnectionId()
+        connectionOrchestrator.transition(RoonConnectionState.Connecting)
+        logStructuredNetworkEvent(
+            event = "CONNECT_START",
+            details = "target=$hostInput assigned_connection_id=$connectionId"
+        )
         
         updateStatus("Validating connection...")
         
@@ -3401,6 +3881,19 @@ class MainActivity : Activity() {
                 logDebug("Attempting WebSocket connection to $host:$port")
                 newClient.connect()
                 logDebug("WebSocket connection successful")
+                connectionOrchestrator.transition(RoonConnectionState.Connected)
+                logStructuredNetworkEvent(
+                    event = "CONNECT_OK",
+                    details = "host=$host port=$port"
+                )
+                if (reconnectStartedAtMs > 0L) {
+                    val reconnectLatencyMs = System.currentTimeMillis() - reconnectStartedAtMs
+                    logStructuredNetworkEvent(
+                        event = "RECONNECT_LATENCY",
+                        details = "latency_ms=$reconnectLatencyMs count=$reconnectCount"
+                    )
+                    reconnectStartedAtMs = 0L
+                }
                 
                 withContext(Dispatchers.Main) {
                     updateStatus("Connected. Listening for messages...")
@@ -3414,6 +3907,14 @@ class MainActivity : Activity() {
                 
             } catch (e: Exception) {
                 logError("Connection failed: ${e.message}", e)
+                connectionOrchestrator.transition(
+                    state = RoonConnectionState.Failed,
+                    error = e.message
+                )
+                logStructuredNetworkEvent(
+                    event = "CONNECT_FAIL",
+                    details = e.message ?: "unknown"
+                )
                 withContext(Dispatchers.Main) {
                     updateStatus("Connection failed: ${e.message}")
                     healthMonitor.stopMonitoring()
@@ -3433,24 +3934,50 @@ class MainActivity : Activity() {
         healthMonitor.stopMonitoring()
         webSocketClient?.disconnect()
         webSocketClient = null
+        subscriptionRegistry.clear()
+        mooSession.clearPending()
+        queueStore.clear()
+        zoneStateStore.reset()
         pendingImageRequests.clear()
         currentQueueSubscriptionZoneId = null
         currentQueueSubscriptionKey = null
+        lastQueueSubscribeRequestAtMs = 0L
         expectedNextPreviewTrackId = null
         expectedNextPreviewImageKey = null
         queueSnapshot = null
+        lastQueueListFingerprint = null
         currentNowPlayingQueueItemId = null
         currentNowPlayingItemKey = null
+        pendingTrackTransition = null
+        activeTransitionSession = null
+        transitionIntentStartedAtMs.clear()
+        tapToVisualLoggedTokens.clear()
+        lastRenderedTransitionTrackId = null
+        activeTrackTransitionAnimator?.cancel()
+        activeTrackTransitionAnimator = null
+        activeTextTransitionAnimator?.cancel()
+        activeTextTransitionAnimator = null
+        cancelActiveTextAnimators()
+        activeRollbackTintAnimator?.cancel()
+        activeRollbackTintAnimator = null
         connectionGuard.finish()
         registrationAuthHintJob?.cancel()
         registrationAuthHintJob = null
         authDialogShown = false
         autoReconnectAttempted = false // Allow future auto-reconnection attempts
+        connectionOrchestrator.transition(RoonConnectionState.Disconnected)
+        logStructuredNetworkEvent(event = "DISCONNECT")
         updateStatus("Not connected to Roon")
         resetDisplay()
     }
     
     private fun sendMoo(mooMessage: String) {
+        val requestId = extractRequestIdOrNull(mooMessage)
+        logStructuredNetworkEvent(
+            event = "MOO_SEND",
+            requestId = requestId,
+            details = mooMessage.lineSequence().firstOrNull().orEmpty()
+        )
         webSocketClient?.sendWebSocketFrame(mooMessage)
     }
     
@@ -3547,6 +4074,19 @@ class MainActivity : Activity() {
 
     private fun sendRegistration() {
         val request = prepareRegisterRequest(includeSettings = true)
+        registrationStartedAtMs = System.currentTimeMillis()
+        registerMooPendingRequest(
+            requestId = request.requestId,
+            endpoint = "com.roonlabs.registry:1/register",
+            category = MooRequestCategory.ONE_SHOT,
+            timeoutMs = connectionConfig.webSocketReadTimeoutMs.toLong().coerceAtLeast(10_000L)
+        )
+        connectionOrchestrator.transition(RoonConnectionState.Registering)
+        logStructuredNetworkEvent(
+            event = "REGISTER_SEND",
+            requestId = request.requestId.toString(),
+            details = "has_token=${request.hasToken}"
+        )
         logDebug("Sending registration message (with token: ${request.hasToken}):\n${request.mooMessage}")
         sendMoo(request.mooMessage)
 
@@ -3656,6 +4196,11 @@ class MainActivity : Activity() {
     
     private fun sendInfoRequest() {
         val requestId = nextRequestId()
+        registerMooPendingRequest(
+            requestId = requestId,
+            endpoint = "com.roonlabs.registry:1/info",
+            category = MooRequestCategory.ONE_SHOT
+        )
         
         val mooMessage = buildString {
             append("MOO/1 REQUEST com.roonlabs.registry:1/info\n")
@@ -3666,6 +4211,11 @@ class MainActivity : Activity() {
         }
         
         logDebug("Sending core info request (Request-Id: $requestId)")
+        logStructuredNetworkEvent(
+            event = "INFO_REQUEST_SEND",
+            requestId = requestId.toString(),
+            details = "registry/info"
+        )
         sendMoo(mooMessage)
     }
     
@@ -3700,6 +4250,60 @@ class MainActivity : Activity() {
             val jsonBody = mooMessage.jsonBody
             
             logDebug("Parsed - Verb: $verb, Service: $servicePath, RequestId: $requestId, Body: $jsonBody")
+            if (featureFlags.newMooRouter && requestId.isNullOrBlank()) {
+                val details = "verb=$verb service=$servicePath"
+                logStructuredNetworkEvent(event = "MOO_MISSING_REQUEST_ID", details = details)
+                if (featureFlags.strictMooUnknownRequestIdDisconnect) {
+                    disconnect()
+                    return
+                }
+            }
+            if (featureFlags.newSubscriptionRegistry) {
+                handleSubscriptionLifecycle(
+                    verb = verb,
+                    servicePath = servicePath,
+                    requestId = requestId
+                )
+            }
+            if (featureFlags.newMooRouter) {
+                val routed = mooRouter.route(
+                    message = mooMessage,
+                    onInboundRequest = { _ -> },
+                    onInboundResponse = { responseMessage, pending ->
+                        if (pending != null) {
+                            logStructuredNetworkEvent(
+                                event = "MOO_RESPONSE_MATCHED",
+                                requestId = responseMessage.requestId,
+                                details = "endpoint=${pending.endpoint} verb=${responseMessage.verb}"
+                            )
+                        }
+                    },
+                    onInboundSubscriptionEvent = { subscriptionMessage, pending ->
+                        val requestIdValue = subscriptionMessage.requestId.orEmpty()
+                        val metadata = subscriptionRegistry.getByRequestId(requestIdValue)
+                        logStructuredNetworkEvent(
+                            event = "MOO_SUBSCRIPTION_EVENT",
+                            requestId = subscriptionMessage.requestId,
+                            subscriptionKey = metadata?.subscriptionKey,
+                            zoneId = metadata?.zoneId,
+                            details = pending.endpoint
+                        )
+                    },
+                    onProtocolError = { error ->
+                        logStructuredNetworkEvent(
+                            event = "MOO_ROUTER_ERROR",
+                            requestId = requestId,
+                            details = error
+                        )
+                        if (featureFlags.strictMooUnknownRequestIdDisconnect) {
+                            disconnect()
+                        }
+                    }
+                )
+                if (!routed && featureFlags.strictMooUnknownRequestIdDisconnect) {
+                    return
+                }
+            }
             
             // Send default success response for REQUEST to prevent timeout on Roon side
             if (verb == "REQUEST") {
@@ -3933,6 +4537,9 @@ class MainActivity : Activity() {
                 val (host, port) = parseHostPortInput(hostInput)
                 
                 val currentCoreId = saveResult.coreId ?: ""
+                if (currentCoreId.isNotBlank()) {
+                    pairedCoreRepository.savePairedCoreId(currentCoreId)
+                }
                 pairedCores[hostInput] = PairedCoreInfo(
                     ip = host,
                     port = port,
@@ -3952,6 +4559,20 @@ class MainActivity : Activity() {
 
                 // Reset authorization flag since pairing is successful
                 authDialogShown = false
+                connectionOrchestrator.transition(RoonConnectionState.Connected)
+                if (registrationStartedAtMs > 0L) {
+                    val registerLatencyMs = System.currentTimeMillis() - registrationStartedAtMs
+                    logStructuredNetworkEvent(
+                        event = "REGISTER_LATENCY",
+                        coreId = currentCoreId.takeIf { it.isNotBlank() },
+                        details = "latency_ms=$registerLatencyMs"
+                    )
+                }
+                logStructuredNetworkEvent(
+                    event = "REGISTER_OK",
+                    coreId = currentCoreId.takeIf { it.isNotBlank() },
+                    details = "host=$hostInput"
+                )
                 
                 mainHandler.post {
                     updateStatus("✅ Auto-pairing succeeded. Subscribing...")
@@ -3965,12 +4586,22 @@ class MainActivity : Activity() {
                 logDebug("Settings service initialized and ready to handle requests")
                 
                 // Subscribe to transport service - pairing is now complete
+                subscriptionRestoreStartedAtMs = System.currentTimeMillis()
                 subscribeToTransport()
                 
             } else {
                 // First time connection - authorization needed in Roon
                 // According to official docs, this is normal for first-time pairing
                 logDebug("First-time connection: authorization needed in Roon")
+                connectionOrchestrator.transition(RoonConnectionState.WaitingApproval)
+                if (registrationStartedAtMs > 0L) {
+                    val registerLatencyMs = System.currentTimeMillis() - registrationStartedAtMs
+                    logStructuredNetworkEvent(
+                        event = "REGISTER_WAITING_APPROVAL_LATENCY",
+                        details = "latency_ms=$registerLatencyMs"
+                    )
+                }
+                logStructuredNetworkEvent(event = "REGISTER_WAITING_APPROVAL")
                 
                 mainHandler.post {
                     updateStatus("First connection: enable the extension in Roon")
@@ -3982,9 +4613,23 @@ class MainActivity : Activity() {
     
     private fun subscribeToTransport() {
         val requestId = nextRequestId()
+        registerMooPendingRequest(
+            requestId = requestId,
+            endpoint = "com.roonlabs.transport:2/subscribe_zones",
+            category = MooRequestCategory.SUBSCRIPTION,
+            timeoutMs = connectionConfig.webSocketReadTimeoutMs.toLong().coerceAtLeast(15_000L)
+        )
         
         // Generate a unique subscription key for this transport subscription
         val subscriptionKey = "zones_subscription_${System.currentTimeMillis()}"
+        if (featureFlags.newSubscriptionRegistry) {
+            subscriptionRegistry.registerPending(
+                requestId = requestId.toString(),
+                endpoint = "com.roonlabs.transport:2/subscribe_zones",
+                subscriptionKey = subscriptionKey,
+                zoneId = null
+            )
+        }
         
         val body = JSONObject().apply {
             put("subscription_key", subscriptionKey)
@@ -4004,16 +4649,59 @@ class MainActivity : Activity() {
         }
         
         logDebug("Sending transport subscribe message with subscription_key: $subscriptionKey")
+        logStructuredNetworkEvent(
+            event = "SUBSCRIBE_ZONES_SEND",
+            requestId = requestId.toString(),
+            subscriptionKey = subscriptionKey
+        )
         logDebug("Transport request:\n$mooMessage")
         sendMoo(mooMessage)
     }
 
-    private fun ensureQueueSubscription(zoneId: String?) {
+    private fun ensureQueueSubscription(
+        zoneId: String?,
+        forceResubscribe: Boolean = false,
+        reason: String = "normal"
+    ) {
         if (zoneId.isNullOrBlank()) return
-        if (zoneId == currentQueueSubscriptionZoneId && !currentQueueSubscriptionKey.isNullOrBlank()) return
+        if (featureFlags.newZoneStore) {
+            queueStore.setCurrentZone(zoneId)
+        }
+        if (!forceResubscribe && zoneId == currentQueueSubscriptionZoneId && !currentQueueSubscriptionKey.isNullOrBlank()) return
+
+        val now = System.currentTimeMillis()
+        if (forceResubscribe && now - lastQueueSubscribeRequestAtMs < QUEUE_RESUBSCRIBE_DEBOUNCE_MS) {
+            logRuntimeInfo("Skip queue resubscribe due to debounce: zone=$zoneId reason=$reason")
+            return
+        }
+
+        val previousSubscriptionKey = currentQueueSubscriptionKey
+        val previousZoneId = currentQueueSubscriptionZoneId
+        if (
+            featureFlags.newSubscriptionRegistry &&
+            !previousSubscriptionKey.isNullOrBlank() &&
+            !previousZoneId.isNullOrBlank() &&
+            previousZoneId != zoneId
+        ) {
+            sendQueueUnsubscribe(previousSubscriptionKey, "zone-switch:$previousZoneId->$zoneId")
+        }
 
         val requestId = nextRequestId()
+        registerMooPendingRequest(
+            requestId = requestId,
+            endpoint = "com.roonlabs.transport:2/subscribe_queue",
+            category = MooRequestCategory.SUBSCRIPTION,
+            timeoutMs = connectionConfig.webSocketReadTimeoutMs.toLong().coerceAtLeast(15_000L)
+        )
         val subscriptionKey = "queue_subscription_${System.currentTimeMillis()}"
+        if (featureFlags.newSubscriptionRegistry) {
+            subscriptionRegistry.registerPending(
+                requestId = requestId.toString(),
+                endpoint = "com.roonlabs.transport:2/subscribe_queue",
+                subscriptionKey = subscriptionKey,
+                zoneId = zoneId
+            )
+        }
         val body = JSONObject().apply {
             put("subscription_key", subscriptionKey)
             put("zone_or_output_id", zoneId)
@@ -4034,8 +4722,123 @@ class MainActivity : Activity() {
 
         currentQueueSubscriptionZoneId = zoneId
         currentQueueSubscriptionKey = subscriptionKey
-        logRuntimeInfo("Queue subscribe request sent: zone=$zoneId subscriptionKey=$subscriptionKey")
+        lastQueueSubscribeRequestAtMs = now
+        logRuntimeInfo(
+            "Queue subscribe request sent: zone=$zoneId subscriptionKey=$subscriptionKey force=$forceResubscribe reason=$reason"
+        )
+        logStructuredNetworkEvent(
+            event = "SUBSCRIBE_QUEUE_SEND",
+            requestId = requestId.toString(),
+            subscriptionKey = subscriptionKey,
+            zoneId = zoneId,
+            details = "reason=$reason force=$forceResubscribe"
+        )
         sendMoo(mooMessage)
+    }
+
+    private fun sendQueueUnsubscribe(
+        subscriptionKey: String,
+        reason: String
+    ) {
+        val requestId = nextRequestId()
+        registerMooPendingRequest(
+            requestId = requestId,
+            endpoint = "com.roonlabs.transport:2/unsubscribe_queue",
+            category = MooRequestCategory.ONE_SHOT
+        )
+        val body = JSONObject().apply {
+            put("subscription_key", subscriptionKey)
+        }
+        val bodyString = body.toString()
+        val bodyBytes = bodyString.toByteArray(Charsets.UTF_8)
+        val mooMessage = buildString {
+            append("MOO/1 REQUEST com.roonlabs.transport:2/unsubscribe_queue\n")
+            append("Request-Id: $requestId\n")
+            append("Content-Type: application/json\n")
+            append("User-Agent: RoonPlayerAndroid/1.0\n")
+            append("Host: ${getHostInput()}\n")
+            append("Content-Length: ${bodyBytes.size}\n")
+            append("\n")
+            append(bodyString)
+        }
+        if (featureFlags.newSubscriptionRegistry) {
+            subscriptionRegistry.removeBySubscriptionKey(subscriptionKey)
+        }
+        logStructuredNetworkEvent(
+            event = "UNSUBSCRIBE_QUEUE_SEND",
+            requestId = requestId.toString(),
+            subscriptionKey = subscriptionKey,
+            details = reason
+        )
+        sendMoo(mooMessage)
+    }
+
+    private fun requestQueueSnapshotRefresh(reason: String) {
+        val zoneId = resolveTransportZoneId()
+        if (zoneId.isNullOrBlank()) return
+        ensureQueueSubscription(
+            zoneId = zoneId,
+            forceResubscribe = true,
+            reason = reason
+        )
+    }
+
+    private fun handleSubscriptionLifecycle(
+        verb: String,
+        servicePath: String,
+        requestId: String?
+    ) {
+        val normalizedRequestId = requestId?.takeIf { it.isNotBlank() } ?: return
+        val isSubscriptionPath = servicePath.contains("subscribe") || servicePath.contains("unsubscribe")
+        if (!isSubscriptionPath) {
+            return
+        }
+
+        val pending = subscriptionRegistry.getByRequestId(normalizedRequestId)
+        if (pending == null) {
+            logStructuredNetworkEvent(
+                event = "SUBSCRIPTION_UNKNOWN_REQUEST_ID",
+                requestId = normalizedRequestId,
+                details = "verb=$verb service=$servicePath"
+            )
+            if (featureFlags.strictMooUnknownRequestIdDisconnect) {
+                disconnect()
+            }
+            return
+        }
+
+        when {
+            verb == "RESPONSE" || (verb == "CONTINUE" && servicePath.contains("Subscribed", ignoreCase = true)) -> {
+                val active = subscriptionRegistry.activateByRequestId(normalizedRequestId)
+                logStructuredNetworkEvent(
+                    event = "SUBSCRIPTION_ACTIVE",
+                    requestId = normalizedRequestId,
+                    subscriptionKey = active?.subscriptionKey ?: pending.subscriptionKey,
+                    zoneId = active?.zoneId ?: pending.zoneId,
+                    details = servicePath
+                )
+            }
+            verb == "COMPLETE" && servicePath.contains("Unsubscribed", ignoreCase = true) -> {
+                val removed = subscriptionRegistry.removeByRequestId(normalizedRequestId)
+                logStructuredNetworkEvent(
+                    event = "SUBSCRIPTION_REMOVED",
+                    requestId = normalizedRequestId,
+                    subscriptionKey = removed?.subscriptionKey ?: pending.subscriptionKey,
+                    zoneId = removed?.zoneId ?: pending.zoneId,
+                    details = servicePath
+                )
+            }
+            verb == "COMPLETE" && servicePath.contains("subscribe", ignoreCase = true) -> {
+                val removed = subscriptionRegistry.removeByRequestId(normalizedRequestId)
+                logStructuredNetworkEvent(
+                    event = "SUBSCRIPTION_COMPLETE",
+                    requestId = normalizedRequestId,
+                    subscriptionKey = removed?.subscriptionKey ?: pending.subscriptionKey,
+                    zoneId = removed?.zoneId ?: pending.zoneId,
+                    details = servicePath
+                )
+            }
+        }
     }
 
     private fun toZoneSnapshots(zones: Map<String, JSONObject>): Map<String, ZoneSnapshot> {
@@ -4052,13 +4855,22 @@ class MainActivity : Activity() {
     }
 
     private fun toPairedCoreSnapshots(): List<PairedCoreSnapshot> {
+        val preferredCoreId = pairedCoreRepository.getPairedCoreId()
         val snapshots = ArrayList<PairedCoreSnapshot>(pairedCores.size)
         for (pairedCore in pairedCores.values) {
+            val routingTimestamp = if (
+                !preferredCoreId.isNullOrBlank() &&
+                preferredCoreId == pairedCore.coreId
+            ) {
+                Long.MAX_VALUE
+            } else {
+                pairedCore.lastConnected
+            }
             snapshots.add(
                 PairedCoreSnapshot(
                     host = pairedCore.ip,
                     port = pairedCore.port,
-                    lastConnected = pairedCore.lastConnected
+                    lastConnected = routingTimestamp
                 )
             )
         }
@@ -4067,17 +4879,42 @@ class MainActivity : Activity() {
     
     private fun handleZoneUpdate(body: JSONObject) {
         try {
+            val effectiveBody = if (featureFlags.newZoneStore) {
+                val snapshot = zoneStateStore.apply(body)
+                val normalizedZones = JSONArray()
+                for ((_, zone) in snapshot.zones) {
+                    normalizedZones.put(JSONObject(zone.toString()))
+                }
+                JSONObject().apply {
+                    put("zones", normalizedZones)
+                }
+            } else {
+                body
+            }
+
             // 支持多种数据格式：
             // 1. 初始订阅的"zones"
             // 2. 变化事件的"zones_changed" 
             // 3. 播放变化的"zones_now_playing_changed"
-            val zones = body.optJSONArray("zones") 
-                ?: body.optJSONArray("zones_changed")
-                ?: body.optJSONArray("zones_now_playing_changed")
+            val zones = effectiveBody.optJSONArray("zones")
+                ?: effectiveBody.optJSONArray("zones_changed")
+                ?: effectiveBody.optJSONArray("zones_now_playing_changed")
             
             if (zones != null && zones.length() > 0) {
                 
                 logDebug("Received ${zones.length()} zone(s)")
+                if (subscriptionRestoreStartedAtMs > 0L) {
+                    val restoreLatencyMs = System.currentTimeMillis() - subscriptionRestoreStartedAtMs
+                    logStructuredNetworkEvent(
+                        event = "SUBSCRIPTION_RESTORE_LATENCY",
+                        details = "latency_ms=$restoreLatencyMs"
+                    )
+                    subscriptionRestoreStartedAtMs = 0L
+                }
+
+                if (featureFlags.newZoneStore) {
+                    availableZones.clear()
+                }
                 
                 // 1. 更新可用Zone数据
                 for (i in 0 until zones.length()) {
@@ -4142,11 +4979,10 @@ class MainActivity : Activity() {
                             val currentAlbum = snapshotState.albumText
 
                             val trackChanged = title != currentTitle || artist != currentArtist || album != currentAlbum
-                            val trackTransitionDirection = if (trackChanged) {
-                                consumeTrackTransitionDirection()
-                            } else {
-                                TrackTransitionDirection.UNKNOWN
-                            }
+                            val pendingTransition = if (trackChanged) consumePendingTrackTransition() else null
+                            val trackTransitionDirection = pendingTransition?.direction ?: TrackTransitionDirection.UNKNOWN
+                            val transitionKey = pendingTransition?.key ?: trackTransitionStore.state.value.currentKey
+                            val transitionTrack = playbackInfoToTransitionTrack(playbackInfo)
 
                             if (trackChanged) {
                                 updateTrackPreviewHistory(
@@ -4158,7 +4994,16 @@ class MainActivity : Activity() {
                                     newImageRef = playbackInfo.imageKey
                                 )
                                 logDebug("🎵 Track info changed - Title: '$title', Artist: '$artist', Album: '$album'")
-                                updateTrackInfo(title, artist, album)
+                                dispatchTrackTransitionIntent(
+                                    TrackTransitionIntent.EngineUpdate(
+                                        EngineEvent.Playing(
+                                            key = transitionKey,
+                                            track = transitionTrack,
+                                            anchorPositionMs = 0L,
+                                            anchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+                                        )
+                                    )
+                                )
                             } else {
                                 logDebug("🎵 Track info unchanged - keeping current display")
                             }
@@ -4177,10 +5022,6 @@ class MainActivity : Activity() {
                             } else {
                                 logDebug("⏸️ Music not playing (state: '$state') - scheduling delayed art wall switch")
                                 handlePlaybackStopped()
-                            }
-
-                            if (trackChanged) {
-                                animateTrackTransition(trackTransitionDirection)
                             }
 
                             val imageKey = playbackInfo.imageKey
@@ -4328,6 +5169,19 @@ class MainActivity : Activity() {
 
     private fun handleQueueUpdate(body: JSONObject) {
         try {
+            if (featureFlags.newZoneStore) {
+                val payloadZoneId = extractQueuePayloadZoneId(body)
+                val accepted = queueStore.updateIfMatchesCurrentZone(payloadZoneId, body)
+                if (accepted == null) {
+                    logStructuredNetworkEvent(
+                        event = "QUEUE_IGNORED_NON_CURRENT_ZONE",
+                        zoneId = payloadZoneId,
+                        details = "current_zone=${queueStore.snapshot().currentZoneId}"
+                    )
+                    return
+                }
+            }
+
             val hasDetailedQueue = hasDetailedQueueItemsPayload(body)
             val snapshot = extractQueueSnapshot(body) ?: run {
                 val keys = buildString {
@@ -4337,29 +5191,111 @@ class MainActivity : Activity() {
                         append(iterator.next())
                     }
                 }
+                clearTrackPreviewHistory()
+                queueSnapshot = null
+                lastQueueListFingerprint = null
                 if (hasDetailedQueue) {
-                    logRuntimeInfo("Queue update has detailed queue but no valid snapshot. clearing preview. keys=[$keys], payload=${body.toString().take(260)}")
-                    queueNextTrackPreviewFrame = null
-                    expectedNextPreviewTrackId = null
-                    expectedNextPreviewImageKey = null
-                    queueSnapshot = null
+                    logRuntimeInfo("Queue update has detailed queue but no valid snapshot. clearing preview and forcing refresh. keys=[$keys], payload=${body.toString().take(260)}")
+                    requestQueueSnapshotRefresh("invalid-detailed-queue-snapshot")
                 } else {
-                    logRuntimeInfo("Queue update has no detailed queue items. keeping current preview. keys=[$keys], payload=${body.toString().take(260)}")
+                    logRuntimeInfo("Queue update has no detailed queue items. clearing stale queue preview and forcing refresh. keys=[$keys], payload=${body.toString().take(260)}")
+                    requestQueueSnapshotRefresh("incremental-queue-update")
                 }
                 return
             }
 
+            val queueListFingerprint = buildQueueListFingerprint(snapshot)
+            val isNewQueueList = queueListFingerprint != lastQueueListFingerprint
+            lastQueueListFingerprint = queueListFingerprint
+            if (isNewQueueList) {
+                clearTrackPreviewHistory()
+                clearQueuePreviewFetchStateForFullRefresh()
+                logRuntimeInfo(
+                    "Queue list changed. force refresh all covers: total=${snapshot.items.size} currentIndex=${snapshot.currentIndex}"
+                )
+            }
+
             queueSnapshot = snapshot
             resolveNextQueueTrack(snapshot)?.let { nextTrack ->
-                updateQueueNextPreview(nextTrack)
+                updateQueueNextPreview(
+                    nextTrack = nextTrack,
+                    forceNetworkRefresh = isNewQueueList
+                )
             } ?: run {
                 queueNextTrackPreviewFrame = null
                 expectedNextPreviewTrackId = null
                 expectedNextPreviewImageKey = null
             }
-            prefetchQueuePreviewImages(snapshot)
+            prefetchQueuePreviewImages(
+                snapshot = snapshot,
+                forceNetworkRefresh = isNewQueueList
+            )
         } catch (e: Exception) {
             logError("Error handling queue update: ${e.message}", e)
+        }
+    }
+
+    private fun extractQueuePayloadZoneId(body: JSONObject): String? {
+        val directZone = body.optString("zone_or_output_id").takeIf { it.isNotBlank() }
+        if (directZone != null) return directZone
+
+        body.optJSONObject("queue")?.optString("zone_or_output_id")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        body.optJSONObject("queue_changed")?.optString("zone_or_output_id")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        body.optJSONArray("queues")?.let { queues ->
+            for (i in 0 until queues.length()) {
+                val zoneId = queues.optJSONObject(i)
+                    ?.optString("zone_or_output_id")
+                    ?.takeIf { it.isNotBlank() }
+                if (zoneId != null) return zoneId
+            }
+        }
+        body.optJSONArray("queues_changed")?.let { queues ->
+            for (i in 0 until queues.length()) {
+                val zoneId = queues.optJSONObject(i)
+                    ?.optString("zone_or_output_id")
+                    ?.takeIf { it.isNotBlank() }
+                if (zoneId != null) return zoneId
+            }
+        }
+
+        val zoneKeys = listOf("zones", "zones_changed", "zones_now_playing_changed", "zones_state_changed")
+        for (zoneKey in zoneKeys) {
+            body.optJSONArray(zoneKey)?.let { zones ->
+                for (i in 0 until zones.length()) {
+                    val zoneId = zones.optJSONObject(i)
+                        ?.optString("zone_id")
+                        ?.takeIf { it.isNotBlank() }
+                    if (zoneId != null) return zoneId
+                }
+            }
+        }
+        return null
+    }
+
+    private fun buildQueueListFingerprint(snapshot: QueueSnapshot): String {
+        val builder = StringBuilder()
+        builder.append(snapshot.items.size).append('#')
+        for (item in snapshot.items) {
+            builder.append(item.queueItemId ?: "")
+                .append('|')
+                .append(item.itemKey ?: "")
+                .append('|')
+                .append(item.imageKey ?: "")
+                .append(';')
+        }
+        return builder.toString()
+    }
+
+    private fun clearQueuePreviewFetchStateForFullRefresh() {
+        imageBitmapByImageKey.clear()
+        pendingImageRequests.entries.removeIf { entry ->
+            entry.value.purpose == ImageRequestPurpose.NEXT_PREVIEW ||
+                entry.value.purpose == ImageRequestPurpose.QUEUE_PREFETCH
         }
     }
 
@@ -4513,15 +5449,33 @@ class MainActivity : Activity() {
             currentIndex in items.indices -> currentIndex + 1
             else -> {
                 val currentImageKey = sharedPreferences.getString("current_image_key", "").orEmpty()
-                val firstImageKey = items.firstOrNull()?.imageKey.orEmpty()
-                if (currentImageKey.isNotBlank() && firstImageKey == currentImageKey) 1 else 0
+                if (currentImageKey.isBlank()) {
+                    null
+                } else {
+                    val currentByImage = items.indexOfFirst { it.imageKey == currentImageKey }
+                    if (currentByImage >= 0) currentByImage + 1 else null
+                }
             }
         }
-        if (nextIndex !in items.indices) return null
+        if (nextIndex == null || nextIndex !in items.indices) return null
         return items[nextIndex]
     }
 
-    private fun updateQueueNextPreview(nextTrack: QueueTrackInfo) {
+    private fun resolvePreviousQueueTrack(snapshot: QueueSnapshot): QueueTrackInfo? {
+        val items = snapshot.items
+        if (items.isEmpty()) return null
+        if (items.size == 1) return null
+        val currentIndex = snapshot.currentIndex
+        if (currentIndex !in items.indices) return null
+        val previousIndex = currentIndex - 1
+        if (previousIndex !in items.indices) return null
+        return items[previousIndex]
+    }
+
+    private fun updateQueueNextPreview(
+        nextTrack: QueueTrackInfo,
+        forceNetworkRefresh: Boolean = false
+    ) {
         val imageKey = nextTrack.imageKey
         if (imageKey.isNullOrBlank()) {
             logRuntimeWarning("Queue next track has no image_key: ${nextTrack.title ?: "unknown"}")
@@ -4544,10 +5498,12 @@ class MainActivity : Activity() {
         if (memoryBitmap != null) {
             queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = trackId, bitmap = memoryBitmap)
             logRuntimeInfo("Next preview hit memory cache: trackId=$trackId imageKey=$imageKey")
-            return
+            if (!forceNetworkRefresh) {
+                return
+            }
         }
 
-        if (!hasPendingImageRequestForKey(imageKey)) {
+        if (forceNetworkRefresh || !hasPendingImageRequestForKey(imageKey)) {
             logRuntimeInfo("Queue next resolved: title='${nextTrack.title ?: "unknown"}', imageKey=$imageKey, trackId=$trackId")
             requestImage(
                 imageKey = imageKey,
@@ -4559,7 +5515,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun prefetchQueuePreviewImages(snapshot: QueueSnapshot) {
+    private fun prefetchQueuePreviewImages(
+        snapshot: QueueSnapshot,
+        forceNetworkRefresh: Boolean = false
+    ) {
         if (snapshot.items.isEmpty()) return
 
         val requestOrder = LinkedHashSet<Int>()
@@ -4574,11 +5533,13 @@ class MainActivity : Activity() {
         }
 
         var requestedCount = 0
+        val requestedKeys = HashSet<String>()
         for (index in requestOrder) {
             if (index !in snapshot.items.indices) continue
             val imageKey = snapshot.items[index].imageKey ?: continue
-            if (getPreviewBitmapForImageKey(imageKey) != null) continue
-            if (hasPendingImageRequestForKey(imageKey)) continue
+            if (!requestedKeys.add(imageKey)) continue
+            if (!forceNetworkRefresh && getPreviewBitmapForImageKey(imageKey) != null) continue
+            if (!forceNetworkRefresh && hasPendingImageRequestForKey(imageKey)) continue
 
             requestImage(
                 imageKey = imageKey,
@@ -4591,7 +5552,7 @@ class MainActivity : Activity() {
 
         if (requestedCount > 0) {
             logRuntimeInfo(
-                "Queue prefetch started: requested=$requestedCount total=${snapshot.items.size} currentIndex=${snapshot.currentIndex}"
+                "Queue prefetch started: requested=$requestedCount total=${snapshot.items.size} currentIndex=${snapshot.currentIndex} force=$forceNetworkRefresh"
             )
         }
     }
@@ -4618,6 +5579,19 @@ class MainActivity : Activity() {
     private fun hasPendingImageRequestForKey(imageKey: String): Boolean {
         for (request in pendingImageRequests.values) {
             if (request.imageKey == imageKey) return true
+        }
+        return false
+    }
+
+    private fun shouldIgnoreCurrentAlbumResponse(requestContext: ImageRequestContext?): Boolean {
+        val requestedImageKey = requestContext?.imageKey ?: return false
+        val expectedImageKey = sharedPreferences.getString("current_image_key", "").orEmpty()
+        if (expectedImageKey.isBlank()) return false
+        if (requestedImageKey != expectedImageKey) {
+            logRuntimeInfo(
+                "Ignore stale current album image response: expected=$expectedImageKey actual=$requestedImageKey"
+            )
+            return true
         }
         return false
     }
@@ -4675,6 +5649,12 @@ class MainActivity : Activity() {
     ) {
         val requestId = nextRequestId()
         val requestIdString = requestId.toString()
+        registerMooPendingRequest(
+            requestId = requestId,
+            endpoint = "com.roonlabs.image:1/get_image",
+            category = MooRequestCategory.ONE_SHOT,
+            timeoutMs = connectionConfig.webSocketReadTimeoutMs.toLong().coerceAtLeast(20_000L)
+        )
 
         pendingImageRequests[requestIdString] = ImageRequestContext(
             purpose = purpose,
@@ -4728,6 +5708,7 @@ class MainActivity : Activity() {
         val requestContext = requestId?.let { pendingImageRequests.remove(it) }
         if (requestId != null && requestContext == null) {
             logRuntimeWarning("Image response has no pending context: requestId=$requestId")
+            return
         }
         val purpose = requestContext?.purpose ?: ImageRequestPurpose.CURRENT_ALBUM
 
@@ -4811,6 +5792,9 @@ class MainActivity : Activity() {
                     requestContext?.imageKey?.let { rememberPreviewBitmapForImageKey(it, cachedBitmap) }
                     when (purpose) {
                         ImageRequestPurpose.CURRENT_ALBUM -> {
+                            if (shouldIgnoreCurrentAlbumResponse(requestContext)) {
+                                return
+                            }
                             val imageRef = requestContext?.imageKey ?: imageHash
                             mainHandler.post { updateAlbumImage(cachedBitmap, imageRef) }
                         }
@@ -4856,6 +5840,9 @@ class MainActivity : Activity() {
 
                         when (purpose) {
                             ImageRequestPurpose.CURRENT_ALBUM -> {
+                                if (shouldIgnoreCurrentAlbumResponse(requestContext)) {
+                                    return
+                                }
                                 val imageRef = requestContext?.imageKey ?: imageHash
                                 mainHandler.post { updateAlbumImage(bitmap, imageRef) }
                             }
@@ -4986,11 +5973,14 @@ class MainActivity : Activity() {
     ) {
         val previousZoneId = currentZoneId
         currentZoneId = zoneId
+        if (featureFlags.newZoneStore) {
+            queueStore.setCurrentZone(zoneId)
+        }
         if (previousZoneId != zoneId) {
-            queueNextTrackPreviewFrame = null
-            expectedNextPreviewTrackId = null
-            expectedNextPreviewImageKey = null
+            clearTrackPreviewHistory()
+            clearQueuePreviewFetchStateForFullRefresh()
             queueSnapshot = null
+            lastQueueListFingerprint = null
             currentNowPlayingQueueItemId = null
             currentNowPlayingItemKey = null
         }
@@ -5179,10 +6169,14 @@ class MainActivity : Activity() {
     /**
      * 从MOO消息中提取Request-Id
      */
-    private fun extractRequestId(message: String): String {
+    private fun extractRequestIdOrNull(message: String): String? {
         val requestIdRegex = "Request-Id: (\\S+)".toRegex()
         val match = requestIdRegex.find(message)
-        return match?.groupValues?.get(1) ?: "unknown"
+        return match?.groupValues?.getOrNull(1)
+    }
+
+    private fun extractRequestId(message: String): String {
+        return extractRequestIdOrNull(message) ?: "unknown"
     }
     
     // ============ 简化的Zone配置管理 ============
@@ -5550,8 +6544,21 @@ class MainActivity : Activity() {
         expectedNextPreviewTrackId = null
         expectedNextPreviewImageKey = null
         queueSnapshot = null
+        lastQueueListFingerprint = null
         currentNowPlayingQueueItemId = null
         currentNowPlayingItemKey = null
+        pendingTrackTransition = null
+        activeTransitionSession = null
+        transitionIntentStartedAtMs.clear()
+        tapToVisualLoggedTokens.clear()
+        lastRenderedTransitionTrackId = null
+        activeTrackTransitionAnimator?.cancel()
+        activeTrackTransitionAnimator = null
+        activeTextTransitionAnimator?.cancel()
+        activeTextTransitionAnimator = null
+        cancelActiveTextAnimators()
+        activeRollbackTintAnimator?.cancel()
+        activeRollbackTintAnimator = null
         updateTrackInfo("Nothing playing", "Unknown artist", "Unknown album")
         updateAlbumImage(null, null)
         
@@ -5783,6 +6790,10 @@ class MainActivity : Activity() {
     private fun warmupQueueNextPreviewForDrag() {
         if (queueNextTrackPreviewFrame != null) return
         val snapshot = queueSnapshot ?: return
+        if (snapshot.currentIndex < 0) {
+            requestQueueSnapshotRefresh("drag-warmup-no-current-index")
+            return
+        }
         resolveNextQueueTrack(snapshot)?.let { nextTrack ->
             updateQueueNextPreview(nextTrack)
         }
@@ -5899,7 +6910,7 @@ class MainActivity : Activity() {
                     .scaleX(0.9f)
                     .scaleY(0.9f)
                     .translationX(0f)
-                    .setDuration(120)
+                    .setDuration(TrackTransitionDesignTokens.CoverDrag.PREVIEW_HIDE_DURATION_MS)
                     .withEndAction {
                         target.visibility = View.INVISIBLE
                         target.alpha = 0f
@@ -5967,7 +6978,7 @@ class MainActivity : Activity() {
                 albumArtView.animate()
                     .scaleX(COVER_DRAG_DOWN_SCALE)
                     .scaleY(COVER_DRAG_DOWN_SCALE)
-                    .setDuration(100)
+                    .setDuration(TrackTransitionDesignTokens.CoverDrag.PRESS_DURATION_MS)
                     .start()
                 return false
             }
@@ -6038,13 +7049,19 @@ class MainActivity : Activity() {
                     .translationX(releaseShift)
                     .scaleX(COVER_DRAG_DOWN_SCALE)
                     .scaleY(COVER_DRAG_DOWN_SCALE)
-                    .setDuration(90)
+                    .setDuration(TrackTransitionDesignTokens.CoverDrag.RELEASE_OUT_DURATION_MS)
                     .withEndAction {
                         albumArtView.animate()
                             .translationX(0f)
                             .scaleX(1f)
                             .scaleY(1f)
-                            .setDuration(if (commandSent) 170 else 130)
+                            .setDuration(
+                                if (commandSent) {
+                                    TrackTransitionDesignTokens.CoverDrag.RELEASE_IN_DURATION_SENT_MS
+                                } else {
+                                    TrackTransitionDesignTokens.CoverDrag.RELEASE_IN_DURATION_CANCEL_MS
+                                }
+                            )
                             .start()
                     }
                     .start()
@@ -6105,7 +7122,7 @@ class MainActivity : Activity() {
             else -> return
         }
 
-        val distance = 24.dpToPx().toFloat()
+        val distance = TrackTransitionDesignTokens.SwipeFeedback.SHIFT_DP.dpToPx().toFloat()
         val translationX = when (direction) {
             SwipeDirection.LEFT -> -distance
             SwipeDirection.RIGHT -> distance
@@ -6121,93 +7138,435 @@ class MainActivity : Activity() {
             playTogether(
                 ObjectAnimator.ofFloat(target, View.TRANSLATION_X, target.translationX, translationX),
                 ObjectAnimator.ofFloat(target, View.TRANSLATION_Y, target.translationY, translationY),
-                ObjectAnimator.ofFloat(target, View.SCALE_X, target.scaleX, 0.985f),
-                ObjectAnimator.ofFloat(target, View.SCALE_Y, target.scaleY, 0.985f)
+                ObjectAnimator.ofFloat(
+                    target,
+                    View.SCALE_X,
+                    target.scaleX,
+                    TrackTransitionDesignTokens.SwipeFeedback.OUT_SCALE
+                ),
+                ObjectAnimator.ofFloat(
+                    target,
+                    View.SCALE_Y,
+                    target.scaleY,
+                    TrackTransitionDesignTokens.SwipeFeedback.OUT_SCALE
+                )
             )
-            duration = 90
+            duration = TrackTransitionDesignTokens.SwipeFeedback.OUT_DURATION_MS
             interpolator = AccelerateDecelerateInterpolator()
         }
         val back = AnimatorSet().apply {
             playTogether(
                 ObjectAnimator.ofFloat(target, View.TRANSLATION_X, translationX, 0f),
                 ObjectAnimator.ofFloat(target, View.TRANSLATION_Y, translationY, 0f),
-                ObjectAnimator.ofFloat(target, View.SCALE_X, 0.985f, 1f),
-                ObjectAnimator.ofFloat(target, View.SCALE_Y, 0.985f, 1f)
+                ObjectAnimator.ofFloat(
+                    target,
+                    View.SCALE_X,
+                    TrackTransitionDesignTokens.SwipeFeedback.OUT_SCALE,
+                    1f
+                ),
+                ObjectAnimator.ofFloat(
+                    target,
+                    View.SCALE_Y,
+                    TrackTransitionDesignTokens.SwipeFeedback.OUT_SCALE,
+                    1f
+                )
             )
-            duration = 150
+            duration = TrackTransitionDesignTokens.SwipeFeedback.IN_DURATION_MS
             interpolator = AccelerateDecelerateInterpolator()
         }
 
         AnimatorSet().apply { playSequentially(out, back) }.start()
     }
 
-    private fun markPendingTrackTransition(direction: TrackTransitionDirection) {
-        pendingTrackTransitionDirection = direction
-        pendingTrackTransitionDeadlineMs = System.currentTimeMillis() + TRACK_TRANSITION_WINDOW_MS
+    private fun markPendingTrackTransition(
+        direction: TrackTransitionDirection,
+        key: CorrelationKey
+    ) {
+        val now = System.currentTimeMillis()
+        pendingTrackTransition = PendingTrackTransition(
+            key = key,
+            direction = direction,
+            requestedAtMs = now,
+            deadlineMs = now + TrackTransitionDesignTokens.TransitionWindow.INTENT_MATCH_WINDOW_MS
+        )
     }
 
-    private fun consumeTrackTransitionDirection(): TrackTransitionDirection {
-        val direction = pendingTrackTransitionDirection
+    private fun consumePendingTrackTransition(): PendingTrackTransition? {
+        val pending = pendingTrackTransition
         val now = System.currentTimeMillis()
-        val resolved = if (direction != null && now <= pendingTrackTransitionDeadlineMs) {
-            direction
-        } else {
-            TrackTransitionDirection.UNKNOWN
-        }
-        pendingTrackTransitionDirection = null
-        pendingTrackTransitionDeadlineMs = 0L
+        val resolved = if (pending != null && now <= pending.deadlineMs) pending else null
+        pendingTrackTransition = null
         return resolved
     }
 
-    private fun animateTrackTransition(direction: TrackTransitionDirection) {
+    private fun animateTrackTransition(
+        session: TransitionAnimationSession,
+        motion: DirectionalMotion
+    ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post { animateTrackTransition(direction) }
+            mainHandler.post { animateTrackTransition(session, motion) }
             return
         }
-        if (isTrackTransitionAnimating) return
-        if (!::albumArtView.isInitialized || albumArtView.visibility != View.VISIBLE) return
-
-        val shiftDistance = 36.dpToPx().toFloat()
-        val shift = when (direction) {
-            TrackTransitionDirection.NEXT -> -shiftDistance
-            TrackTransitionDirection.PREVIOUS -> shiftDistance
-            TrackTransitionDirection.UNKNOWN -> 0f
+        if (!::albumArtView.isInitialized || albumArtView.visibility != View.VISIBLE) {
+            if (isSessionActive(session)) {
+                session.commitHandoffOnce {
+                    applyTrackBinding(session.targetTrack)
+                    commitTrackStateOnly(session.targetTrack)
+                }
+                dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
+            }
+            activeTransitionSession = null
+            return
         }
+
+        val entryInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y2
+        )
+        val returnInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y2
+        )
+
+        val baseShift = TrackTransitionDesignTokens.CoverTransition.SHIFT_DP.dpToPx().toFloat()
+        val shift = baseShift * motion.vector
+
+        val startAlpha = albumArtView.alpha
+        val startScaleX = albumArtView.scaleX
+        val startScaleY = albumArtView.scaleY
+        val startTranslationX = albumArtView.translationX
+
+        activeTrackTransitionAnimator?.cancel()
 
         isTrackTransitionAnimating = true
-        val out = AnimatorSet().apply {
-            playTogether(
-                ObjectAnimator.ofFloat(albumArtView, View.ALPHA, 1f, 0.78f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_X, 1f, 0.96f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_Y, 1f, 0.96f),
-                ObjectAnimator.ofFloat(albumArtView, View.TRANSLATION_X, 0f, shift)
-            )
-            duration = 140
-            interpolator = AccelerateDecelerateInterpolator()
-        }
-        val `in` = AnimatorSet().apply {
-            playTogether(
-                ObjectAnimator.ofFloat(albumArtView, View.ALPHA, 0.78f, 1f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_X, 0.96f, 1f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_Y, 0.96f, 1f),
-                ObjectAnimator.ofFloat(albumArtView, View.TRANSLATION_X, shift, 0f)
-            )
-            duration = 210
-            interpolator = AccelerateDecelerateInterpolator()
-        }
 
-        AnimatorSet().apply {
-            playSequentially(out, `in`)
-            addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    isTrackTransitionAnimating = false
+        if (session.phase == UiPhase.ROLLING_BACK) {
+            val rollbackAnimator = AnimatorSet().apply {
+                playTogether(
+                    ObjectAnimator.ofFloat(albumArtView, View.ALPHA, startAlpha, 1f),
+                    ObjectAnimator.ofFloat(albumArtView, View.SCALE_X, startScaleX, 1f),
+                    ObjectAnimator.ofFloat(albumArtView, View.SCALE_Y, startScaleY, 1f),
+                    ObjectAnimator.ofFloat(albumArtView, View.TRANSLATION_X, startTranslationX, 0f)
+                )
+                duration = TrackTransitionDesignTokens.Rollback.DURATION_MS
+                interpolator = returnInterpolator
+            }
+            rollbackAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationStart(animation: Animator) {
+                    albumArtView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 }
 
-                override fun onAnimationCancel(animation: android.animation.Animator) {
-                    isTrackTransitionAnimating = false
+                override fun onAnimationEnd(animation: Animator) {
+                    if (activeTrackTransitionAnimator === rollbackAnimator) {
+                        isTrackTransitionAnimating = false
+                        activeTrackTransitionAnimator = null
+                        albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
+                        if (isSessionActive(session)) {
+                            session.commitHandoffOnce {
+                                applyTrackBinding(session.targetTrack)
+                                commitTrackStateOnly(session.targetTrack)
+                            }
+                            dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
+                        }
+                        if (activeTransitionSession?.sessionId == session.sessionId) {
+                            activeTransitionSession = null
+                        }
+                    }
+                }
+
+                override fun onAnimationCancel(animation: Animator) {
+                    if (activeTrackTransitionAnimator === rollbackAnimator) {
+                        isTrackTransitionAnimating = false
+                        activeTrackTransitionAnimator = null
+                        albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
+                    }
                 }
             })
-        }.start()
+            activeTrackTransitionAnimator = rollbackAnimator
+            rollbackAnimator.start()
+            return
+        }
+
+        val out = AnimatorSet().apply {
+            playTogether(
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.ALPHA,
+                    startAlpha,
+                    TrackTransitionDesignTokens.CoverTransition.OUT_ALPHA
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_X,
+                    startScaleX,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_Y,
+                    startScaleY,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.TRANSLATION_X,
+                    startTranslationX,
+                    shift
+                )
+            )
+            duration = TrackTransitionDesignTokens.CoverTransition.OUT_DURATION_MS
+            interpolator = entryInterpolator
+        }
+
+        val `in` = AnimatorSet().apply {
+            playTogether(
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.ALPHA,
+                    TrackTransitionDesignTokens.CoverTransition.OUT_ALPHA,
+                    1f
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_X,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION,
+                    TrackTransitionDesignTokens.CoverTransition.RETURN_OVERSHOOT_SCALE,
+                    1f
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_Y,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION,
+                    TrackTransitionDesignTokens.CoverTransition.RETURN_OVERSHOOT_SCALE,
+                    1f
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.TRANSLATION_X,
+                    shift,
+                    0f
+                )
+            )
+            duration = TrackTransitionDesignTokens.CoverTransition.IN_DURATION_MS
+            interpolator = returnInterpolator
+        }
+
+        val transitionAnimator = AnimatorSet()
+        transitionAnimator.playSequentially(out, `in`)
+        transitionAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationStart(animation: Animator) {
+                albumArtView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            }
+
+            override fun onAnimationEnd(animation: Animator) {
+                if (activeTrackTransitionAnimator === transitionAnimator) {
+                    isTrackTransitionAnimating = false
+                    activeTrackTransitionAnimator = null
+                    albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
+                    if (isSessionActive(session)) {
+                        session.commitHandoffOnce {
+                            applyTrackBinding(session.targetTrack)
+                            commitTrackStateOnly(session.targetTrack)
+                        }
+                        dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
+                    }
+                    if (activeTransitionSession?.sessionId == session.sessionId) {
+                        activeTransitionSession = null
+                    }
+                }
+            }
+
+            override fun onAnimationCancel(animation: Animator) {
+                if (activeTrackTransitionAnimator === transitionAnimator) {
+                    isTrackTransitionAnimating = false
+                    activeTrackTransitionAnimator = null
+                    albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
+            }
+        })
+        activeTrackTransitionAnimator = transitionAnimator
+        transitionAnimator.start()
+    }
+
+    private fun animateTrackTextTransition(
+        session: TransitionAnimationSession,
+        motion: DirectionalMotion
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { animateTrackTextTransition(session, motion) }
+            return
+        }
+        if (!::trackText.isInitialized || !::artistText.isInitialized || !::albumText.isInitialized) {
+            return
+        }
+
+        activeTextTransitionAnimator?.cancel()
+        activeTextTransitionAnimator = null
+        cancelActiveTextAnimators()
+
+        val baseOffsetDp = if (session.phase == UiPhase.ROLLING_BACK) {
+            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_ROLLBACK_DP
+        } else {
+            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_DP
+        }
+        val outOffset = baseOffsetDp.dpToPx().toFloat() * motion.vector
+        val inOffset = -outOffset
+
+        val exitInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y2
+        )
+        val enterInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y2
+        )
+
+        motion.cascade.forEachIndexed { index, field ->
+            val view = resolveTextViewForField(field) ?: return@forEachIndexed
+            val delayMs = index * TrackTransitionDesignTokens.TextTransition.STAGGER_DELAY_MS
+            mainHandler.postDelayed({
+                if (!isSessionActive(session)) return@postDelayed
+                val outAnimator = AnimatorSet().apply {
+                    playTogether(
+                        ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, view.translationY, outOffset),
+                        ObjectAnimator.ofFloat(view, View.ALPHA, view.alpha, TrackTransitionDesignTokens.TextTransition.OUT_ALPHA)
+                    )
+                    duration = TrackTransitionDesignTokens.TextTransition.OUT_DURATION_MS
+                    interpolator = exitInterpolator
+                }
+                outAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (!isSessionActive(session)) return
+                        session.commitFieldOnce(field.name.lowercase()) {
+                            session.commitHandoffOnce {
+                                commitTrackStateOnly(session.targetTrack)
+                                lastRenderedTransitionTrackId = session.targetTrack.id
+                            }
+                            view.text = resolveTextForField(session.targetTrack, field)
+                        }
+                        view.translationY = inOffset
+                        view.alpha = 0f
+                        val inAnimator = AnimatorSet().apply {
+                            playTogether(
+                                ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, inOffset, 0f),
+                                ObjectAnimator.ofFloat(view, View.ALPHA, 0f, 1f)
+                            )
+                            duration = TrackTransitionDesignTokens.TextTransition.IN_DURATION_MS
+                            interpolator = enterInterpolator
+                        }
+                        registerTextAnimator(inAnimator)
+                        inAnimator.start()
+                    }
+                })
+                registerTextAnimator(outAnimator)
+                outAnimator.start()
+            }, delayMs.toLong())
+        }
+    }
+
+    private fun resolveTextViewForField(field: TextCascadeField): TextView? {
+        return when (field) {
+            TextCascadeField.TRACK -> if (::trackText.isInitialized) trackText else null
+            TextCascadeField.ARTIST -> if (::artistText.isInitialized) artistText else null
+            TextCascadeField.ALBUM -> if (::albumText.isInitialized) albumText else null
+        }
+    }
+
+    private fun resolveTextForField(
+        track: TransitionTrack,
+        field: TextCascadeField
+    ): String {
+        return when (field) {
+            TextCascadeField.TRACK -> track.title
+            TextCascadeField.ARTIST -> track.artist
+            TextCascadeField.ALBUM -> track.album
+        }
+    }
+
+    private fun registerTextAnimator(animator: Animator) {
+        activeTextFieldAnimators.add(animator)
+        animator.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                activeTextFieldAnimators.remove(animator)
+            }
+
+            override fun onAnimationCancel(animation: Animator) {
+                activeTextFieldAnimators.remove(animator)
+            }
+        })
+    }
+
+    private fun cancelActiveTextAnimators() {
+        if (activeTextFieldAnimators.isEmpty()) return
+        val snapshot = activeTextFieldAnimators.toList()
+        activeTextFieldAnimators.clear()
+        snapshot.forEach { animator ->
+            runCatching { animator.cancel() }
+        }
+    }
+
+    private fun animateRollbackTintCue() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { animateRollbackTintCue() }
+            return
+        }
+        if (!::mainLayout.isInitialized) return
+        activePaletteAnimator?.cancel()
+        activePaletteAnimator = null
+        val drawable = (mainLayout.background as? ColorDrawable)
+            ?: ColorDrawable(currentDominantColor).also { mainLayout.background = it }
+        val baseColor = drawable.color
+        val tintedColor = blendColors(
+            from = baseColor,
+            to = TrackTransitionDesignTokens.Rollback.TINT_COLOR,
+            ratio = TrackTransitionDesignTokens.Rollback.TINT_BLEND_RATIO
+        )
+
+        activeRollbackTintAnimator?.cancel()
+        val tintAnimator = ValueAnimator.ofArgb(baseColor, tintedColor, baseColor)
+        tintAnimator.duration = TrackTransitionDesignTokens.Rollback.TINT_IN_DURATION_MS +
+            TrackTransitionDesignTokens.Rollback.TINT_OUT_DURATION_MS
+        tintAnimator.interpolator = DecelerateInterpolator()
+        tintAnimator.addUpdateListener { animator ->
+            drawable.color = animator.animatedValue as Int
+        }
+        tintAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (activeRollbackTintAnimator === tintAnimator) {
+                    activeRollbackTintAnimator = null
+                }
+            }
+
+            override fun onAnimationCancel(animation: Animator) {
+                if (activeRollbackTintAnimator === tintAnimator) {
+                    activeRollbackTintAnimator = null
+                }
+            }
+        })
+        activeRollbackTintAnimator = tintAnimator
+        tintAnimator.start()
+    }
+
+    private fun blendColors(
+        from: Int,
+        to: Int,
+        ratio: Float
+    ): Int {
+        val clamped = ratio.coerceIn(0f, 1f)
+        val inv = 1f - clamped
+        val a = ((Color.alpha(from) * inv) + (Color.alpha(to) * clamped)).toInt()
+        val r = ((Color.red(from) * inv) + (Color.red(to) * clamped)).toInt()
+        val g = ((Color.green(from) * inv) + (Color.green(to) * clamped)).toInt()
+        val b = ((Color.blue(from) * inv) + (Color.blue(to) * clamped)).toInt()
+        return Color.argb(a, r, g, b)
     }
     
     private fun checkAndRequestPermissions() {
@@ -6315,8 +7674,18 @@ class MainActivity : Activity() {
     
     private fun nextTrack(): Boolean {
         val zoneId = resolveTransportZoneId() ?: return false
+        val transitionKey = nextTrackTransitionKey()
+        val optimisticTrack = resolveOptimisticTransitionTrack(TrackTransitionDirection.NEXT)
         val sent = sendTransportControl(zoneId, "next")
         if (sent) {
+            recordTransitionIntentStart(transitionKey)
+            dispatchTrackTransitionIntent(
+                TrackTransitionIntent.Skip(
+                    key = transitionKey,
+                    direction = toTransitionDirection(TrackTransitionDirection.NEXT),
+                    targetTrack = optimisticTrack
+                )
+            )
             captureCurrentTrackPreviewFrame()?.let { currentFrame ->
                 pushPreviewFrame(previousTrackPreviewFrames, currentFrame)
             }
@@ -6326,15 +7695,29 @@ class MainActivity : Activity() {
             queueNextTrackPreviewFrame = null
             expectedNextPreviewTrackId = null
             expectedNextPreviewImageKey = null
-            markPendingTrackTransition(TrackTransitionDirection.NEXT)
+            queueSnapshot = null
+            markPendingTrackTransition(
+                direction = TrackTransitionDirection.NEXT,
+                key = transitionKey
+            )
         }
         return sent
     }
     
     private fun previousTrack(): Boolean {
         val zoneId = resolveTransportZoneId() ?: return false
+        val transitionKey = nextTrackTransitionKey()
+        val optimisticTrack = resolveOptimisticTransitionTrack(TrackTransitionDirection.PREVIOUS)
         val sent = sendTransportControl(zoneId, "previous")
         if (sent) {
+            recordTransitionIntentStart(transitionKey)
+            dispatchTrackTransitionIntent(
+                TrackTransitionIntent.Skip(
+                    key = transitionKey,
+                    direction = toTransitionDirection(TrackTransitionDirection.PREVIOUS),
+                    targetTrack = optimisticTrack
+                )
+            )
             captureCurrentTrackPreviewFrame()?.let { currentFrame ->
                 pushPreviewFrame(nextTrackPreviewFrames, currentFrame)
             }
@@ -6344,7 +7727,11 @@ class MainActivity : Activity() {
             queueNextTrackPreviewFrame = null
             expectedNextPreviewTrackId = null
             expectedNextPreviewImageKey = null
-            markPendingTrackTransition(TrackTransitionDirection.PREVIOUS)
+            queueSnapshot = null
+            markPendingTrackTransition(
+                direction = TrackTransitionDirection.PREVIOUS,
+                key = transitionKey
+            )
         }
         return sent
     }
@@ -6483,12 +7870,26 @@ class MainActivity : Activity() {
     
     override fun onDestroy() {
         super.onDestroy()
+
+        activeTransitionSession = null
+        activeTrackTransitionAnimator?.cancel()
+        activeTrackTransitionAnimator = null
+        activeTextTransitionAnimator?.cancel()
+        activeTextTransitionAnimator = null
+        cancelActiveTextAnimators()
+        activeRollbackTintAnimator?.cancel()
+        activeRollbackTintAnimator = null
         
         // Cancel all activity-scoped coroutines to prevent leaks
         try {
             activityScope.cancel()
         } catch (e: Exception) {
             logWarning("Error cancelling activity scope: ${e.message}")
+        }
+        try {
+            trackTransitionStore.close()
+        } catch (e: Exception) {
+            logWarning("Error closing track transition store: ${e.message}")
         }
         
         smartConnectionManager.unregisterNetworkMonitoring()

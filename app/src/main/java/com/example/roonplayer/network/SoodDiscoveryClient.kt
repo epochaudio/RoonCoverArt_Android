@@ -2,7 +2,9 @@ package com.example.roonplayer.network
 
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 
 class SoodDiscoveryClient(
@@ -15,6 +17,8 @@ class SoodDiscoveryClient(
         discoveryPort: Int,
         socketTimeoutMs: Int,
         listenWindowMs: Long,
+        includeInterfaceBroadcastTargets: Boolean = true,
+        fallbackUnicastTargets: List<InetAddress> = emptyList(),
         onResponse: (payload: ByteArray, sourceIp: String) -> Unit,
         onLog: (String) -> Unit,
         onError: (String, Exception?) -> Unit
@@ -25,9 +29,26 @@ class SoodDiscoveryClient(
             socket.reuseAddress = true
             socket.soTimeout = socketTimeoutMs
 
-            val query = codec.buildServiceQuery(serviceId)
+            val replyAddress = resolveReplyAddress()
+            val query = codec.buildServiceQuery(
+                serviceId = serviceId,
+                replyAddress = replyAddress,
+                replyPort = socket.localPort
+            )
+            onLog(
+                "SOOD query prepared (replyaddr=${replyAddress ?: "none"}, " +
+                    "replyport=${socket.localPort})"
+            )
+
             val sentTargets = mutableSetOf<String>()
-            for (target in targets) {
+            val allTargets = LinkedHashSet<InetAddress>()
+            allTargets.addAll(targets)
+            allTargets.addAll(fallbackUnicastTargets)
+            if (includeInterfaceBroadcastTargets) {
+                allTargets.addAll(collectInterfaceBroadcastTargets())
+            }
+
+            for (target in allTargets) {
                 val host = target.hostAddress ?: continue
                 if (!sentTargets.add(host)) {
                     continue
@@ -61,6 +82,42 @@ class SoodDiscoveryClient(
         } finally {
             socket.close()
         }
+    }
+
+    private fun collectInterfaceBroadcastTargets(): List<InetAddress> {
+        val addresses = mutableListOf<InetAddress>()
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return emptyList()
+        while (interfaces.hasMoreElements()) {
+            val networkInterface = interfaces.nextElement()
+            if (!networkInterface.isUp || networkInterface.isLoopback) {
+                continue
+            }
+            for (interfaceAddress in networkInterface.interfaceAddresses) {
+                val broadcast = interfaceAddress.broadcast ?: continue
+                if (broadcast is Inet4Address) {
+                    addresses.add(broadcast)
+                }
+            }
+        }
+        return addresses
+    }
+
+    private fun resolveReplyAddress(): String? {
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+        while (interfaces.hasMoreElements()) {
+            val networkInterface = interfaces.nextElement()
+            if (!networkInterface.isUp || networkInterface.isLoopback) {
+                continue
+            }
+            val addresses = networkInterface.inetAddresses
+            while (addresses.hasMoreElements()) {
+                val address = addresses.nextElement()
+                if (address is Inet4Address && !address.isLoopbackAddress) {
+                    return address.hostAddress
+                }
+            }
+        }
+        return null
     }
 
     companion object {

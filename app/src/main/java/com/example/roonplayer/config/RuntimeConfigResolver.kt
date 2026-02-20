@@ -24,7 +24,8 @@ data class RuntimeConfigResolution(
             "discovery.network=group=${config.discoveryNetwork.multicastGroup},port=${config.discoveryNetwork.discoveryPort},broadcast=${config.discoveryNetwork.broadcastAddress}",
             "discovery.timing=scan_interval_ms=${config.discoveryTiming.networkScanIntervalMs},announcement_window_ms=${config.discoveryTiming.announcementListenWindowMs},active_sood_window_ms=${config.discoveryTiming.activeSoodListenWindowMs}",
             "ui.timing=multi_click_ms=${config.uiTiming.multiClickTimeDeltaMs},single_click_ms=${config.uiTiming.singleClickDelayMs},startup_settle_ms=${config.uiTiming.startupUiSettleDelayMs}",
-            "cache=max_images=${config.cache.maxCachedImages},display=${config.cache.maxDisplayCache},preload=${config.cache.maxPreloadCache},memory_threshold_bytes=${config.cache.memoryThresholdBytes}"
+            "cache=max_images=${config.cache.maxCachedImages},display=${config.cache.maxDisplayCache},preload=${config.cache.maxPreloadCache},memory_threshold_bytes=${config.cache.memoryThresholdBytes}",
+            "feature_flags=new_sood_codec=${config.featureFlags.newSoodCodec},new_moo_router=${config.featureFlags.newMooRouter},new_subscription_registry=${config.featureFlags.newSubscriptionRegistry},new_zone_store=${config.featureFlags.newZoneStore},strict_unknown_request_id_disconnect=${config.featureFlags.strictMooUnknownRequestIdDisconnect}"
         )
     }
 }
@@ -76,6 +77,12 @@ object RuntimeConfigKeys {
     const val CACHE_MAX_DISPLAY_CACHE = "cache.max_display_cache"
     const val CACHE_MAX_PRELOAD_CACHE = "cache.max_preload_cache"
     const val CACHE_MEMORY_THRESHOLD_BYTES = "cache.memory_threshold_bytes"
+
+    const val FEATURE_NEW_SOOD_CODEC = "feature_flags.new_sood_codec"
+    const val FEATURE_NEW_MOO_ROUTER = "feature_flags.new_moo_router"
+    const val FEATURE_NEW_SUBSCRIPTION_REGISTRY = "feature_flags.new_subscription_registry"
+    const val FEATURE_NEW_ZONE_STORE = "feature_flags.new_zone_store"
+    const val FEATURE_STRICT_MOO_UNKNOWN_REQUEST_ID_DISCONNECT = "feature_flags.strict_moo_unknown_request_id_disconnect"
 }
 
 class RuntimeConfigResolver(
@@ -156,6 +163,30 @@ class RuntimeConfigResolver(
                 source = sourceName
             )
             return normalized
+        }
+
+        fun applyBoolean(
+            key: String,
+            defaultValue: Boolean
+        ): Boolean {
+            val raw = overrides[key] ?: return defaultValue
+            val normalized = raw.trim().lowercase()
+            val parsed = when (normalized) {
+                "true", "1", "yes", "y", "on" -> true
+                "false", "0", "no", "n", "off" -> false
+                else -> null
+            }
+            if (parsed == null) {
+                warnings += "Invalid boolean override: $key=$raw, fallback=$defaultValue"
+                return defaultValue
+            }
+            records += RuntimeConfigOverrideRecord(
+                key = key,
+                rawValue = raw,
+                appliedValue = parsed.toString(),
+                source = sourceName
+            )
+            return parsed
         }
 
         val connection = defaults.connection.copy(
@@ -417,6 +448,29 @@ class RuntimeConfigResolver(
             )
         )
 
+        val featureFlags = defaults.featureFlags.copy(
+            newSoodCodec = applyBoolean(
+                RuntimeConfigKeys.FEATURE_NEW_SOOD_CODEC,
+                defaults.featureFlags.newSoodCodec
+            ),
+            newMooRouter = applyBoolean(
+                RuntimeConfigKeys.FEATURE_NEW_MOO_ROUTER,
+                defaults.featureFlags.newMooRouter
+            ),
+            newSubscriptionRegistry = applyBoolean(
+                RuntimeConfigKeys.FEATURE_NEW_SUBSCRIPTION_REGISTRY,
+                defaults.featureFlags.newSubscriptionRegistry
+            ),
+            newZoneStore = applyBoolean(
+                RuntimeConfigKeys.FEATURE_NEW_ZONE_STORE,
+                defaults.featureFlags.newZoneStore
+            ),
+            strictMooUnknownRequestIdDisconnect = applyBoolean(
+                RuntimeConfigKeys.FEATURE_STRICT_MOO_UNKNOWN_REQUEST_ID_DISCONNECT,
+                defaults.featureFlags.strictMooUnknownRequestIdDisconnect
+            )
+        )
+
         // 为什么在最终结果里返回覆盖记录和告警：
         // “值是多少”不足以排障，必须同时知道值从哪里来、有没有被校验修正。
         return RuntimeConfigResolution(
@@ -425,7 +479,8 @@ class RuntimeConfigResolver(
                 discoveryNetwork = discoveryNetwork,
                 discoveryTiming = discoveryTiming,
                 uiTiming = uiTiming,
-                cache = cache
+                cache = cache,
+                featureFlags = featureFlags
             ),
             sourceName = sourceName,
             overrides = records,

@@ -22,7 +22,8 @@ data class RegistrationTokenSaveResult(
 )
 
 class PairedCoreRepository(
-    private val sharedPreferences: SharedPreferences
+    private val sharedPreferences: SharedPreferences,
+    private val legacySharedPreferences: SharedPreferences? = null
 ) {
     companion object {
         private const val TOKEN_PREFIX = "roon_core_token_"
@@ -30,6 +31,8 @@ class PairedCoreRepository(
         private const val CORE_ID_BY_HOST_PREFIX = "roon_core_id_"
         private const val LAST_CONNECTED_BY_HOST_PREFIX = "roon_last_connected_"
         private const val LAST_CONNECTED_BY_CORE_ID_PREFIX = "roon_last_connected_by_core_id_"
+        private const val PAIRED_CORE_ID_KEY = "roon_paired_core_id"
+        private const val SECURE_STORAGE_MIGRATION_MARKER = "roon_secure_storage_migrated_v1"
     }
 
     fun loadPairedCores(
@@ -37,6 +40,8 @@ class PairedCoreRepository(
         isValidHost: (String) -> Boolean,
         fallbackLastSuccessful: LastSuccessfulConnectionState?
     ): Map<String, PairedCoreRecord> {
+        migrateLegacyStorageIfNeeded()
+
         val allPrefs = sharedPreferences.all
         val paired = linkedMapOf<String, PairedCoreRecord>()
 
@@ -103,6 +108,8 @@ class PairedCoreRepository(
         coreId: String,
         hostInput: String
     ): TokenMigrationStatus {
+        migrateLegacyStorageIfNeeded()
+
         val existingToken = sharedPreferences.getString(tokenByCoreIdKey(coreId), null)
         if (existingToken != null) {
             return TokenMigrationStatus.ALREADY_EXISTS
@@ -115,29 +122,49 @@ class PairedCoreRepository(
 
         val oldLastConnected = sharedPreferences.getLong(lastConnectedByHostKey(hostInput), 0L)
 
-        val editor = sharedPreferences.edit()
-        editor.putString(tokenByCoreIdKey(coreId), oldToken)
-        if (oldLastConnected > 0L) {
-            editor.putLong(lastConnectedByCoreIdKey(coreId), oldLastConnected)
+        atomicEdit {
+            putString(tokenByCoreIdKey(coreId), oldToken)
+            if (oldLastConnected > 0L) {
+                putLong(lastConnectedByCoreIdKey(coreId), oldLastConnected)
+            }
+            remove(tokenByHostKey(hostInput))
+            remove(lastConnectedByHostKey(hostInput))
+            putString(PAIRED_CORE_ID_KEY, coreId)
         }
-        editor.remove(tokenByHostKey(hostInput))
-        editor.remove(lastConnectedByHostKey(hostInput))
-        editor.apply()
 
         return TokenMigrationStatus.MIGRATED
     }
 
     fun saveCoreId(hostInput: String, coreId: String) {
-        sharedPreferences.edit()
-            .putString(coreIdByHostKey(hostInput), coreId)
-            .apply()
+        migrateLegacyStorageIfNeeded()
+        atomicEdit {
+            putString(coreIdByHostKey(hostInput), coreId)
+        }
+    }
+
+    fun savePairedCoreId(coreId: String?) {
+        migrateLegacyStorageIfNeeded()
+        atomicEdit {
+            if (coreId.isNullOrBlank()) {
+                remove(PAIRED_CORE_ID_KEY)
+            } else {
+                putString(PAIRED_CORE_ID_KEY, coreId)
+            }
+        }
+    }
+
+    fun getPairedCoreId(): String? {
+        migrateLegacyStorageIfNeeded()
+        return sharedPreferences.getString(PAIRED_CORE_ID_KEY, null)?.takeIf { it.isNotBlank() }
     }
 
     fun getCoreId(hostInput: String): String? {
+        migrateLegacyStorageIfNeeded()
         return sharedPreferences.getString(coreIdByHostKey(hostInput), null)
     }
 
     fun getSavedToken(hostInput: String): String? {
+        migrateLegacyStorageIfNeeded()
         val coreId = getCoreId(hostInput)
         return if (coreId != null) {
             sharedPreferences.getString(tokenByCoreIdKey(coreId), null)
@@ -151,23 +178,71 @@ class PairedCoreRepository(
         token: String,
         connectedAt: Long
     ): RegistrationTokenSaveResult {
+        migrateLegacyStorageIfNeeded()
         val coreId = getCoreId(hostInput)
-        val editor = sharedPreferences.edit()
-        if (coreId != null) {
-            editor.putString(tokenByCoreIdKey(coreId), token)
-            editor.putLong(lastConnectedByCoreIdKey(coreId), connectedAt)
 
-            // 为什么这里主动删除旧键：避免同一 Core 在新旧两套键下并存，
-            // 否则后续加载会出现重复候选并污染“最近连接”判断。
-            editor.remove(tokenByHostKey(hostInput))
-            editor.remove(lastConnectedByHostKey(hostInput))
-        } else {
-            editor.putString(tokenByHostKey(hostInput), token)
-            editor.putLong(lastConnectedByHostKey(hostInput), connectedAt)
+        atomicEdit {
+            if (coreId != null) {
+                putString(tokenByCoreIdKey(coreId), token)
+                putLong(lastConnectedByCoreIdKey(coreId), connectedAt)
+                putString(PAIRED_CORE_ID_KEY, coreId)
+
+                // 为什么这里主动删除旧键：避免同一 Core 在新旧两套键下并存，
+                // 否则后续加载会出现重复候选并污染“最近连接”判断。
+                remove(tokenByHostKey(hostInput))
+                remove(lastConnectedByHostKey(hostInput))
+            } else {
+                putString(tokenByHostKey(hostInput), token)
+                putLong(lastConnectedByHostKey(hostInput), connectedAt)
+            }
         }
-        editor.apply()
 
         return RegistrationTokenSaveResult(coreId = coreId)
+    }
+
+    private fun migrateLegacyStorageIfNeeded() {
+        val legacyPrefs = legacySharedPreferences ?: return
+        if (legacyPrefs === sharedPreferences) {
+            return
+        }
+        if (sharedPreferences.getBoolean(SECURE_STORAGE_MIGRATION_MARKER, false)) {
+            return
+        }
+
+        val legacyAll = legacyPrefs.all
+        atomicEdit {
+            for ((key, value) in legacyAll) {
+                if (!shouldMigrateKey(key)) {
+                    continue
+                }
+                if (sharedPreferences.contains(key)) {
+                    continue
+                }
+                when (value) {
+                    is String -> putString(key, value)
+                    is Long -> putLong(key, value)
+                    is Int -> putInt(key, value)
+                    is Boolean -> putBoolean(key, value)
+                    is Float -> putFloat(key, value)
+                }
+            }
+            putBoolean(SECURE_STORAGE_MIGRATION_MARKER, true)
+        }
+    }
+
+    private fun shouldMigrateKey(key: String): Boolean {
+        return key.startsWith(TOKEN_PREFIX) ||
+            key.startsWith(TOKEN_BY_CORE_ID_PREFIX) ||
+            key.startsWith(CORE_ID_BY_HOST_PREFIX) ||
+            key.startsWith(LAST_CONNECTED_BY_HOST_PREFIX) ||
+            key.startsWith(LAST_CONNECTED_BY_CORE_ID_PREFIX) ||
+            key == PAIRED_CORE_ID_KEY
+    }
+
+    private fun atomicEdit(block: SharedPreferences.Editor.() -> Unit): Boolean {
+        val editor = sharedPreferences.edit()
+        editor.block()
+        return editor.commit()
     }
 
     private fun findLatestHostPortByCoreId(

@@ -51,13 +51,22 @@ data class CacheConfig(
     val memoryThresholdBytes: Long
 )
 
+data class FeatureFlagConfig(
+    val newSoodCodec: Boolean,
+    val newMooRouter: Boolean,
+    val newSubscriptionRegistry: Boolean,
+    val newZoneStore: Boolean,
+    val strictMooUnknownRequestIdDisconnect: Boolean
+)
+
 data class AppRuntimeConfig(
     val connection: ConnectionConfig,
     val discoveryNetwork: DiscoveryNetworkConfig,
     val discoveryPolicy: DiscoveryPolicyConfig,
     val discoveryTiming: DiscoveryTimingConfig,
     val uiTiming: UiTimingConfig,
-    val cache: CacheConfig
+    val cache: CacheConfig,
+    val featureFlags: FeatureFlagConfig
 ) {
     companion object {
         fun defaults(): AppRuntimeConfig {
@@ -113,6 +122,13 @@ data class AppRuntimeConfig(
                     maxDisplayCache = 15,
                     maxPreloadCache = 5,
                     memoryThresholdBytes = 50L * 1024 * 1024
+                ),
+                featureFlags = FeatureFlagConfig(
+                    newSoodCodec = true,
+                    newMooRouter = false,
+                    newSubscriptionRegistry = false,
+                    newZoneStore = false,
+                    strictMooUnknownRequestIdDisconnect = false
                 )
             )
         }

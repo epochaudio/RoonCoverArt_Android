@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.22)
+# CoverArt for Android (v2.23)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,8 +34,9 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Install the APK to your Android device.
-3. Ensure device and Roon Core are in the same LAN.
+2. Current packaged APK (v2.23) is generated at project root: `CoverArtForAndroid-v2.23-debug.apk`
+3. Install the APK to your Android device.
+4. Ensure device and Roon Core are in the same LAN.
 
 ### Setup in Roon
 1. Open Roon desktop app.
@@ -51,7 +52,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.22 (Latest)**
+- **2.23 (Latest)**
   - Added touch gesture playback controls (left/right/up/down swipes)
   - Added track transition animation feedback when changing tracks
   - Kept clean status overlay policy and existing keyboard/media-key control path
@@ -94,8 +95,9 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 安装生成的 APK 到 Android 设备。
-3. 确保设备与 Roon Core 在同一局域网。
+2. 当前已打包的 v2.23 APK 位于项目根目录：`CoverArtForAndroid-v2.23-debug.apk`
+3. 安装生成的 APK 到 Android 设备。
+4. 确保设备与 Roon Core 在同一局域网。
 
 ### Roon 侧配置
 1. 打开 Roon 桌面端。
@@ -111,7 +113,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.22（最新）**
+- **2.23（最新）**
   - 新增触摸手势播放控制（左/右/上/下滑）
   - 新增切歌动画反馈
   - 保留并兼容原有媒体键控制与状态提示策略
