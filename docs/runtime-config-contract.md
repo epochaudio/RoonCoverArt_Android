@@ -24,6 +24,7 @@
 |---|---:|---:|---|---|
 | `connection.web_socket_port` | `9330` | `1..65535` | WebSocket 目标端口默认值 | 错配会导致全链路连接失败 |
 | `connection.tcp_connect_timeout_ms` | `1000` | `100..120000` | TCP 探测/验证超时 | 过小易误判离线，过大阻塞发现 |
+| `connection.health_check_connect_timeout_ms` | `3000` | `100..120000` | 健康检查 TCP 建连超时 | 过小易抖动误判，过大延后异常反馈 |
 | `connection.ws_connect_timeout_ms` | `5000` | `100..120000` | WebSocket TCP 建连超时 | 过大会拖慢失败切换 |
 | `connection.ws_handshake_timeout_ms` | `5000` | `100..120000` | WebSocket 握手超时 | 过小易在弱网握手失败 |
 | `connection.ws_read_timeout_ms` | `15000` | `100..300000` | WebSocket 读超时 | 过小会造成误断连 |

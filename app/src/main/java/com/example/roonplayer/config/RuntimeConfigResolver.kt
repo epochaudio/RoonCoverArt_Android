@@ -19,6 +19,7 @@ data class RuntimeConfigResolution(
         return listOf(
             "connection.web_socket_port=${config.connection.webSocketPort}",
             "connection.tcp_connect_timeout_ms=${config.connection.tcpConnectTimeoutMs}",
+            "connection.health_check_connect_timeout_ms=${config.connection.healthCheckConnectTimeoutMs}",
             "connection.ws_connect_timeout_ms=${config.connection.webSocketConnectTimeoutMs}",
             "connection.smart_retry=max_attempts=${config.connection.smartRetryMaxAttempts},initial_ms=${config.connection.smartRetryInitialDelayMs},max_ms=${config.connection.smartRetryMaxDelayMs}",
             "discovery.network=group=${config.discoveryNetwork.multicastGroup},port=${config.discoveryNetwork.discoveryPort},broadcast=${config.discoveryNetwork.broadcastAddress}",
@@ -33,6 +34,7 @@ data class RuntimeConfigResolution(
 object RuntimeConfigKeys {
     const val CONNECTION_WEB_SOCKET_PORT = "connection.web_socket_port"
     const val CONNECTION_TCP_CONNECT_TIMEOUT_MS = "connection.tcp_connect_timeout_ms"
+    const val CONNECTION_HEALTH_CHECK_CONNECT_TIMEOUT_MS = "connection.health_check_connect_timeout_ms"
     const val CONNECTION_WS_CONNECT_TIMEOUT_MS = "connection.ws_connect_timeout_ms"
     const val CONNECTION_WS_HANDSHAKE_TIMEOUT_MS = "connection.ws_handshake_timeout_ms"
     const val CONNECTION_WS_READ_TIMEOUT_MS = "connection.ws_read_timeout_ms"
@@ -199,6 +201,12 @@ class RuntimeConfigResolver(
             tcpConnectTimeoutMs = applyInt(
                 RuntimeConfigKeys.CONNECTION_TCP_CONNECT_TIMEOUT_MS,
                 defaults.connection.tcpConnectTimeoutMs,
+                RuntimeConfigBounds.TIMEOUT_MIN_MS,
+                RuntimeConfigBounds.TIMEOUT_MAX_MS
+            ),
+            healthCheckConnectTimeoutMs = applyInt(
+                RuntimeConfigKeys.CONNECTION_HEALTH_CHECK_CONNECT_TIMEOUT_MS,
+                defaults.connection.healthCheckConnectTimeoutMs,
                 RuntimeConfigBounds.TIMEOUT_MIN_MS,
                 RuntimeConfigBounds.TIMEOUT_MAX_MS
             ),

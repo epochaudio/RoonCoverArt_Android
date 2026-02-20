@@ -6,7 +6,8 @@ import kotlinx.coroutines.*
 class ConnectionHealthMonitor(
     private val connectionValidator: RoonConnectionValidator,
     private val defaultCheckIntervalMs: Long,
-    private val quickCheckIntervalMs: Long
+    private val quickCheckIntervalMs: Long,
+    private val healthCheckTimeoutMs: Int
 ) {
     companion object {
         private const val TAG = "ConnectionHealthMonitor"
@@ -73,7 +74,7 @@ class ConnectionHealthMonitor(
         Log.d(TAG, "Running health check: $ip:$port")
 
         try {
-            when (val result = connectionValidator.validateConnection(ip, port)) {
+            when (val result = connectionValidator.validateConnection(ip, port, healthCheckTimeoutMs)) {
                 is RoonConnectionValidator.ConnectionResult.Success -> {
                     Log.d(TAG, "Health check succeeded")
                     consecutiveFailures = 0
@@ -96,7 +97,7 @@ class ConnectionHealthMonitor(
                     Log.w(TAG, "Health check network error (consecutive failures: $consecutiveFailures)")
                     
                     when {
-                        consecutiveFailures >= 2 -> HealthStatus.Unhealthy
+                        consecutiveFailures >= 3 -> HealthStatus.Unhealthy
                         else -> HealthStatus.Degraded
                     }
                 }

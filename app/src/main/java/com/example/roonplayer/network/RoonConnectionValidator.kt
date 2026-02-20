@@ -52,32 +52,33 @@ class RoonConnectionValidator(
 
         try {
             val address = InetAddress.getByName(ip)
-            
-            withTimeout(customTimeout.toLong()) {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(address, port), customTimeout)
-                }
+
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(address, port), customTimeout)
             }
-            
+
             Log.i(TAG, "Successfully connected to Roon Core at $ip:$port")
             ConnectionResult.Success
-            
-        } catch (e: TimeoutCancellationException) {
-            Log.w(TAG, "Connection timeout to $ip:$port")
+
+        } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "Connection timeout to $ip:$port after ${customTimeout}ms")
             ConnectionResult.Timeout("Connection timeout after ${customTimeout}ms")
-            
+
         } catch (e: ConnectException) {
             Log.w(TAG, "Connection refused by $ip:$port")
             ConnectionResult.NetworkError("Connection refused - is Roon Core running?")
-            
+
         } catch (e: UnknownHostException) {
             Log.w(TAG, "Unknown host: $ip")
             ConnectionResult.NetworkError("Cannot resolve IP address: $ip")
-            
+
         } catch (e: IOException) {
             Log.w(TAG, "Network error connecting to $ip", e)
             ConnectionResult.NetworkError("Network error: ${e.message}")
-            
+
+        } catch (e: CancellationException) {
+            throw e
+
         } catch (e: Exception) {
             Log.e(TAG, "Unexpected error validating connection to $ip", e)
             ConnectionResult.InvalidCore("Unexpected error: ${e.message}")

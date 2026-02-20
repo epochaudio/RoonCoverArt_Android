@@ -1705,7 +1705,8 @@ class MainActivity : Activity() {
         healthMonitor = ConnectionHealthMonitor(
             connectionValidator = connectionValidator,
             defaultCheckIntervalMs = connectionConfig.healthCheckIntervalMs,
-            quickCheckIntervalMs = connectionConfig.healthQuickCheckIntervalMs
+            quickCheckIntervalMs = connectionConfig.healthQuickCheckIntervalMs,
+            healthCheckTimeoutMs = connectionConfig.healthCheckConnectTimeoutMs
         )
         
         logDebug("✅ Layout creation completed")

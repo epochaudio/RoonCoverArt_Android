@@ -6,6 +6,7 @@ import com.example.roonplayer.domain.DiscoveryTimingConfig
 data class ConnectionConfig(
     val webSocketPort: Int,
     val tcpConnectTimeoutMs: Int,
+    val healthCheckConnectTimeoutMs: Int,
     val webSocketConnectTimeoutMs: Int,
     val webSocketHandshakeTimeoutMs: Int,
     val webSocketReadTimeoutMs: Int,
@@ -73,6 +74,7 @@ data class AppRuntimeConfig(
             val connectionConfig = ConnectionConfig(
                 webSocketPort = 9330,
                 tcpConnectTimeoutMs = 1000,
+                healthCheckConnectTimeoutMs = 3000,
                 webSocketConnectTimeoutMs = 5000,
                 webSocketHandshakeTimeoutMs = 5000,
                 webSocketReadTimeoutMs = 15000,
