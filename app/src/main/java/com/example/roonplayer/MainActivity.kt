@@ -260,6 +260,7 @@ class MainActivity : Activity() {
     private enum class ImageRequestPurpose {
         CURRENT_ALBUM,
         NEXT_PREVIEW,
+        PREVIOUS_PREVIEW,
         QUEUE_PREFETCH
     }
 
@@ -1075,7 +1076,10 @@ class MainActivity : Activity() {
     private lateinit var nextPreviewImageView: ImageView
     private val previousTrackPreviewFrames = ArrayDeque<TrackPreviewFrame>()
     private val nextTrackPreviewFrames = ArrayDeque<TrackPreviewFrame>()
+    private var queuePreviousTrackPreviewFrame: TrackPreviewFrame? = null
     private var queueNextTrackPreviewFrame: TrackPreviewFrame? = null
+    private var expectedPreviousPreviewTrackId: String? = null
+    private var expectedPreviousPreviewImageKey: String? = null
     private var expectedNextPreviewTrackId: String? = null
     private var expectedNextPreviewImageKey: String? = null
     private var queueSnapshot: QueueSnapshot? = null
@@ -4123,8 +4127,7 @@ class MainActivity : Activity() {
         currentQueueSubscriptionZoneId = null
         currentQueueSubscriptionKey = null
         lastQueueSubscribeRequestAtMs = 0L
-        expectedNextPreviewTrackId = null
-        expectedNextPreviewImageKey = null
+        clearQueueDirectionalPreviewState()
         queueSnapshot = null
         lastQueueListFingerprint = null
         currentNowPlayingQueueItemId = null
@@ -5266,7 +5269,7 @@ class MainActivity : Activity() {
                                 sharedPreferences.edit().remove("current_image_key").apply()
                                 mainHandler.post { updateAlbumImage(null, null) }
                             }
-                            refreshNextPreviewFromCachedQueue("now-playing-update")
+                            refreshQueuePreviewsFromCachedQueue("now-playing-update")
                         } else {
                             logDebug("No music playing in selected zone")
                             currentNowPlayingQueueItemId = null
@@ -5434,15 +5437,21 @@ class MainActivity : Activity() {
             }
 
             queueSnapshot = snapshot
+            resolvePreviousQueueTrack(snapshot)?.let { previousTrack ->
+                updateQueuePreviousPreview(
+                    previousTrack = previousTrack,
+                    forceNetworkRefresh = isNewQueueList
+                )
+            } ?: run {
+                clearQueuePreviousPreviewState()
+            }
             resolveNextQueueTrack(snapshot)?.let { nextTrack ->
                 updateQueueNextPreview(
                     nextTrack = nextTrack,
                     forceNetworkRefresh = isNewQueueList
                 )
             } ?: run {
-                queueNextTrackPreviewFrame = null
-                expectedNextPreviewTrackId = null
-                expectedNextPreviewImageKey = null
+                clearQueueNextPreviewState()
             }
             prefetchQueuePreviewImages(
                 snapshot = snapshot,
@@ -5512,6 +5521,7 @@ class MainActivity : Activity() {
     private fun clearQueuePreviewFetchStateForFullRefresh() {
         imageBitmapByImageKey.clear()
         pendingImageRequests.entries.removeIf { entry ->
+            entry.value.purpose == ImageRequestPurpose.PREVIOUS_PREVIEW ||
             entry.value.purpose == ImageRequestPurpose.NEXT_PREVIEW ||
                 entry.value.purpose == ImageRequestPurpose.QUEUE_PREFETCH
         }
@@ -5690,6 +5700,64 @@ class MainActivity : Activity() {
         return items[previousIndex]
     }
 
+    private fun clearQueuePreviousPreviewState() {
+        queuePreviousTrackPreviewFrame = null
+        expectedPreviousPreviewTrackId = null
+        expectedPreviousPreviewImageKey = null
+    }
+
+    private fun clearQueueNextPreviewState() {
+        queueNextTrackPreviewFrame = null
+        expectedNextPreviewTrackId = null
+        expectedNextPreviewImageKey = null
+    }
+
+    private fun clearQueueDirectionalPreviewState() {
+        clearQueuePreviousPreviewState()
+        clearQueueNextPreviewState()
+    }
+
+    private fun updateQueuePreviousPreview(
+        previousTrack: QueueTrackInfo,
+        forceNetworkRefresh: Boolean = false
+    ) {
+        val imageKey = previousTrack.imageKey
+        if (imageKey.isNullOrBlank()) {
+            logRuntimeWarning("Queue previous track has no image_key: ${previousTrack.title ?: "unknown"}")
+            clearQueuePreviousPreviewState()
+            return
+        }
+
+        val trackId = previousTrack.stableId?.let { "queue:$it|$imageKey" } ?: buildTrackPreviewId(
+            track = previousTrack.title ?: "Unknown title",
+            artist = previousTrack.artist ?: "Unknown artist",
+            album = previousTrack.album ?: "Unknown album",
+            imageRef = imageKey
+        )
+        expectedPreviousPreviewTrackId = trackId
+        expectedPreviousPreviewImageKey = imageKey
+
+        val memoryBitmap = getPreviewBitmapForImageKey(imageKey)
+        if (memoryBitmap != null) {
+            queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = trackId, bitmap = memoryBitmap)
+            logRuntimeInfo("Previous preview hit memory cache: trackId=$trackId imageKey=$imageKey")
+            if (!forceNetworkRefresh) {
+                return
+            }
+        }
+
+        if (forceNetworkRefresh || !hasPendingImageRequestForKey(imageKey)) {
+            logRuntimeInfo("Queue previous resolved: title='${previousTrack.title ?: "unknown"}', imageKey=$imageKey, trackId=$trackId")
+            requestImage(
+                imageKey = imageKey,
+                width = PREVIEW_IMAGE_REQUEST_SIZE_PX,
+                height = PREVIEW_IMAGE_REQUEST_SIZE_PX,
+                purpose = ImageRequestPurpose.PREVIOUS_PREVIEW,
+                trackId = trackId
+            )
+        }
+    }
+
     private fun updateQueueNextPreview(
         nextTrack: QueueTrackInfo,
         forceNetworkRefresh: Boolean = false
@@ -5697,9 +5765,7 @@ class MainActivity : Activity() {
         val imageKey = nextTrack.imageKey
         if (imageKey.isNullOrBlank()) {
             logRuntimeWarning("Queue next track has no image_key: ${nextTrack.title ?: "unknown"}")
-            queueNextTrackPreviewFrame = null
-            expectedNextPreviewTrackId = null
-            expectedNextPreviewImageKey = null
+            clearQueueNextPreviewState()
             return
         }
 
@@ -5775,23 +5841,27 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun refreshNextPreviewFromCachedQueue(reason: String) {
+    private fun refreshQueuePreviewsFromCachedQueue(reason: String) {
         val snapshot = queueSnapshot ?: return
         val refreshed = snapshot.copy(currentIndex = resolveQueueCurrentIndex(snapshot.items))
         queueSnapshot = refreshed
 
+        val previousTrack = resolvePreviousQueueTrack(refreshed)
+        if (previousTrack == null) {
+            clearQueuePreviousPreviewState()
+        } else {
+            updateQueuePreviousPreview(previousTrack)
+        }
+
         val nextTrack = resolveNextQueueTrack(refreshed)
         if (nextTrack == null) {
-            queueNextTrackPreviewFrame = null
-            expectedNextPreviewTrackId = null
-            expectedNextPreviewImageKey = null
+            clearQueueNextPreviewState()
             logRuntimeInfo(
                 "Queue next refresh cleared preview: reason=$reason currentIndex=${refreshed.currentIndex} total=${refreshed.items.size}"
             )
-            return
+        } else {
+            updateQueueNextPreview(nextTrack)
         }
-
-        updateQueueNextPreview(nextTrack)
     }
 
     private fun hasPendingImageRequestForKey(imageKey: String): Boolean {
@@ -5901,8 +5971,14 @@ class MainActivity : Activity() {
             append(bodyString)
         }
 
-        if (purpose == ImageRequestPurpose.NEXT_PREVIEW) {
-            logRuntimeInfo("Request next preview image: imageKey=$imageKey trackId=$trackId requestId=$requestIdString")
+        when (purpose) {
+            ImageRequestPurpose.NEXT_PREVIEW -> {
+                logRuntimeInfo("Request next preview image: imageKey=$imageKey trackId=$trackId requestId=$requestIdString")
+            }
+            ImageRequestPurpose.PREVIOUS_PREVIEW -> {
+                logRuntimeInfo("Request previous preview image: imageKey=$imageKey trackId=$trackId requestId=$requestIdString")
+            }
+            else -> Unit
         }
 
         activityScope.launch(Dispatchers.IO) {
@@ -6033,9 +6109,26 @@ class MainActivity : Activity() {
                                 Unit
                             }
                         }
+                        ImageRequestPurpose.PREVIOUS_PREVIEW -> {
+                            val expectedTrackId = expectedPreviousPreviewTrackId
+                            val contextTrackId = requestContext?.trackId
+                            if (expectedTrackId != null && contextTrackId != expectedTrackId) {
+                                logRuntimeInfo("Ignore stale previous preview image response: expected=$expectedTrackId actual=$contextTrackId")
+                                return
+                            }
+                            if (contextTrackId != null) {
+                                val preview = scalePreviewBitmap(cachedBitmap)
+                                queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
+                                logRuntimeInfo(
+                                    "Previous preview loaded from cache: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
+                                )
+                            } else {
+                                Unit
+                            }
+                        }
                         ImageRequestPurpose.QUEUE_PREFETCH -> {
                             requestContext?.imageKey?.let { imageKey ->
-                                promotePrefetchedNextPreviewIfNeeded(imageKey, cachedBitmap)
+                                promotePrefetchedDirectionalPreviewsIfNeeded(imageKey, cachedBitmap)
                             }
                         }
                     }
@@ -6083,9 +6176,28 @@ class MainActivity : Activity() {
                                     Unit
                                 }
                             }
+                            ImageRequestPurpose.PREVIOUS_PREVIEW -> {
+                                val expectedTrackId = expectedPreviousPreviewTrackId
+                                val contextTrackId = requestContext?.trackId
+                                if (expectedTrackId != null && contextTrackId != expectedTrackId) {
+                                    logRuntimeInfo(
+                                        "Ignore stale previous preview image decode: expected=$expectedTrackId actual=$contextTrackId"
+                                    )
+                                    return
+                                }
+                                if (contextTrackId != null) {
+                                    val preview = scalePreviewBitmap(bitmap)
+                                    queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
+                                    logRuntimeInfo(
+                                        "Previous preview loaded from network: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
+                                    )
+                                } else {
+                                    Unit
+                                }
+                            }
                             ImageRequestPurpose.QUEUE_PREFETCH -> {
                                 requestContext?.imageKey?.let { imageKey ->
-                                    promotePrefetchedNextPreviewIfNeeded(imageKey, bitmap)
+                                    promotePrefetchedDirectionalPreviewsIfNeeded(imageKey, bitmap)
                                 }
                             }
                         }
@@ -6120,13 +6232,22 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun promotePrefetchedNextPreviewIfNeeded(imageKey: String, bitmap: Bitmap) {
-        val expectedImageKey = expectedNextPreviewImageKey ?: return
-        if (imageKey != expectedImageKey) return
-        val expectedTrackId = expectedNextPreviewTrackId ?: return
+    private fun promotePrefetchedDirectionalPreviewsIfNeeded(imageKey: String, bitmap: Bitmap) {
         val preview = scalePreviewBitmap(bitmap)
-        queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = expectedTrackId, bitmap = preview)
-        logRuntimeInfo("Next preview populated by queue prefetch: trackId=$expectedTrackId imageKey=$imageKey")
+
+        val expectedNextImageKey = expectedNextPreviewImageKey
+        val expectedNextTrackId = expectedNextPreviewTrackId
+        if (expectedNextImageKey != null && expectedNextTrackId != null && imageKey == expectedNextImageKey) {
+            queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = expectedNextTrackId, bitmap = preview)
+            logRuntimeInfo("Next preview populated by queue prefetch: trackId=$expectedNextTrackId imageKey=$imageKey")
+        }
+
+        val expectedPreviousImageKey = expectedPreviousPreviewImageKey
+        val expectedPreviousTrackId = expectedPreviousPreviewTrackId
+        if (expectedPreviousImageKey != null && expectedPreviousTrackId != null && imageKey == expectedPreviousImageKey) {
+            queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = expectedPreviousTrackId, bitmap = preview)
+            logRuntimeInfo("Previous preview populated by queue prefetch: trackId=$expectedPreviousTrackId imageKey=$imageKey")
+        }
     }
     
     private fun checkForImageHeaders(data: ByteArray) {
@@ -6758,9 +6879,6 @@ class MainActivity : Activity() {
     
     private fun resetDisplay() {
         clearTrackPreviewHistory()
-        queueNextTrackPreviewFrame = null
-        expectedNextPreviewTrackId = null
-        expectedNextPreviewImageKey = null
         queueSnapshot = null
         lastQueueListFingerprint = null
         currentNowPlayingQueueItemId = null
@@ -6904,9 +7022,7 @@ class MainActivity : Activity() {
     private fun clearTrackPreviewHistory() {
         previousTrackPreviewFrames.clear()
         nextTrackPreviewFrames.clear()
-        queueNextTrackPreviewFrame = null
-        expectedNextPreviewTrackId = null
-        expectedNextPreviewImageKey = null
+        clearQueueDirectionalPreviewState()
     }
 
     private fun shouldAllowCoverDragTouch(rawX: Float, rawY: Float): Boolean {
@@ -6980,14 +7096,15 @@ class MainActivity : Activity() {
 
     private fun prepareCoverDragFallbackPreviews() {
         val currentBitmap = captureCurrentTrackPreviewFrame()?.bitmap
-        coverDragFallbackPreviousBitmap = previousTrackPreviewFrames.lastOrNull()?.bitmap ?: currentBitmap
+        coverDragFallbackPreviousBitmap =
+            queuePreviousTrackPreviewFrame?.bitmap ?: previousTrackPreviewFrames.lastOrNull()?.bitmap ?: currentBitmap
         coverDragFallbackNextBitmap =
             queueNextTrackPreviewFrame?.bitmap ?: nextTrackPreviewFrames.lastOrNull()?.bitmap ?: currentBitmap
     }
 
     private fun resolveRightDragPreviewBitmap(): Bitmap? {
-        return previousTrackPreviewFrames.lastOrNull()?.bitmap
-            ?: nextTrackPreviewFrames.lastOrNull()?.bitmap
+        return queuePreviousTrackPreviewFrame?.bitmap
+            ?: previousTrackPreviewFrames.lastOrNull()?.bitmap
             ?: coverDragFallbackPreviousBitmap
             ?: captureCurrentTrackPreviewFrame()?.bitmap
     }
@@ -6995,7 +7112,6 @@ class MainActivity : Activity() {
     private fun resolveLeftDragPreviewBitmap(): Bitmap? {
         return queueNextTrackPreviewFrame?.bitmap
             ?: nextTrackPreviewFrames.lastOrNull()?.bitmap
-            ?: previousTrackPreviewFrames.lastOrNull()?.bitmap
             ?: coverDragFallbackNextBitmap
             ?: captureCurrentTrackPreviewFrame()?.bitmap
     }
@@ -7005,15 +7121,21 @@ class MainActivity : Activity() {
         return albumArtView.drawable
     }
 
-    private fun warmupQueueNextPreviewForDrag() {
-        if (queueNextTrackPreviewFrame != null) return
+    private fun warmupQueueDirectionalPreviewsForDrag() {
         val snapshot = queueSnapshot ?: return
         if (snapshot.currentIndex < 0) {
             requestQueueSnapshotRefresh("drag-warmup-no-current-index")
             return
         }
-        resolveNextQueueTrack(snapshot)?.let { nextTrack ->
-            updateQueueNextPreview(nextTrack)
+        if (queuePreviousTrackPreviewFrame == null) {
+            resolvePreviousQueueTrack(snapshot)?.let { previousTrack ->
+                updateQueuePreviousPreview(previousTrack)
+            }
+        }
+        if (queueNextTrackPreviewFrame == null) {
+            resolveNextQueueTrack(snapshot)?.let { nextTrack ->
+                updateQueueNextPreview(nextTrack)
+            }
         }
     }
 
@@ -7187,7 +7309,7 @@ class MainActivity : Activity() {
                 coverDragStartRawY = ev.rawY
                 coverDragTranslationX = 0f
                 ensureCoverDragPreviewViews()
-                warmupQueueNextPreviewForDrag()
+                warmupQueueDirectionalPreviewsForDrag()
                 prepareCoverDragFallbackPreviews()
                 ensureQueueSubscription(resolveTransportZoneId())
                 logRuntimeInfo(
@@ -7929,9 +8051,7 @@ class MainActivity : Activity() {
             if (nextTrackPreviewFrames.isNotEmpty()) {
                 nextTrackPreviewFrames.removeLast()
             }
-            queueNextTrackPreviewFrame = null
-            expectedNextPreviewTrackId = null
-            expectedNextPreviewImageKey = null
+            clearQueueDirectionalPreviewState()
             queueSnapshot = null
             markPendingTrackTransition(
                 direction = TrackTransitionDirection.NEXT,
@@ -7961,9 +8081,7 @@ class MainActivity : Activity() {
             if (previousTrackPreviewFrames.isNotEmpty()) {
                 previousTrackPreviewFrames.removeLast()
             }
-            queueNextTrackPreviewFrame = null
-            expectedNextPreviewTrackId = null
-            expectedNextPreviewImageKey = null
+            clearQueueDirectionalPreviewState()
             queueSnapshot = null
             markPendingTrackTransition(
                 direction = TrackTransitionDirection.PREVIOUS,
