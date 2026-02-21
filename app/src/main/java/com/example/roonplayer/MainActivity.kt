@@ -35,6 +35,8 @@ import kotlin.random.Random
 import android.app.AlertDialog
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import org.json.JSONArray
@@ -1003,6 +1005,8 @@ class MainActivity : Activity() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var authDialogShown = false
     private var registrationAuthHintJob: Job? = null
+    @Volatile
+    private var lastRegisterRequestId: String? = null
     private var autoReconnectAttempted = false
     private val pairedCores = ConcurrentHashMap<String, PairedCoreInfo>()
     private var statusOverlayContainer: View? = null
@@ -1476,6 +1480,11 @@ class MainActivity : Activity() {
                             absVelocityY >= swipeMinVelocityPx &&
                             absDeltaX <= swipeMaxOffAxisPx
                     if (verticalSwipe) {
+                        // Keep Android system home/back swipe area authoritative: ignore "up=pause"
+                        // when gesture starts from the bottom system gesture region.
+                        if (deltaY < 0f && isBottomSystemGestureStart(start.rawY)) {
+                            return false
+                        }
                         return if (deltaY < 0f) {
                             handleSwipeCommand(SwipeDirection.UP)
                         } else {
@@ -1486,6 +1495,32 @@ class MainActivity : Activity() {
                     return false
                 }
             }
+        )
+    }
+
+    private fun isBottomSystemGestureStart(rawY: Float): Boolean {
+        if (rawY <= 0f) return false
+        val screenHeight = resources.displayMetrics.heightPixels.toFloat()
+        if (screenHeight <= 0f) return false
+        val insetPx = resolveBottomSystemGestureInsetPx()
+        val cutoff = screenHeight - insetPx
+        return rawY >= cutoff
+    }
+
+    private fun resolveBottomSystemGestureInsetPx(): Float {
+        val fallbackInsetPx = (24f * resources.displayMetrics.density).coerceAtLeast(1f)
+        val rootView = window?.decorView ?: return fallbackInsetPx
+        val insets = ViewCompat.getRootWindowInsets(rootView) ?: return fallbackInsetPx
+
+        val mandatoryBottom = insets.getInsets(WindowInsetsCompat.Type.mandatorySystemGestures()).bottom
+        val systemBottom = insets.getInsets(WindowInsetsCompat.Type.systemGestures()).bottom
+        val navigationBottom = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+
+        return maxOf(
+            fallbackInsetPx,
+            mandatoryBottom.toFloat(),
+            systemBottom.toFloat(),
+            navigationBottom.toFloat()
         )
     }
     
@@ -4109,6 +4144,7 @@ class MainActivity : Activity() {
         connectionGuard.finish()
         registrationAuthHintJob?.cancel()
         registrationAuthHintJob = null
+        lastRegisterRequestId = null
         authDialogShown = false
         autoReconnectAttempted = false // Allow future auto-reconnection attempts
         connectionOrchestrator.transition(RoonConnectionState.Disconnected)
@@ -4160,6 +4196,7 @@ class MainActivity : Activity() {
 
         val hostInput = getHostInput()
         val savedToken = pairedCoreRepository.getSavedToken(hostInput)
+        val hasUsableToken = !savedToken.isNullOrBlank()
 
         val body = JSONObject().apply {
             put("extension_id", EXTENSION_ID)
@@ -4169,7 +4206,7 @@ class MainActivity : Activity() {
             put("email", "masked")
             put("website", "https://shop236654229.taobao.com/")
 
-            if (savedToken != null) {
+            if (hasUsableToken) {
                 put("token", savedToken)
             }
 
@@ -4204,7 +4241,7 @@ class MainActivity : Activity() {
         logDebug("Register message length: ${mooMessage.length}, body length: ${bodyBytes.size}")
         logDebug("Register hex: ${mooMessage.toByteArray().take(120).joinToString(" ") { "%02x".format(it) }}...")
 
-        return RegisterRequest(requestId, mooMessage, savedToken != null)
+        return RegisterRequest(requestId, mooMessage, hasUsableToken)
     }
 
     private fun resolveAppVersionName(): String {
@@ -4220,6 +4257,7 @@ class MainActivity : Activity() {
 
     private fun sendRegistration() {
         val request = prepareRegisterRequest(includeSettings = true)
+        lastRegisterRequestId = request.requestId.toString()
         registrationStartedAtMs = System.currentTimeMillis()
         registerMooPendingRequest(
             requestId = request.requestId,
@@ -4252,10 +4290,11 @@ class MainActivity : Activity() {
             if (isFinishing) return@launch
             if (authDialogShown) return@launch
             if (webSocketClient?.isConnected() != true) return@launch
+            if (connectionOrchestrator.connectionState.value == RoonConnectionState.Connected) return@launch
 
             val hostInput = getHostInput()
             val savedToken = pairedCoreRepository.getSavedToken(hostInput)
-            if (savedToken != null) return@launch
+            if (!savedToken.isNullOrBlank()) return@launch
 
             // If we're still not paired after a reasonable wait, surface the server-side action.
             showAuthorizationInstructions()
@@ -4572,7 +4611,15 @@ class MainActivity : Activity() {
                 
                 "COMPLETE" -> {
                     // 处理完整消息（可能是 info 响应或订阅数据）
+                    val isRegisterCompleteSuccess =
+                        servicePath.contains(MOO_COMPLETE_SUCCESS) &&
+                            requestId != null &&
+                            requestId == lastRegisterRequestId
                     when {
+                        isRegisterCompleteSuccess -> {
+                            logDebug("Received registration COMPLETE, processing...")
+                            handleRegistrationResponse(jsonBody)
+                        }
                         servicePath.contains("Success") && jsonBody?.has("core_id") == true -> {
                             logDebug("Received core info via COMPLETE, proceeding to registration...")
                             handleInfoResponse(jsonBody)
@@ -4665,8 +4712,18 @@ class MainActivity : Activity() {
     
     private fun handleRegistrationResponse(jsonBody: JSONObject?) {
         logDebug("Handling registration response: $jsonBody")
-        
-        jsonBody?.let { body ->
+        lastRegisterRequestId = null
+
+        if (jsonBody == null || jsonBody.length() == 0) {
+            logDebug("Registration response body is empty; falling back to authorization instructions")
+            connectionOrchestrator.transition(RoonConnectionState.WaitingApproval)
+            mainHandler.post {
+                showAuthorizationInstructions()
+            }
+            return
+        }
+
+        jsonBody.let { body ->
             if (body.has("token")) {
                 // Automatic pairing successful - save token for future use
                 val token = body.getString("token")

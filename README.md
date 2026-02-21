@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.25)
+# CoverArt for Android (v2.26)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,7 +34,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.25) is generated at project root: `CoverArtForAndroid-v2.25-debug.apk`
+2. Current packaged APK (v2.26) is generated at project root: `CoverArtForAndroid-v2.26-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +52,12 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.25 (Latest)**
+- **2.26 (Latest)**
+  - Improved first-pairing authorization hint reliability when registration responses are delayed or missing
+  - Added fallback handling for empty registration responses to always surface Roon-side authorization guidance
+  - Hardened register response correlation to avoid missing pairing-state transitions
+  - Prevented bottom system-gesture area from triggering swipe-up pause when exiting app
+- **2.25**
   - Premium UI Refactoring: Extracted dimensions into centralized `UIDesignTokens`
   - Adaptive Static Typography: Replaced marquee effects with intelligent multi-line layout and kerning for perfect immersion
   - Art Wall Rebirth: Replaced rigid 3D card flips with elegant cross-fade "breathing" transitions and soft elevations
@@ -105,7 +110,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.25 APK 位于项目根目录：`CoverArtForAndroid-v2.25-debug.apk`
+2. 当前已打包的 v2.26 APK 位于项目根目录：`CoverArtForAndroid-v2.26-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -123,7 +128,12 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.25（最新）**
+- **2.26（最新）**
+  - 优化首次配对授权提示可靠性，覆盖注册响应延迟/丢失场景
+  - 新增注册空响应兜底处理，确保能提示去 Roon 侧完成授权
+  - 强化 register 响应关联，降低配对状态丢失风险
+  - 修复底部系统手势区域误触发“上滑暂停”，避免退出应用时误暂停播放
+- **2.25**
   - 高级视觉重构 (Premium UI)：引入 `UIDesignTokens` 标准化设计语言，剥离硬编码约束
   - 沉静式排版：全面消除跑马灯，引入自适应折行、文字安全边距与画廊级字间距
   - 艺术墙 (Art Wall) 原生质感：移除生硬的 3D 翻转卡片与 2px 勾边，重制为极具呼吸感的平滑交叉渐变 (Cross-fade) 与弥散阴影 
