@@ -212,6 +212,7 @@ class TrackTransitionChoreographer(
                 val prevBitmap = delegate.resolveRightDragPreviewBitmap()
                 if (prevBitmap != null) {
                     previousPreviewImageView.setImageBitmap(prevBitmap)
+                    previousPreviewImageView.clearColorFilter()
                 } else {
                     // Fallback to frosted glass/blurred current state
                     val drawable = delegate.resolveCurrentAlbumPreviewDrawable()
@@ -233,6 +234,7 @@ class TrackTransitionChoreographer(
                 val nextBitmap = delegate.resolveLeftDragPreviewBitmap()
                 if (nextBitmap != null) {
                     nextPreviewImageView.setImageBitmap(nextBitmap)
+                    nextPreviewImageView.clearColorFilter()
                 } else {
                      val drawable = delegate.resolveCurrentAlbumPreviewDrawable()
                      if (drawable != null) {

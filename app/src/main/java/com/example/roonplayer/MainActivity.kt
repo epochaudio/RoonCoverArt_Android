@@ -129,6 +129,16 @@ class MainActivity : Activity() {
         private const val PERMISSION_REQUEST_CODE = 123
         private const val STATUS_AUTO_CONNECT_LAST_PAIRED = "Auto-connecting to the last paired Roon Core..."
         private const val STATUS_START_AUTO_DISCOVERY = "No paired Core found. Starting auto-discovery..."
+        private const val STATUS_CONNECTED_SILENT = "Connected"
+        private const val STATUS_AUTHORIZATION_REQUIRED =
+            "⚠️ 未配对：请先在 Roon 启用 CoverArt 扩展\n" +
+                "Unpaired: Enable CoverArt extension in Roon before pairing\n" +
+                "Roon app -> Settings -> Extensions -> CoverArt_Android -> Enable/Start\n" +
+                "完成授权后请选择展示封面的 Zone / Then choose a display zone"
+        private const val STATUS_ZONE_SELECTION_REQUIRED =
+            "⚠️ 已连接 Core：请在 Roon 扩展设置中选择展示封面的 Zone\n" +
+                "Core connected: Select a zone for cover display\n" +
+                "Roon app -> Settings -> Extensions -> CoverArt_Android -> Settings -> Zone"
         private const val MOO_COMPLETE_SUCCESS = "Success"
         private const val MOO_COMPLETE_INVALID_REQUEST = "InvalidRequest"
         private const val MOO_COMPLETE_UNSUBSCRIBED = "Unsubscribed"
@@ -1358,6 +1368,11 @@ class MainActivity : Activity() {
             
             // 重新应用布局参数以适应新的屏幕方向（复用现有Views）
             applyLayoutParameters()
+
+            // Rebind gesture choreographer after layout rebuild:
+            // - re-attaches drag preview views removed by mainLayout.removeAllViews()
+            // - refreshes screen width used by release animations
+            initializeChoreographer()
             
             // 恢复状态（现在使用复用的Views，状态保持更可靠）
             restoreUIState()
@@ -2050,7 +2065,7 @@ class MainActivity : Activity() {
         statusText.apply {
             // Keep it readable, but not as dominant as the track title.
             textSize = screenAdapter.getResponsiveFontSize(16, TextElement.NORMAL).coerceAtMost(28f)
-            maxLines = 2
+            maxLines = 8
             ellipsize = android.text.TextUtils.TruncateAt.END
             alpha = 0.85f
             // Prevent the overlay from growing beyond screen bounds.
@@ -4781,7 +4796,7 @@ class MainActivity : Activity() {
                 )
                 
                 mainHandler.post {
-                    updateStatus("✅ Auto-pairing succeeded. Subscribing...")
+                    refreshPostPairingGuidanceStatus()
                 }
                 
                 // Load saved zone configuration
@@ -4810,7 +4825,6 @@ class MainActivity : Activity() {
                 logStructuredNetworkEvent(event = "REGISTER_WAITING_APPROVAL")
                 
                 mainHandler.post {
-                    updateStatus("First connection: enable the extension in Roon")
                     showAuthorizationInstructions()
                 }
             }
@@ -5167,8 +5181,7 @@ class MainActivity : Activity() {
                     val state = selectedZone.optString("state", "")
 
                     mainHandler.post {
-                        val zoneName = selectedZone.optString("display_name", "Unknown")
-                        updateStatus("✅ Zone: $zoneName ($selectionReason, $state)")
+                        refreshPostPairingGuidanceStatus()
 
                         val playbackInfo = parseZonePlayback(selectedZone)
 
@@ -5280,7 +5293,7 @@ class MainActivity : Activity() {
                 } else {
                     logWarning("No suitable zone found")
                     mainHandler.post {
-                        updateStatus("⚠️ No suitable playback zone found")
+                        updateMissingZoneStatus("⚠️ No suitable playback zone found")
                         resetDisplay()
                     }
                 }
@@ -5292,7 +5305,7 @@ class MainActivity : Activity() {
             } else {
                 logWarning("No zones received")
                 mainHandler.post {
-                    updateStatus("⚠️ No playback zone found")
+                    updateMissingZoneStatus("⚠️ No playback zone found")
                     resetDisplay()
                 }
             }
@@ -5672,20 +5685,10 @@ class MainActivity : Activity() {
         if (items.isEmpty()) return null
         if (items.size == 1) return null
 
-        val currentIndex = snapshot.currentIndex
-        val nextIndex = when {
-            currentIndex in items.indices -> currentIndex + 1
-            else -> {
-                val currentImageKey = sharedPreferences.getString("current_image_key", "").orEmpty()
-                if (currentImageKey.isBlank()) {
-                    null
-                } else {
-                    val currentByImage = items.indexOfFirst { it.imageKey == currentImageKey }
-                    if (currentByImage >= 0) currentByImage + 1 else null
-                }
-            }
-        }
-        if (nextIndex == null || nextIndex !in items.indices) return null
+        val anchorIndex = resolveQueueAnchorIndex(snapshot)
+        if (anchorIndex !in items.indices) return null
+        val nextIndex = anchorIndex + 1
+        if (nextIndex !in items.indices) return null
         return items[nextIndex]
     }
 
@@ -5693,11 +5696,16 @@ class MainActivity : Activity() {
         val items = snapshot.items
         if (items.isEmpty()) return null
         if (items.size == 1) return null
-        val currentIndex = snapshot.currentIndex
-        if (currentIndex !in items.indices) return null
-        val previousIndex = currentIndex - 1
+        val anchorIndex = resolveQueueAnchorIndex(snapshot)
+        if (anchorIndex !in items.indices) return null
+        val previousIndex = anchorIndex - 1
         if (previousIndex !in items.indices) return null
         return items[previousIndex]
+    }
+
+    private fun resolveQueueAnchorIndex(snapshot: QueueSnapshot): Int {
+        if (snapshot.currentIndex in snapshot.items.indices) return snapshot.currentIndex
+        return resolveQueueCurrentIndex(snapshot.items)
     }
 
     private fun clearQueuePreviousPreviewState() {
@@ -6277,19 +6285,20 @@ class MainActivity : Activity() {
     }
     
     private fun handleZoneConfigurationChange(zoneId: String?) {
-        if (zoneId != null && zoneId != currentZoneId) {
+        if (zoneId == null) return
+
+        if (zoneId != currentZoneId) {
             logDebug("Zone configuration changed: $currentZoneId -> $zoneId")
             if (availableZones.containsKey(zoneId)) {
-                val zoneName = getZoneName(zoneId)
                 applyZoneSelection(
                     zoneId = zoneId,
                     reason = "Settings changed",
                     persist = true,
                     recordUsage = false,
                     updateFiltering = true,
-                    showFeedback = true,
-                    statusMessage = "✅ Selected zone: $zoneName"
+                    showFeedback = false
                 )
+                mainHandler.post { refreshPostPairingGuidanceStatus() }
             } else {
                 currentZoneId = zoneId
                 saveZoneConfiguration(zoneId)
@@ -6298,7 +6307,10 @@ class MainActivity : Activity() {
                     updateStatus("⚠️ Selected zone is unavailable")
                 }
             }
+            return
         }
+
+        mainHandler.post { refreshPostPairingGuidanceStatus() }
     }
 
     private fun applyZoneSelection(
@@ -6605,9 +6617,6 @@ class MainActivity : Activity() {
         // If we have a configured zone, filter updates to only show that zone
         currentZoneId?.let { zoneId ->
             logDebug("Zone filtering enabled for zone: $zoneId")
-            mainHandler.post {
-                updateStatus("✅ Configured zone: ${getZoneName(zoneId)}")
-            }
         }
     }
     
@@ -6840,6 +6849,32 @@ class MainActivity : Activity() {
         
         return stats
     }
+
+    private fun hasExplicitZoneSelection(): Boolean {
+        return !zoneConfigRepository.getStoredOutputId().isNullOrBlank()
+    }
+
+    private fun refreshPostPairingGuidanceStatus() {
+        if (webSocketClient?.isConnected() != true) return
+        if (connectionOrchestrator.connectionState.value != RoonConnectionState.Connected) return
+
+        val nextStatus = if (hasExplicitZoneSelection()) {
+            STATUS_CONNECTED_SILENT
+        } else {
+            STATUS_ZONE_SELECTION_REQUIRED
+        }
+        if (currentState.get().statusText != nextStatus) {
+            updateStatus(nextStatus)
+        }
+    }
+
+    private fun updateMissingZoneStatus(defaultWarning: String) {
+        if (hasExplicitZoneSelection()) {
+            updateStatus(defaultWarning)
+            return
+        }
+        refreshPostPairingGuidanceStatus()
+    }
     
     
     private fun showAuthorizationInstructions() {
@@ -6850,21 +6885,7 @@ class MainActivity : Activity() {
         
         // Show official Roon authorization instructions
         mainHandler.post {
-            updateStatus("Enable the extension in Roon")
-            
-            val instructions = """
-                🎵 Connected. Please authorize:
-                
-                1. Open the Roon app
-                2. Settings > Extensions
-                3. Find "$DISPLAY_NAME"
-                4. Tap "Enable"
-                
-                ✅ After enabling, pairing will complete automatically
-                🔄 Future connections will auto-reconnect
-            """.trimIndent()
-            
-            android.widget.Toast.makeText(this@MainActivity, instructions, android.widget.Toast.LENGTH_LONG).show()
+            updateStatus(STATUS_AUTHORIZATION_REQUIRED)
         }
         
         // Start automatic retry logic - check every 30 seconds for authorization
@@ -7103,17 +7124,59 @@ class MainActivity : Activity() {
     }
 
     private fun resolveRightDragPreviewBitmap(): Bitmap? {
-        return queuePreviousTrackPreviewFrame?.bitmap
+        return resolveDirectionalQueuePreviewBitmap(
+            direction = TrackTransitionDirection.PREVIOUS,
+            frame = queuePreviousTrackPreviewFrame,
+            expectedTrackId = expectedPreviousPreviewTrackId,
+            expectedImageKey = expectedPreviousPreviewImageKey
+        )
             ?: previousTrackPreviewFrames.lastOrNull()?.bitmap
             ?: coverDragFallbackPreviousBitmap
             ?: captureCurrentTrackPreviewFrame()?.bitmap
     }
 
     private fun resolveLeftDragPreviewBitmap(): Bitmap? {
-        return queueNextTrackPreviewFrame?.bitmap
+        return resolveDirectionalQueuePreviewBitmap(
+            direction = TrackTransitionDirection.NEXT,
+            frame = queueNextTrackPreviewFrame,
+            expectedTrackId = expectedNextPreviewTrackId,
+            expectedImageKey = expectedNextPreviewImageKey
+        )
             ?: nextTrackPreviewFrames.lastOrNull()?.bitmap
             ?: coverDragFallbackNextBitmap
             ?: captureCurrentTrackPreviewFrame()?.bitmap
+    }
+
+    private fun resolveDirectionalQueuePreviewBitmap(
+        direction: TrackTransitionDirection,
+        frame: TrackPreviewFrame?,
+        expectedTrackId: String?,
+        expectedImageKey: String?
+    ): Bitmap? {
+        if (frame != null) {
+            if (expectedTrackId.isNullOrBlank() || frame.trackId == expectedTrackId) {
+                return frame.bitmap
+            }
+            when (direction) {
+                TrackTransitionDirection.NEXT -> queueNextTrackPreviewFrame = null
+                TrackTransitionDirection.PREVIOUS -> queuePreviousTrackPreviewFrame = null
+                TrackTransitionDirection.UNKNOWN -> Unit
+            }
+        }
+
+        if (!expectedImageKey.isNullOrBlank()) {
+            getPreviewBitmapForImageKey(expectedImageKey)?.let { return it }
+        }
+        return null
+    }
+
+    private fun prepareCoverDragPreviewSession(rawX: Float, rawY: Float) {
+        if (!shouldAllowCoverDragTouch(rawX, rawY)) return
+        ensureCoverDragPreviewViews()
+        warmupQueueDirectionalPreviewsForDrag()
+        prepareCoverDragFallbackPreviews()
+        ensureQueueSubscription(resolveTransportZoneId(), reason = "drag-prewarm")
+        coverDragLoggedMissingNextPreview = false
     }
 
     private fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable? {
@@ -8328,6 +8391,18 @@ class MainActivity : Activity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                prepareCoverDragPreviewSession(ev.rawX, ev.rawY)
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                coverDragFallbackPreviousBitmap = null
+                coverDragFallbackNextBitmap = null
+                coverDragLoggedMissingNextPreview = false
+            }
+            else -> Unit
+        }
         // Feed all events to GestureDetector first so fling detection gets a full sequence.
         val gestureHandled = ::gestureDetector.isInitialized && gestureDetector.onTouchEvent(ev)
         if (::trackTransitionChoreographer.isInitialized && trackTransitionChoreographer.handleTouch(ev)) {
