@@ -10,8 +10,8 @@ android {
         minSdk 26
         targetSdk 33
         // Android 以 versionCode 判断是否允许“升级安装”，必须单调递增；否则会被视为降级并拒绝安装。
-        versionCode 15
-        versionName "2.23"
+        versionCode 16
+        versionName "2.25"
     }
 
     buildTypes {
@@ -32,6 +32,7 @@ android {
 
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.4.0'
+    implementation 'androidx.dynamicanimation:dynamicanimation:1.0.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'

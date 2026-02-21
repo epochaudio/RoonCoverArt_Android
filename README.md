@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.23)
+# CoverArt for Android (v2.25)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,7 +34,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.23) is generated at project root: `CoverArtForAndroid-v2.23-debug.apk`
+2. Current packaged APK (v2.25) is generated at project root: `CoverArtForAndroid-v2.25-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +52,17 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.23 (Latest)**
+- **2.25 (Latest)**
+  - Premium UI Refactoring: Extracted dimensions into centralized `UIDesignTokens`
+  - Adaptive Static Typography: Replaced marquee effects with intelligent multi-line layout and kerning for perfect immersion
+  - Art Wall Rebirth: Replaced rigid 3D card flips with elegant cross-fade "breathing" transitions and soft elevations
+- **2.24**
+  - Improved track transition aesthetics with physics-based spring animations
+  - Added cascade text animation and Z-axis drop effect for cover art
+  - Perfected audio-visual synchronization by strictly aligning with `playing` state
+  - Added async image rendezvous handling for slow networks
+  - Improved art wall idle detection and timeout suppression
+- **2.23**
   - Added touch gesture playback controls (left/right/up/down swipes)
   - Added track transition animation feedback when changing tracks
   - Kept clean status overlay policy and existing keyboard/media-key control path
@@ -95,7 +105,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.23 APK 位于项目根目录：`CoverArtForAndroid-v2.23-debug.apk`
+2. 当前已打包的 v2.25 APK 位于项目根目录：`CoverArtForAndroid-v2.25-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -113,7 +123,17 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.23（最新）**
+- **2.25（最新）**
+  - 高级视觉重构 (Premium UI)：引入 `UIDesignTokens` 标准化设计语言，剥离硬编码约束
+  - 沉静式排版：全面消除跑马灯，引入自适应折行、文字安全边距与画廊级字间距
+  - 艺术墙 (Art Wall) 原生质感：移除生硬的 3D 翻转卡片与 2px 勾边，重制为极具呼吸感的平滑交叉渐变 (Cross-fade) 与弥散阴影 
+- **2.24**
+  - 提升切歌动效手感，引入物理弹簧动画 (SpringAnimation)
+  - 增加文字错落浮现与封面 Z 轴沉缩呼吸效果
+  - 极其精准的音画同步机制，严格对齐 `playing` 状态
+  - 新增异步超清图片加载过程的平滑遮罩处理
+  - 优化弱网及缓冲时的艺术墙防切误判
+- **2.23**
   - 新增触摸手势播放控制（左/右/上/下滑）
   - 新增切歌动画反馈
   - 保留并兼容原有媒体键控制与状态提示策略

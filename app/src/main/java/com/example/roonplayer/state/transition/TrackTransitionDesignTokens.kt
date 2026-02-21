@@ -67,7 +67,7 @@ object TrackTransitionDesignTokens {
     }
 
     object Palette {
-        const val COLOR_TRANSITION_DURATION_MS = 260L
+        const val COLOR_TRANSITION_DURATION_MS = 800L
         const val COLOR_TRANSITION_START_DELAY_MS = 36L
         const val SHADOW_FADE_OUT_MS = 150L
         const val SHADOW_FADE_IN_MS = 300L

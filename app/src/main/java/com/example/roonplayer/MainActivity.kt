@@ -15,8 +15,12 @@ import android.widget.*
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.TransitionDrawable
 import android.app.Activity
 import android.animation.Animator
 import android.animation.AnimatorSet
@@ -163,6 +167,29 @@ class MainActivity : Activity() {
         private const val QUEUE_PREFETCH_ITEM_COUNT = 12
         private const val PREVIEW_IMAGE_REQUEST_SIZE_PX = 420
         private const val QUEUE_RESUBSCRIBE_DEBOUNCE_MS = 1000L
+        
+        // --- 统一设计语言池 (Design Tokens) ---
+        object UIDesignTokens {
+            // Typography (排版基准)
+            const val TEXT_LETTER_SPACING_ALBUM = 0.05f
+            const val TEXT_MAX_LINES_TITLE = 3
+            const val TEXT_MAX_LINES_ARTIST = 2
+            const val TEXT_MAX_LINES_ALBUM = 2
+            
+            // Layout Proportions (比例常数)
+            const val PROPORTION_LANDSCAPE_IMAGE_WIDTH = 0.618f // 更接近黄金比例
+            const val PROPORTION_LANDSCAPE_TEXT_WIDTH = 0.38f
+            const val PROPORTION_LANDSCAPE_HEIGHT = 0.65f
+            const val PROPORTION_PORTRAIT_IMAGE_WIDTH = 0.85f
+            const val PROPORTION_PORTRAIT_TEXT_HEIGHT = 0.35f
+            const val PROPORTION_COVER_CORNER_RADIUS = 0.035f // 相对宽度的3.5%
+            
+            // Shadows & Elevations
+            const val ELEVATION_ART_WALL = 12f // 减轻厚重的硬编码16f
+            
+            // Animations
+            const val ANIM_CROSSFADE_MS = 600L
+        }
     }
 
     private lateinit var runtimeConfig: AppRuntimeConfig
@@ -323,18 +350,18 @@ class MainActivity : Activity() {
         // Get optimal image size with text area consideration
         fun getOptimalImageSize(): Pair<Int, Int> {
             return if (isLandscape) {
-                // Landscape: Create square container for square album art
-                val maxWidth = (screenWidth * 0.65).toInt()
-                val maxHeight = (screenHeight * 0.92).toInt()
-                val size = minOf(maxWidth, maxHeight) // 使用较小值保持正方形
+                // Landscape: Create stable square container for constraints
+                val maxWidth = (screenWidth * UIDesignTokens.PROPORTION_LANDSCAPE_IMAGE_WIDTH).toInt()
+                val maxHeight = (screenHeight * 0.92).toInt() // Margin top/bottom safe zone
+                val size = minOf(maxWidth, maxHeight) 
                 Pair(size, size)
             } else {
-                // Portrait: 75% width, adaptive based on remaining space
+                // Portrait: Maximum width
                 val (_, textAreaHeight) = getTextAreaSize()
                 val margin = getResponsiveMargin()
-                val availableHeight = screenHeight - textAreaHeight - (margin * 6) // 增加预留间距
-                val imageWidth = (screenWidth * 0.92).toInt() // 增大图片占比提升视觉效果
-                val imageHeight = minOf(imageWidth, availableHeight) // 保持正方形但不超过可用高度
+                val availableHeight = screenHeight - textAreaHeight - (margin * 6)
+                val imageWidth = (screenWidth * UIDesignTokens.PROPORTION_PORTRAIT_IMAGE_WIDTH).toInt()
+                val imageHeight = minOf(imageWidth, availableHeight) 
                 Pair(imageWidth, imageHeight)
             }
         }
@@ -342,14 +369,14 @@ class MainActivity : Activity() {
         // Get text area dimensions with adaptive sizing
         fun getTextAreaSize(): Pair<Int, Int> {
             return if (isLandscape) {
-                // Landscape: 36% width, adaptive height based on screen size
-                val width = (screenWidth * 0.36).toInt()
-                val height = (screenHeight * 0.65).toInt() // 增加到65%确保有足够空间
+                // Landscape: Adaptive height based on screen size, constrained width
+                val width = (screenWidth * UIDesignTokens.PROPORTION_LANDSCAPE_TEXT_WIDTH).toInt()
+                val height = (screenHeight * UIDesignTokens.PROPORTION_LANDSCAPE_HEIGHT).toInt() 
                 Pair(width, height)
             } else {
                 // Portrait: full width, adaptive height for multi-line text display
                 val width = screenWidth
-                val baseHeight = (screenHeight * 0.35).toInt() // 增加到35%确保足够空间
+                val baseHeight = (screenHeight * UIDesignTokens.PROPORTION_PORTRAIT_TEXT_HEIGHT).toInt() 
                 // 根据屏幕密度调整文字区域高度
                 val adjustedHeight = when {
                     density > 3.0f -> (baseHeight * 1.2).toInt() // 高密度屏需要更多空间
@@ -463,14 +490,47 @@ class MainActivity : Activity() {
     private fun getCurrentAlbumBitmap(): Bitmap? {
         return try {
             if (::albumArtView.isInitialized) {
-                val drawable = albumArtView.drawable
-                if (drawable is android.graphics.drawable.BitmapDrawable) {
-                    drawable.bitmap
-                } else null
+                extractTerminalAlbumBitmap(albumArtView.drawable)
             } else null
         } catch (e: Exception) {
             logWarning("Failed to get current album bitmap: ${e.message}")
             null
+        }
+    }
+
+    private fun extractTerminalAlbumBitmap(drawable: Drawable?): Bitmap? {
+        var current: Drawable? = drawable
+        var depth = 0
+        while (depth < 8 && current != null) {
+            when (val drawableAtDepth = current) {
+                is BitmapDrawable -> return drawableAtDepth.bitmap
+                is TransitionDrawable -> {
+                    val layerCount = drawableAtDepth.numberOfLayers
+                    if (layerCount <= 0) return null
+                    current = drawableAtDepth.getDrawable(layerCount - 1)
+                }
+                is LayerDrawable -> {
+                    val layerCount = drawableAtDepth.numberOfLayers
+                    if (layerCount <= 0) return null
+                    current = drawableAtDepth.getDrawable(layerCount - 1)
+                }
+                else -> return null
+            }
+            depth++
+        }
+        return null
+    }
+
+    private fun resolveAlbumTransitionStartDrawable(drawable: Drawable?): Drawable? {
+        return when (drawable) {
+            null -> null
+            is ColorDrawable -> null
+            is BitmapDrawable -> BitmapDrawable(resources, drawable.bitmap)
+            is TransitionDrawable, is LayerDrawable -> {
+                val bitmap = extractTerminalAlbumBitmap(drawable) ?: return null
+                BitmapDrawable(resources, bitmap)
+            }
+            else -> drawable
         }
     }
     
@@ -552,7 +612,8 @@ class MainActivity : Activity() {
             return
         }
         stateLock.withLock {
-            val newState = currentState.get().copy(
+            val previousState = currentState.get()
+            val newState = previousState.copy(
                 albumBitmap = bitmap,
                 imageUri = imageUri,
                 timestamp = System.currentTimeMillis()
@@ -562,10 +623,29 @@ class MainActivity : Activity() {
             // Update UI components
             if (::albumArtView.isInitialized) {
                 if (bitmap != null) {
-                    albumArtView.setImageBitmap(bitmap)
+                    albumArtView.clearColorFilter()
+                    val sameImageRef = !imageUri.isNullOrBlank() && imageUri == previousState.imageUri
+                    val currentDrawable = albumArtView.drawable
+                    if (sameImageRef) {
+                        // Same image key means repeated callback; render directly to avoid redundant cross-fade.
+                        albumArtView.setImageBitmap(bitmap)
+                    } else {
+                        val startDrawable = resolveAlbumTransitionStartDrawable(currentDrawable)
+                        if (startDrawable != null) {
+                            val transitionDrawable = TransitionDrawable(
+                                arrayOf(startDrawable, BitmapDrawable(resources, bitmap))
+                            )
+                            transitionDrawable.isCrossFadeEnabled = true
+                            albumArtView.setImageDrawable(transitionDrawable)
+                            transitionDrawable.startTransition(300)
+                        } else {
+                            albumArtView.setImageBitmap(bitmap)
+                        }
+                    }
                     updateBackgroundColor(bitmap)
                 } else {
                     albumArtView.setImageResource(android.R.color.darker_gray)
+                    albumArtView.clearColorFilter()
                 }
             }
             
@@ -847,6 +927,7 @@ class MainActivity : Activity() {
     private lateinit var artistText: TextView
     private lateinit var albumText: TextView
     private lateinit var albumArtView: ImageView
+    private lateinit var trackTransitionChoreographer: com.example.roonplayer.state.transition.TrackTransitionChoreographer
 
     @Volatile
     private var currentHostInput: String = ""
@@ -1357,17 +1438,18 @@ class MainActivity : Activity() {
 
         gestureDetector = GestureDetector(
             this,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onDown(e: MotionEvent): Boolean = true
-
-                override fun onFling(
-                    e1: MotionEvent,
-                    e2: MotionEvent,
+            object : NullSafeGestureListener() {
+                override fun onFlingNullable(
+                    e1: MotionEvent?,
+                    e2: MotionEvent?,
                     velocityX: Float,
                     velocityY: Float
                 ): Boolean {
-                    val deltaX = e2.x - e1.x
-                    val deltaY = e2.y - e1.y
+                    val start = e1 ?: return false
+                    val end = e2 ?: return false
+
+                    val deltaX = end.x - start.x
+                    val deltaY = end.y - start.y
                     val absDeltaX = kotlin.math.abs(deltaX)
                     val absDeltaY = kotlin.math.abs(deltaY)
                     val absVelocityX = kotlin.math.abs(velocityX)
@@ -1378,6 +1460,10 @@ class MainActivity : Activity() {
                             absVelocityX >= swipeMinVelocityPx &&
                             absDeltaY <= swipeMaxOffAxisPx
                     if (horizontalSwipe) {
+                        // Horizontal drag/commit is handled by TrackTransitionChoreographer.
+                        if (::trackTransitionChoreographer.isInitialized) {
+                            return false
+                        }
                         return if (deltaX < 0f) {
                             handleSwipeCommand(SwipeDirection.LEFT)
                         } else {
@@ -1709,7 +1795,34 @@ class MainActivity : Activity() {
             healthCheckTimeoutMs = connectionConfig.healthCheckConnectTimeoutMs
         )
         
+        initializeChoreographer()
+        
         logDebug("✅ Layout creation completed")
+    }
+    
+    private fun initializeChoreographer() {
+        ensureCoverDragPreviewViews()
+        trackTransitionChoreographer = com.example.roonplayer.state.transition.TrackTransitionChoreographer(
+            albumArtView = albumArtView,
+            nextPreviewImageView = nextPreviewImageView,
+            previousPreviewImageView = previousPreviewImageView,
+            trackText = if (::trackText.isInitialized) trackText else null,
+            artistText = if (::artistText.isInitialized) artistText else null,
+            albumText = if (::albumText.isInitialized) albumText else null,
+            mainLayout = mainLayout,
+            delegate = object : com.example.roonplayer.state.transition.ChoreographerDelegate {
+                override fun onNextTrack() { nextTrack() }
+                override fun onPreviousTrack() { previousTrack() }
+                override fun resolveLeftDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveLeftDragPreviewBitmap()
+                override fun resolveRightDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveRightDragPreviewBitmap()
+                override fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable? = this@MainActivity.resolveCurrentAlbumPreviewDrawable()
+                override fun applyTrackBinding(track: com.example.roonplayer.state.transition.TransitionTrack) { this@MainActivity.applyTrackBinding(track) }
+                override fun commitTrackStateOnly(track: com.example.roonplayer.state.transition.TransitionTrack) { this@MainActivity.commitTrackStateOnly(track) }
+                override fun resolveTextForField(track: com.example.roonplayer.state.transition.TransitionTrack, field: com.example.roonplayer.state.transition.TextCascadeField): String = this@MainActivity.resolveTextForField(track, field)
+            },
+            touchSlopPx = touchSlopPx,
+            screenWidth = screenAdapter.screenWidth
+        )
     }
     
     private fun isLandscape(): Boolean {
@@ -1830,17 +1943,16 @@ class MainActivity : Activity() {
     }
     
     
-    private fun createArtWallItemBackground(): android.graphics.drawable.LayerDrawable {
-        // 为封面墙小封面创建适度阴影效果
+    private fun createArtWallItemBackground(cornerRadius: Float): android.graphics.drawable.LayerDrawable {
+        // 创建极简纯净的阴影，避免此前的多余堆叠和边框
         val shadowLayer = android.graphics.drawable.GradientDrawable().apply {
-            cornerRadius = 20f
-            setColor(0x30000000.toInt()) // 较淡的阴影
+            this.cornerRadius = cornerRadius
+            setColor(0x15000000.toInt()) // 更微弱的弥散阴影
         }
         
         val backgroundLayer = android.graphics.drawable.GradientDrawable().apply {
-            cornerRadius = 20f
-            setColor(0xFF1a1a1a.toInt()) // 背景色
-            setStroke(2, 0x20FFFFFF.toInt()) // 细微白色边框
+            this.cornerRadius = cornerRadius
+            setColor(0xFF1a1a1a.toInt()) // 纯净的底色，去除原有 2px 的 stroke 勾边
         }
         
         return android.graphics.drawable.LayerDrawable(arrayOf(shadowLayer, backgroundLayer)).apply {
@@ -1997,7 +2109,7 @@ class MainActivity : Activity() {
         
         trackText.apply {
             textSize = titleSize
-            maxLines = 3 // 支持3行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_TITLE
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
             logDebug("Track text size: ${titleSize}sp")
@@ -2005,7 +2117,7 @@ class MainActivity : Activity() {
         
         artistText.apply {
             textSize = subtitleSize
-            maxLines = 2 // 支持2行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_ARTIST
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
             logDebug("Artist text size: ${subtitleSize}sp")
@@ -2013,9 +2125,10 @@ class MainActivity : Activity() {
         
         albumText.apply {
             textSize = captionSize
-            maxLines = 2 // 支持2行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_ALBUM
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
+            letterSpacing = UIDesignTokens.TEXT_LETTER_SPACING_ALBUM
             logDebug("Album text size: ${captionSize}sp")
         }
         
@@ -2208,7 +2321,7 @@ class MainActivity : Activity() {
             // 响应式间距
             val responsivePadding = screenAdapter.getResponsiveMargin() / 3
             setPadding(0, 0, 0, responsivePadding)
-            maxLines = 3 // 支持3行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_TITLE 
             ellipsize = android.text.TextUtils.TruncateAt.END
             
             gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
@@ -2219,13 +2332,13 @@ class MainActivity : Activity() {
             text = "Unknown artist"
             // 智能响应式字体：确保完整显示
             textSize = screenAdapter.getResponsiveFontSize(28, TextElement.SUBTITLE)
-            setTextColor(0xFFffffff.toInt()) // 60% 不透明白色
+            setTextColor(0xFFffffff.toInt()) // 60% 不透明度白色
             alpha = 0.60f
-            typeface = android.graphics.Typeface.DEFAULT // Medium效果
+            typeface = android.graphics.Typeface.DEFAULT // Regular
             // 响应式间距
-            val responsivePadding = screenAdapter.getResponsiveMargin() / 3
+            val responsivePadding = screenAdapter.getResponsiveMargin() / 4
             setPadding(0, 0, 0, responsivePadding)
-            maxLines = 2 // 支持2行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_ARTIST
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
                 android.view.Gravity.START else android.view.Gravity.CENTER
@@ -2235,12 +2348,13 @@ class MainActivity : Activity() {
             text = "Unknown album"
             // 智能响应式字体：确保完整显示
             textSize = screenAdapter.getResponsiveFontSize(24, TextElement.CAPTION)
-            setTextColor(0xFFffffff.toInt())
-            alpha = 0.70f // 统一70%透明度
+            setTextColor(0xFFffffff.toInt()) // 60% 不透明度白色
+            alpha = 0.60f
             typeface = android.graphics.Typeface.DEFAULT // Regular
+            letterSpacing = UIDesignTokens.TEXT_LETTER_SPACING_ALBUM
             // 最后一个元素无底部间距
             setPadding(0, 0, 0, 0)
-            maxLines = 2 // 支持2行显示
+            maxLines = UIDesignTokens.TEXT_MAX_LINES_ALBUM
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
                 android.view.Gravity.START else android.view.Gravity.CENTER
@@ -2292,6 +2406,8 @@ class MainActivity : Activity() {
         
         // 创建ImageView - 统一15张图片
         val imageCount = 15
+        val dynamicCornerRadius = cellSize * UIDesignTokens.PROPORTION_COVER_CORNER_RADIUS // 动态计算圆角
+        
         for (i in 0 until imageCount) {
             val imageView = ImageView(this).apply {
                 layoutParams = GridLayout.LayoutParams().apply {
@@ -2300,16 +2416,14 @@ class MainActivity : Activity() {
                     setMargins(gap / 2, gap / 2, gap / 2, gap / 2)
                 }
                 scaleType = ImageView.ScaleType.CENTER_CROP
-                // 为封面墙小封面添加适度阴影效果
-                background = createArtWallItemBackground()
+                background = createArtWallItemBackground(dynamicCornerRadius)
                 clipToOutline = true
                 outlineProvider = object : android.view.ViewOutlineProvider() {
                     override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                        val cornerRadius = 20f // 稍小于主封面的圆角
-                        outline.setRoundRect(0, 0, view.width, view.height, cornerRadius)
+                        outline.setRoundRect(0, 0, view.width, view.height, dynamicCornerRadius)
                     }
                 }
-                elevation = 16f // 适度阴影，不过度突出
+                elevation = UIDesignTokens.ELEVATION_ART_WALL 
             }
             artWallImages[i] = imageView
             artWallGrid.addView(imageView)
@@ -2726,66 +2840,86 @@ class MainActivity : Activity() {
         }
     }
     
-    // 原有的animateImageUpdate函数（用于兼容性）
+    // 原有的animateImageUpdate函数（用于兼容性），同样更新为呼吸动画
     private fun animateImageUpdate(position: Int, imagePath: String) {
         val imageView = artWallImages[position] ?: return
         
-        // 3D翻转动画
-        val rotateOut = ObjectAnimator.ofFloat(imageView, "rotationY", 0f, 90f).apply {
-            duration = 300
+        val fadeOut = ObjectAnimator.ofFloat(imageView, "alpha", 1f, 0f)
+        val scaleDownX = ObjectAnimator.ofFloat(imageView, "scaleX", 1f, 0.95f)
+        val scaleDownY = ObjectAnimator.ofFloat(imageView, "scaleY", 1f, 0.95f)
+        
+        val fadeOutSet = AnimatorSet().apply {
+            playTogether(fadeOut, scaleDownX, scaleDownY)
+            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
             interpolator = AccelerateDecelerateInterpolator()
         }
         
-        val rotateIn = ObjectAnimator.ofFloat(imageView, "rotationY", -90f, 0f).apply {
-            duration = 300
+        val fadeIn = ObjectAnimator.ofFloat(imageView, "alpha", 0f, 1f)
+        val scaleUpX = ObjectAnimator.ofFloat(imageView, "scaleX", 0.95f, 1f)
+        val scaleUpY = ObjectAnimator.ofFloat(imageView, "scaleY", 0.95f, 1f)
+        
+        val fadeInSet = AnimatorSet().apply {
+            playTogether(fadeIn, scaleUpX, scaleUpY)
+            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
             interpolator = AccelerateDecelerateInterpolator()
         }
         
-        rotateOut.addUpdateListener { animation ->
-            if (animation.animatedFraction >= 0.5f && imageView.tag != imagePath) {
-                // 在动画中点更换图片
-                loadImageIntoArtWall(position, imagePath)
+        fadeOutSet.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: android.animation.Animator) {
+                if (imageView.tag != imagePath) {
+                    loadImageIntoArtWall(position, imagePath)
+                }
             }
-        }
+        })
         
-        val animatorSet = AnimatorSet().apply {
-            playSequentially(rotateOut, rotateIn)
+        AnimatorSet().apply {
+            playSequentially(fadeOutSet, fadeInSet)
+            start()
         }
-        
-        animatorSet.start()
     }
     
-    // 优化后的animateImageUpdate函数（直接使用bitmap）
+    // 优化后的animateImageUpdate函数（直接使用bitmap），采用呼吸式淡入淡出与极简缩放
     private fun animateImageUpdate(position: Int, imagePath: String, bitmap: Bitmap) {
         val imageView = artWallImages[position] ?: return
         
-        // 3D翻转动画
-        val rotateOut = ObjectAnimator.ofFloat(imageView, "rotationY", 0f, 90f).apply {
-            duration = 300
+        // 淡出和缩小动画 (Cross-fade & Scale-down)
+        val fadeOut = ObjectAnimator.ofFloat(imageView, "alpha", 1f, 0f)
+        val scaleDownX = ObjectAnimator.ofFloat(imageView, "scaleX", 1f, 0.95f)
+        val scaleDownY = ObjectAnimator.ofFloat(imageView, "scaleY", 1f, 0.95f)
+        
+        val fadeOutSet = AnimatorSet().apply {
+            playTogether(fadeOut, scaleDownX, scaleDownY)
+            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
             interpolator = AccelerateDecelerateInterpolator()
         }
         
-        val rotateIn = ObjectAnimator.ofFloat(imageView, "rotationY", -90f, 0f).apply {
-            duration = 300
+        // 淡入和放大动画 (Cross-fade & Scale-up)
+        val fadeIn = ObjectAnimator.ofFloat(imageView, "alpha", 0f, 1f)
+        val scaleUpX = ObjectAnimator.ofFloat(imageView, "scaleX", 0.95f, 1f)
+        val scaleUpY = ObjectAnimator.ofFloat(imageView, "scaleY", 0.95f, 1f)
+        
+        val fadeInSet = AnimatorSet().apply {
+            playTogether(fadeIn, scaleUpX, scaleUpY)
+            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
             interpolator = AccelerateDecelerateInterpolator()
         }
         
         var imageUpdated = false
-        rotateOut.addUpdateListener { animation ->
-            if (animation.animatedFraction >= 0.5f && !imageUpdated) {
-                // 在动画中点更换图片
-                imageView.setImageBitmap(bitmap)
-                imageView.tag = imagePath
-                imageUpdated = true
-                logDebug("🖼️ Updated image at position $position with bitmap")
+        fadeOutSet.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: android.animation.Animator) {
+                if (!imageUpdated) {
+                    imageView.setImageBitmap(bitmap)
+                    imageView.tag = imagePath
+                    imageUpdated = true
+                    logDebug("🖼️ Updated image at position $position with bitmap via breathing animation")
+                }
             }
-        }
+        })
         
-        val animatorSet = AnimatorSet().apply {
-            playSequentially(rotateOut, rotateIn)
+        AnimatorSet().apply {
+            playSequentially(fadeOutSet, fadeInSet)
+            start()
         }
-        
-        animatorSet.start()
     }
     
     // 输出优化统计信息（用于验证）
@@ -2825,6 +2959,17 @@ class MainActivity : Activity() {
     
     
     private fun handlePlaybackStopped() {
+        val hasActiveTransition = activeTransitionSession != null || 
+            trackTransitionStore.state.value.phase != com.example.roonplayer.state.transition.UiPhase.STABLE
+        
+        val snapshot = queueSnapshot
+        val hasNextTrack = snapshot != null && snapshot.currentIndex in 0 until (snapshot.items.size - 1)
+
+        if (hasActiveTransition || hasNextTrack) {
+            logDebug("⏸️ Suppressing art wall timeout: ActiveTransition=$hasActiveTransition, HasNextTrack=$hasNextTrack")
+            return
+        }
+
         // 停止播放后等待5秒再进入封面墙模式
         if (!isArtWallMode && !isPendingArtWallSwitch) {
             scheduleDelayedArtWallSwitch()
@@ -4997,11 +5142,9 @@ class MainActivity : Activity() {
                                 logDebug("🎵 Track info changed - Title: '$title', Artist: '$artist', Album: '$album'")
                                 dispatchTrackTransitionIntent(
                                     TrackTransitionIntent.EngineUpdate(
-                                        EngineEvent.Playing(
+                                        com.example.roonplayer.state.transition.EngineEvent.Buffering(
                                             key = transitionKey,
-                                            track = transitionTrack,
-                                            anchorPositionMs = 0L,
-                                            anchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+                                            track = transitionTrack
                                         )
                                     )
                                 )
@@ -5012,6 +5155,18 @@ class MainActivity : Activity() {
                             logDebug("🎵 Current playback state: '$state', Art wall mode: $isArtWallMode")
 
                             if (state == "playing") {
+                                if (!trackTransitionStore.state.value.audioReady) {
+                                    dispatchTrackTransitionIntent(
+                                        TrackTransitionIntent.EngineUpdate(
+                                            com.example.roonplayer.state.transition.EngineEvent.Playing(
+                                                key = transitionKey,
+                                                track = transitionTrack,
+                                                anchorPositionMs = 0L,
+                                                anchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+                                            )
+                                        )
+                                    )
+                                }
                                 logDebug("▶️ Music is playing - ensuring album cover mode")
                                 cancelDelayedArtWallSwitch()
 
@@ -5033,6 +5188,11 @@ class MainActivity : Activity() {
                                 if (trackChanged || isNewImage) {
                                     if (trackChanged && isNewImage) {
                                         logDebug("🖼️ Track and album art both changed - loading: $imageKey")
+                                        mainHandler.post {
+                                            if (::albumArtView.isInitialized) {
+                                                albumArtView.setColorFilter(Color.argb(150, 0, 0, 0))
+                                            }
+                                        }
                                     } else if (trackChanged) {
                                         logDebug("🖼️ Track changed, refreshing album art: $imageKey")
                                     } else {
@@ -7208,6 +7368,21 @@ class MainActivity : Activity() {
             mainHandler.post { animateTrackTransition(session, motion) }
             return
         }
+        if (::trackTransitionChoreographer.isInitialized) {
+            trackTransitionChoreographer.animateTrackTransition(session, motion) {
+                if (isSessionActive(session)) {
+                    session.commitHandoffOnce {
+                        applyTrackBinding(session.targetTrack)
+                        commitTrackStateOnly(session.targetTrack)
+                    }
+                    dispatchTrackTransitionIntent(com.example.roonplayer.state.transition.TrackTransitionIntent.AnimationCompleted(session.key))
+                }
+                if (activeTransitionSession?.sessionId == session.sessionId) {
+                    activeTransitionSession = null
+                }
+            }
+            return
+        }
         if (!::albumArtView.isInitialized || albumArtView.visibility != View.VISIBLE) {
             if (isSessionActive(session)) {
                 session.commitHandoffOnce {
@@ -7399,6 +7574,10 @@ class MainActivity : Activity() {
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post { animateTrackTextTransition(session, motion) }
+            return
+        }
+        if (::trackTransitionChoreographer.isInitialized) {
+            trackTransitionChoreographer.animateTrackTextTransition(session, motion) {}
             return
         }
         if (!::trackText.isInitialized || !::artistText.isInitialized || !::albumText.isInitialized) {
@@ -7974,10 +8153,12 @@ class MainActivity : Activity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (handleCoverDragTouchEvent(ev)) {
+        // Feed all events to GestureDetector first so fling detection gets a full sequence.
+        val gestureHandled = ::gestureDetector.isInitialized && gestureDetector.onTouchEvent(ev)
+        if (::trackTransitionChoreographer.isInitialized && trackTransitionChoreographer.handleTouch(ev)) {
             return true
         }
-        if (::gestureDetector.isInitialized && gestureDetector.onTouchEvent(ev)) {
+        if (gestureHandled) {
             return true
         }
         return super.dispatchTouchEvent(ev)
