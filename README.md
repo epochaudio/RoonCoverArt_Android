@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.27)
+# CoverArt for Android (v2.28)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,7 +34,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.27) is generated at project root: `CoverArtForAndroid-v2.27-debug.apk`
+2. Current packaged APK (v2.28) is generated at project root: `CoverArtForAndroid-v2.28-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +52,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.27 (Latest)**
+- **2.28 (Latest)**
   - Added explicit bilingual onboarding guidance before pairing: enable CoverArt extension in Roon first
   - Added bilingual post-pairing guidance to select a display zone in Roon extension settings
   - Enforced silent cover-only display after pairing + zone selection (no success toasts/status hints on artwork)
@@ -115,7 +115,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.27 APK 位于项目根目录：`CoverArtForAndroid-v2.27-debug.apk`
+2. 当前已打包的 v2.28 APK 位于项目根目录：`CoverArtForAndroid-v2.28-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -133,7 +133,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.27（最新）**
+- **2.28（最新）**
   - 增加正式配对前的中英双语引导：先在 Roon 启用 CoverArt 扩展
   - 增加配对成功后的中英双语引导：在 Roon 扩展设置中选择展示封面的 Zone
   - 达到“已配对 + 已选 Zone”后，主展示界面强制静默，仅展示封面

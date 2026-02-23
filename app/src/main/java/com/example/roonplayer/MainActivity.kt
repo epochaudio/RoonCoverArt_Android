@@ -15,12 +15,10 @@ import android.widget.*
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
-import android.graphics.drawable.TransitionDrawable
 import android.app.Activity
 import android.animation.Animator
 import android.animation.AnimatorSet
@@ -327,14 +325,20 @@ class MainActivity : Activity() {
         
         // Get responsive font size based on screen size, density, and text area
         fun getResponsiveFontSize(baseSp: Int, textElement: TextElement = TextElement.NORMAL): Float {
+            fun lerp(start: Float, end: Float, fraction: Float): Float {
+                return start + (end - start) * fraction.coerceIn(0f, 1f)
+            }
+
             // 基于屏幕尺寸的基础缩放
             val screenSizeRatio = minOf(screenWidth, screenHeight) / 1080f
             
-            // 基于密度的调整 - 考虑实际物理尺寸
+            // 基于密度的平滑调整 - 避免 3.0/3.01 这类阈值跳变
             val densityAdjustment = when {
-                density > 3.0f -> 0.8f  // 高密度屏幕（小物理尺寸）减小字体
-                density < 1.5f -> 1.3f  // 低密度屏幕（大物理尺寸）增大字体
-                else -> 1.0f            // 标准密度
+                density < 1.5f -> 1.3f
+                density <= 2.25f -> lerp(1.3f, 1.0f, (density - 1.5f) / 0.75f)
+                density <= 3.0f -> 1.0f
+                density < 4.0f -> lerp(1.0f, 0.8f, (density - 3.0f) / 1.0f)
+                else -> 0.8f
             }
             
             // 根据文本类型调整
@@ -503,47 +507,11 @@ class MainActivity : Activity() {
     private fun getCurrentAlbumBitmap(): Bitmap? {
         return try {
             if (::albumArtView.isInitialized) {
-                extractTerminalAlbumBitmap(albumArtView.drawable)
+                coverArtDisplayManager.extractTerminalBitmap(albumArtView.drawable)
             } else null
         } catch (e: Exception) {
             logWarning("Failed to get current album bitmap: ${e.message}")
             null
-        }
-    }
-
-    private fun extractTerminalAlbumBitmap(drawable: Drawable?): Bitmap? {
-        var current: Drawable? = drawable
-        var depth = 0
-        while (depth < 8 && current != null) {
-            when (val drawableAtDepth = current) {
-                is BitmapDrawable -> return drawableAtDepth.bitmap
-                is TransitionDrawable -> {
-                    val layerCount = drawableAtDepth.numberOfLayers
-                    if (layerCount <= 0) return null
-                    current = drawableAtDepth.getDrawable(layerCount - 1)
-                }
-                is LayerDrawable -> {
-                    val layerCount = drawableAtDepth.numberOfLayers
-                    if (layerCount <= 0) return null
-                    current = drawableAtDepth.getDrawable(layerCount - 1)
-                }
-                else -> return null
-            }
-            depth++
-        }
-        return null
-    }
-
-    private fun resolveAlbumTransitionStartDrawable(drawable: Drawable?): Drawable? {
-        return when (drawable) {
-            null -> null
-            is ColorDrawable -> null
-            is BitmapDrawable -> BitmapDrawable(resources, drawable.bitmap)
-            is TransitionDrawable, is LayerDrawable -> {
-                val bitmap = extractTerminalAlbumBitmap(drawable) ?: return null
-                BitmapDrawable(resources, bitmap)
-            }
-            else -> drawable
         }
     }
     
@@ -639,26 +607,21 @@ class MainActivity : Activity() {
                     albumArtView.clearColorFilter()
                     val sameImageRef = !imageUri.isNullOrBlank() && imageUri == previousState.imageUri
                     val currentDrawable = albumArtView.drawable
-                    if (sameImageRef) {
-                        // Same image key means repeated callback; render directly to avoid redundant cross-fade.
-                        albumArtView.setImageBitmap(bitmap)
-                    } else {
-                        val startDrawable = resolveAlbumTransitionStartDrawable(currentDrawable)
-                        if (startDrawable != null) {
-                            val transitionDrawable = TransitionDrawable(
-                                arrayOf(startDrawable, BitmapDrawable(resources, bitmap))
-                            )
-                            transitionDrawable.isCrossFadeEnabled = true
-                            albumArtView.setImageDrawable(transitionDrawable)
-                            transitionDrawable.startTransition(300)
-                        } else {
-                            albumArtView.setImageBitmap(bitmap)
-                        }
-                    }
+                    val shouldAnimateSwap = !sameImageRef &&
+                        currentDrawable != null &&
+                        albumArtView.visibility == View.VISIBLE &&
+                        !isArtWallMode &&
+                        !isTrackTransitionAnimating &&
+                        activeTransitionSession == null
+                    coverArtDisplayManager.renderAlbumBitmap(
+                        imageView = albumArtView,
+                        bitmap = bitmap,
+                        sameImageRef = sameImageRef,
+                        canAnimateSwap = shouldAnimateSwap
+                    )
                     updateBackgroundColor(bitmap)
                 } else {
-                    albumArtView.setImageResource(android.R.color.darker_gray)
-                    albumArtView.clearColorFilter()
+                    coverArtDisplayManager.clearAlbumBitmap(albumArtView)
                 }
             }
             
@@ -1058,6 +1021,7 @@ class MainActivity : Activity() {
     
     // State synchronization and message processing
     private val stateLock = ReentrantLock()
+    private val imageCacheLock = Any()
     private val currentState = AtomicReference(TrackState())
     private lateinit var gestureDetector: GestureDetector
     private var swipeMinDistancePx = 0f
@@ -1112,37 +1076,78 @@ class MainActivity : Activity() {
     }
     
     // 艺术墙模式相关
+    private val coverArtDisplayManager = CoverArtDisplayManager()
+    private val artWallManager = ArtWallManager()
+    private val layoutOrchestrator = LayoutOrchestrator()
+    private val layoutOrchestratorDelegate = object : LayoutOrchestrator.Delegate {
+        override fun refreshScreenMetrics() {
+            screenAdapter = ScreenAdapter()
+        }
+
+        override fun resetInteractiveState() {
+            resetCoverDragVisualState()
+        }
+
+        override fun isMainLayoutInitialized(): Boolean = ::mainLayout.isInitialized
+
+        override fun onMainLayoutMissing() {
+            logError("❌ mainLayout not initialized, cannot apply layout parameters")
+        }
+
+        override fun detachReusableViews() {
+            if (::albumArtView.isInitialized) detachFromParent(albumArtView)
+            if (::trackText.isInitialized) detachFromParent(trackText)
+            if (::artistText.isInitialized) detachFromParent(artistText)
+            if (::albumText.isInitialized) detachFromParent(albumText)
+            if (::statusText.isInitialized) detachFromParent(statusText)
+        }
+
+        override fun clearMainLayoutChildren() {
+            mainLayout.removeAllViews()
+        }
+
+        override fun isLandscape(): Boolean = this@MainActivity.isLandscape()
+
+        override fun applyLandscapeLayout() {
+            this@MainActivity.applyLandscapeLayout()
+        }
+
+        override fun applyPortraitLayout() {
+            this@MainActivity.applyPortraitLayout()
+        }
+
+        override fun attachStatusOverlay() {
+            this@MainActivity.attachStatusOverlay()
+        }
+
+        override fun logDebug(message: String) {
+            this@MainActivity.logDebug(message)
+        }
+    }
     private var isArtWallMode = false
     private var lastPlaybackTime = 0L
     private lateinit var artWallContainer: RelativeLayout
     private lateinit var artWallGrid: GridLayout
-    private val artWallImages = Array<ImageView?>(15) { null }  // 远距离观看优化：横屏3x5，竖屏5x3
-    private var artWallTimer: Timer? = null
+    private val artWallImages = Array<ImageView?>(ArtWallManager.SLOT_COUNT) { null }  // 远距离观看优化：横屏3x5，竖屏5x3
+    private var artWallCellSizePx: Int = 300
     private val artWallUpdateIntervalMs get() = uiTimingConfig.artWallUpdateIntervalMs
     private val artWallStatsLogDelayMs get() = uiTimingConfig.artWallStatsLogDelayMs
     
     // 延迟切换到艺术墙模式相关
-    private var delayedArtWallTimer: Timer? = null
+    private var delayedArtWallSwitchRunnable: Runnable? = null
     private val delayedArtWallSwitchDelayMs get() = uiTimingConfig.delayedArtWallSwitchDelayMs
     private var isPendingArtWallSwitch = false
     
     // 艺术墙轮换优化相关变量
-    private var allImagePaths: List<String> = emptyList()                    // 所有本地图片路径
-    private var imagePathPool: MutableList<String> = mutableListOf()         // 图片路径轮换池
-    private var pathPoolIndex: Int = 0                                       // 当前路径池索引
     private var currentDisplayedPaths: MutableSet<String> = mutableSetOf()   // 当前显示的路径集合
     
     // 位置轮换队列系统
-    private var positionQueue: MutableList<Int> = mutableListOf()            // 位置轮换队列[0-14]
-    private var currentRoundPositions: MutableSet<Int> = mutableSetOf()      // 当前轮次已使用位置
-    private var rotationRound: Int = 0                                       // 当前轮换轮次计数
+    // 轮换池/位置队列状态已迁移至 ArtWallManager（Phase 2）
     
     // 内存管理相关
     private val maxCachedImages get() = cacheConfig.maxCachedImages
     private val maxDisplayCache get() = cacheConfig.maxDisplayCache
-    private val maxPreloadCache get() = cacheConfig.maxPreloadCache
-    private val displayImageCache = LinkedHashMap<String, Bitmap>()          // LRU显示图片缓存
-    private val preloadImageCache = LinkedHashMap<String, Bitmap>()          // LRU预加载图片缓存
+    private val displayImageCache = LinkedHashMap<String, Bitmap>(32, 0.75f, true) // size-aware LRU显示图片缓存
     private val memoryThreshold get() = cacheConfig.memoryThresholdBytes
     
     data class RoonCoreInfo(
@@ -1161,7 +1166,7 @@ class MainActivity : Activity() {
         val coreId: String = "",
         val lastConnected: Long = System.currentTimeMillis()
     )
-    
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
@@ -1353,6 +1358,13 @@ class MainActivity : Activity() {
             
             // 如果在艺术墙模式，先隐藏（安全检查）
             val wasInArtWallMode = isArtWallMode
+            val previousArtWallCellSize = artWallCellSizePx
+            val artWallSnapshot =
+                if (wasInArtWallMode && ::artWallContainer.isInitialized) {
+                    captureArtWallDisplaySnapshot()
+                } else {
+                    emptyList()
+                }
             if (isArtWallMode && ::artWallContainer.isInitialized) {
                 logDebug("🎨 Temporarily hiding art wall for layout recreation")
                 try {
@@ -1388,7 +1400,19 @@ class MainActivity : Activity() {
                     createArtWallLayout()
                     if (::artWallContainer.isInitialized) {
                         artWallContainer.visibility = View.VISIBLE
-                        loadRandomAlbumCovers()
+                        val restoredSlots = restoreArtWallDisplaySnapshot(artWallSnapshot)
+                        if (restoredSlots == artWallImages.size) {
+                            logDebug("🎨 Restored $restoredSlots art wall slots after rotation (skipped full reload)")
+                            if (previousArtWallCellSize != artWallCellSizePx) {
+                                logDebug(
+                                    "🎨 Art wall cell size changed ($previousArtWallCellSize -> $artWallCellSizePx), refreshing restored bitmaps"
+                                )
+                                refreshRestoredArtWallBitmapsForCurrentCellSize()
+                            }
+                        } else {
+                            logDebug("🎨 Restored $restoredSlots/${artWallImages.size} art wall slots, reloading remaining wall")
+                            loadRandomAlbumCovers()
+                        }
                     }
                 } catch (e: Exception) {
                     logError("Failed to recreate art wall: ${e.message}")
@@ -1569,29 +1593,40 @@ class MainActivity : Activity() {
         try {
             // 扫描缓存目录中的文件
             val files = cacheDir.listFiles { file -> file.isFile && file.extension == "jpg" }
-            files?.sortedBy { it.lastModified() }?.forEach { file ->
-                val hash = file.nameWithoutExtension
-                imageCache[hash] = file.absolutePath
+            synchronized(imageCacheLock) {
+                files?.sortedBy { it.lastModified() }?.forEach { file ->
+                    val hash = file.nameWithoutExtension
+                    imageCache[hash] = file.absolutePath
+                }
             }
             
             // 如果缓存超过限制，删除最老的文件
             cleanupOldCache()
             
-            logDebug("Loaded ${imageCache.size} cached images")
+            val cacheSize = synchronized(imageCacheLock) { imageCache.size }
+            logDebug("Loaded $cacheSize cached images")
         } catch (e: Exception) {
             logError("Failed to load cache index: ${e.message}")
         }
     }
     
     private fun cleanupOldCache() {
-        while (imageCache.size > maxCachedImages) {
-            val oldestEntry = imageCache.entries.first()
-            val file = File(oldestEntry.value)
+        while (true) {
+            val oldestEntry = synchronized(imageCacheLock) {
+                if (imageCache.size <= maxCachedImages) {
+                    null
+                } else {
+                    val entry = imageCache.entries.first()
+                    imageCache.remove(entry.key)
+                    entry.key to entry.value
+                }
+            } ?: break
+
+            val file = File(oldestEntry.second)
             if (file.exists()) {
                 file.delete()
             }
-            imageCache.remove(oldestEntry.key)
-            logDebug("Removed old cached image: ${oldestEntry.key}")
+            logDebug("Removed old cached image: ${oldestEntry.first}")
         }
     }
     
@@ -1609,14 +1644,18 @@ class MainActivity : Activity() {
             // 如果文件已存在，更新访问时间并返回
             if (cacheFile.exists()) {
                 cacheFile.setLastModified(System.currentTimeMillis())
-                imageCache.remove(hash) // 移除旧条目
-                imageCache[hash] = cacheFile.absolutePath // 重新添加到末尾(LRU)
+                synchronized(imageCacheLock) {
+                    imageCache.remove(hash) // 移除旧条目
+                    imageCache[hash] = cacheFile.absolutePath // 重新添加到末尾(LRU)
+                }
                 return cacheFile.absolutePath
             }
             
             // 保存新图片
             cacheFile.writeBytes(imageData)
-            imageCache[hash] = cacheFile.absolutePath
+            synchronized(imageCacheLock) {
+                imageCache[hash] = cacheFile.absolutePath
+            }
             
             // 清理旧缓存
             cleanupOldCache()
@@ -1634,22 +1673,26 @@ class MainActivity : Activity() {
     
     private fun loadImageFromCache(hash: String): Bitmap? {
         return try {
-            val cachedPath = imageCache[hash]
+            val cachedPath = synchronized(imageCacheLock) { imageCache[hash] }
             if (cachedPath != null) {
                 val file = File(cachedPath)
                 if (file.exists()) {
                     // 更新访问时间
                     file.setLastModified(System.currentTimeMillis())
                     // 重新排序LRU
-                    imageCache.remove(hash)
-                    imageCache[hash] = cachedPath
+                    synchronized(imageCacheLock) {
+                        imageCache.remove(hash)
+                        imageCache[hash] = cachedPath
+                    }
                     
                     val bitmap = BitmapFactory.decodeFile(cachedPath)
                     logDebug("Loaded image from cache: $hash")
                     return bitmap
                 } else {
                     // 文件不存在，从缓存中移除
-                    imageCache.remove(hash)
+                    synchronized(imageCacheLock) {
+                        imageCache.remove(hash)
+                    }
                 }
             }
             null
@@ -1865,8 +1908,12 @@ class MainActivity : Activity() {
             albumText = if (::albumText.isInitialized) albumText else null,
             mainLayout = mainLayout,
             delegate = object : com.example.roonplayer.state.transition.ChoreographerDelegate {
-                override fun onNextTrack() { nextTrack() }
-                override fun onPreviousTrack() { previousTrack() }
+                override fun onTrackSkipRequested(direction: com.example.roonplayer.state.transition.TrackSkipRequestDirection) {
+                    when (direction) {
+                        com.example.roonplayer.state.transition.TrackSkipRequestDirection.NEXT -> nextTrack()
+                        com.example.roonplayer.state.transition.TrackSkipRequestDirection.PREVIOUS -> previousTrack()
+                    }
+                }
                 override fun resolveLeftDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveLeftDragPreviewBitmap()
                 override fun resolveRightDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveRightDragPreviewBitmap()
                 override fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable? = this@MainActivity.resolveCurrentAlbumPreviewDrawable()
@@ -2016,38 +2063,11 @@ class MainActivity : Activity() {
     }
     
     private fun applyLayoutParameters() {
-        logDebug("📐 Applying layout parameters for ${if (isLandscape()) "landscape" else "portrait"}")
-        
         try {
-            // Refresh screen metrics (important if display config changes).
-            screenAdapter = ScreenAdapter()
-            resetCoverDragVisualState()
-
-            // 确保mainLayout存在
-            if (!::mainLayout.isInitialized) {
-                logError("❌ mainLayout not initialized, cannot apply layout parameters")
-                return
-            }
-
-            // Detach reusable views from any previous parent container before re-attaching.
-            if (::albumArtView.isInitialized) detachFromParent(albumArtView)
-            if (::trackText.isInitialized) detachFromParent(trackText)
-            if (::artistText.isInitialized) detachFromParent(artistText)
-            if (::albumText.isInitialized) detachFromParent(albumText)
-            if (::statusText.isInitialized) detachFromParent(statusText)
-            
-            // 清除现有的子View
-            mainLayout.removeAllViews()
-            
-            if (isLandscape()) {
-                applyLandscapeLayout()
-            } else {
-                applyPortraitLayout()
-            }
-
-            // Always-on status overlay: keep it visible even in art wall mode.
-            attachStatusOverlay()
-            
+            layoutOrchestrator.applyLayoutParameters(
+                orientationName = if (isLandscape()) "landscape" else "portrait",
+                delegate = layoutOrchestratorDelegate
+            )
         } catch (e: Exception) {
             logError("❌ Error applying layout parameters: ${e.message}", e)
             throw e // 重新抛出异常以便上层处理
@@ -2419,77 +2439,33 @@ class MainActivity : Activity() {
     
     private fun createArtWallLayout() {
         logDebug("Creating art wall layout")
-        
-        artWallContainer = RelativeLayout(this).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            setBackgroundColor(currentDominantColor)
-            visibility = View.GONE
+
+        val layoutRefs = artWallManager.createLayout(
+            activity = this,
+            mainLayout = mainLayout,
+            screenAdapter = screenAdapter,
+            currentDominantColor = currentDominantColor,
+            coverCornerRadiusRatio = UIDesignTokens.PROPORTION_COVER_CORNER_RADIUS,
+            artWallElevation = UIDesignTokens.ELEVATION_ART_WALL,
+            createArtWallItemBackground = { cornerRadius -> createArtWallItemBackground(cornerRadius) },
+            onAttachedToMainLayout = { refreshStatusOverlayVisibility() }
+        )
+
+        artWallContainer = layoutRefs.container
+        artWallGrid = layoutRefs.grid
+        artWallCellSizePx = layoutRefs.cellSizePx
+        for (i in artWallImages.indices) {
+            artWallImages[i] = layoutRefs.images.getOrNull(i)
         }
-        
-        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        // 远距离观看优化：横屏3x5，竖屏5x3，使用响应式布局
-        val (rows, columns) = if (isLandscape) Pair(3, 5) else Pair(5, 3)
-        
-        artWallGrid = GridLayout(this).apply {
-            rowCount = rows
-            columnCount = columns
-            layoutParams = RelativeLayout.LayoutParams(
-                RelativeLayout.LayoutParams.WRAP_CONTENT,
-                RelativeLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                addRule(RelativeLayout.CENTER_IN_PARENT)
-            }
-        }
-        
-        // 使用响应式计算，支持4K等高分辨率
-        val margin = screenAdapter.getResponsiveMargin()
-        val gap = screenAdapter.getResponsiveGap()
-        
-        val availableWidth = screenAdapter.screenWidth - (margin * 2) - (gap * (columns - 1))
-        val availableHeight = screenAdapter.screenHeight - (margin * 2) - (gap * (rows - 1))
-        
-        val cellWidth = availableWidth / columns
-        val cellHeight = availableHeight / rows
-        // 移除300px限制，允许更大尺寸适配4K，同时保持正方形
-        val cellSize = minOf(cellWidth, cellHeight)
-        
-        logDebug("Art wall layout - ${rows}x${columns}, cell size: ${cellSize}px")
-        
-        // 创建ImageView - 统一15张图片
-        val imageCount = 15
-        val dynamicCornerRadius = cellSize * UIDesignTokens.PROPORTION_COVER_CORNER_RADIUS // 动态计算圆角
-        
-        for (i in 0 until imageCount) {
-            val imageView = ImageView(this).apply {
-                layoutParams = GridLayout.LayoutParams().apply {
-                    width = cellSize
-                    height = cellSize
-                    setMargins(gap / 2, gap / 2, gap / 2, gap / 2)
-                }
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                background = createArtWallItemBackground(dynamicCornerRadius)
-                clipToOutline = true
-                outlineProvider = object : android.view.ViewOutlineProvider() {
-                    override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                        outline.setRoundRect(0, 0, view.width, view.height, dynamicCornerRadius)
-                    }
-                }
-                elevation = UIDesignTokens.ELEVATION_ART_WALL 
-            }
-            artWallImages[i] = imageView
-            artWallGrid.addView(imageView)
-        }
-        
-        artWallContainer.addView(artWallGrid)
-        mainLayout.addView(artWallContainer)
-        refreshStatusOverlayVisibility()
-        
+
+        logDebug("Art wall cell size: ${artWallCellSizePx}px")
     }
     
     private fun enterArtWallMode() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnMainThread { enterArtWallMode() }
+            return
+        }
         if (isArtWallMode) return
         
         logDebug("Entering art wall mode")
@@ -2510,7 +2486,7 @@ class MainActivity : Activity() {
         refreshStatusOverlayVisibility()
         
         // 确保轮换池已初始化
-        if (allImagePaths.isEmpty()) {
+        if (!artWallManager.hasImagePaths()) {
             logDebug("🔄 Reinitializing image paths for art wall mode")
             initializeAllImagePaths()
         }
@@ -2523,6 +2499,10 @@ class MainActivity : Activity() {
     }
     
     private fun exitArtWallMode() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnMainThread { exitArtWallMode() }
+            return
+        }
         if (!isArtWallMode) return
         
         logDebug("Exiting art wall mode")
@@ -2550,7 +2530,7 @@ class MainActivity : Activity() {
             }
             
             // 远距离观看优化：横屏3x5，竖屏5x3
-            val imageCount = 15
+            val imageCount = ArtWallManager.SLOT_COUNT
             val selectedImages = mutableListOf<String>()
             val availableImages = cachedImages.toMutableList()
             
@@ -2567,15 +2547,25 @@ class MainActivity : Activity() {
             }
             
             mainHandler.post {
+                currentDisplayedPaths.clear()
                 selectedImages.forEachIndexed { index, imagePath ->
-                    loadImageIntoArtWall(index, imagePath)
+                    if (index >= artWallImages.size) return@forEachIndexed
+                    currentDisplayedPaths.add(imagePath)
+                    artWallImages[index]?.tag = imagePath
+                    loadImageSafely(
+                        imagePath = imagePath,
+                        position = index,
+                        animate = false,
+                        targetSizePx = currentArtWallTargetSizePx()
+                    )
                 }
             }
         }
     }
     
     private fun getCachedImagePaths(): List<String> {
-        return imageCache.values.filter { path ->
+        val cachedPaths = synchronized(imageCacheLock) { imageCache.values.toList() }
+        return cachedPaths.filter { path ->
             File(path).exists()
         }
     }
@@ -2606,13 +2596,11 @@ class MainActivity : Activity() {
                     }
                 }
                 
-                // 更新全局图片路径列表
-                allImagePaths = imagePaths
-                
-                // 初始化轮换池
-                initializeRotationPools()
-                
-                logDebug("🎨 Art wall optimization initialized: ${allImagePaths.size} images found")
+                // 更新全局图片路径列表并初始化轮换池（状态托管给 ArtWallManager）
+                artWallManager.replaceImagePaths(imagePaths)
+                val stats = artWallManager.rotationStats()
+                currentDisplayedPaths.clear()
+                logDebug("🎨 Art wall optimization initialized: ${stats.totalImages} images found")
             
                 // 输出优化统计信息
                 activityScope.launch(Dispatchers.Main) {
@@ -2627,17 +2615,11 @@ class MainActivity : Activity() {
     
     // 初始化轮换池和队列
     private fun initializeRotationPools() {
-        // 初始化图片路径池
-        imagePathPool = allImagePaths.shuffled().toMutableList()
-        pathPoolIndex = 0
+        artWallManager.resetRotationPools()
         currentDisplayedPaths.clear()
-        
-        // 初始化位置队列
-        positionQueue = (0 until 15).shuffled().toMutableList()
-        currentRoundPositions.clear()
-        rotationRound = 0
-        
-        logDebug("🔄 Rotation pools initialized - Images: ${imagePathPool.size}, Positions: ${positionQueue.size}")
+
+        val stats = artWallManager.rotationStats()
+        logDebug("🔄 Rotation pools initialized - Images: ${stats.imagePoolSize}, Positions: ${stats.positionQueueSize}")
     }
     
     // 内存管理工具函数
@@ -2645,11 +2627,6 @@ class MainActivity : Activity() {
         val runtime = Runtime.getRuntime()
         val usedMemory = runtime.totalMemory() - runtime.freeMemory()
         return usedMemory > memoryThreshold
-    }
-    
-    private fun clearPreloadCache() {
-        preloadImageCache.clear()
-        logDebug("🧹 Preload cache cleared due to memory pressure")
     }
     
     private fun clearOldDisplayCache() {
@@ -2665,6 +2642,28 @@ class MainActivity : Activity() {
             logDebug("🧹 Display cache cleaned: removed $entriesToRemove old entries")
         }
     }
+
+    private fun artWallBitmapCacheKey(imagePath: String, targetSizePx: Int): String {
+        return "$imagePath@$targetSizePx"
+    }
+
+    private fun getDisplayCachedArtWallBitmap(imagePath: String, targetSizePx: Int): Bitmap? {
+        return displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)]
+    }
+
+    private fun putDisplayCachedArtWallBitmap(imagePath: String, targetSizePx: Int, bitmap: Bitmap) {
+        displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)] = bitmap
+    }
+
+    private fun removeDisplayCacheEntriesForPath(imagePath: String) {
+        val iterator = displayImageCache.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key.startsWith("$imagePath@")) {
+                iterator.remove()
+            }
+        }
+    }
     
     private fun loadCompressedImage(imagePath: String, targetWidth: Int = 300, targetHeight: Int = 300): Bitmap? {
         return try {
@@ -2672,16 +2671,23 @@ class MainActivity : Activity() {
                 inJustDecodeBounds = true
             }
             BitmapFactory.decodeFile(imagePath, options)
+            if (options.outWidth <= 0 || options.outHeight <= 0) {
+                logDebug("❌ Invalid image bounds while loading compressed image: $imagePath")
+                return null
+            }
             
             // 计算压缩比例
-            val scaleFactor = Math.max(
-                options.outWidth / targetWidth,
-                options.outHeight / targetHeight
+            val safeTargetWidth = targetWidth.coerceAtLeast(1)
+            val safeTargetHeight = targetHeight.coerceAtLeast(1)
+            val scaleFactor = maxOf(
+                1,
+                options.outWidth / safeTargetWidth,
+                options.outHeight / safeTargetHeight
             )
             
             options.apply {
                 inJustDecodeBounds = false
-                inSampleSize = scaleFactor
+                inSampleSize = scaleFactor.coerceAtLeast(1)
                 inPreferredConfig = Bitmap.Config.RGB_565 // 减少内存使用
             }
             
@@ -2694,163 +2700,129 @@ class MainActivity : Activity() {
     
     // 动态添加新图片到轮换池
     private fun addNewImageToPool(imagePath: String) {
-        if (imagePath !in allImagePaths && File(imagePath).exists()) {
-            allImagePaths = allImagePaths + imagePath
-            imagePathPool.add(imagePath)
+        if (File(imagePath).exists() && artWallManager.addImagePathIfAbsent(imagePath)) {
             logDebug("➕ New image added to rotation pool: $imagePath")
         }
     }
     
     // 获取下一批轮换位置（不重复）
     private fun getNextRotationPositions(): List<Int> {
-        val updateCount = 5
-        
-        // 如果位置队列不足，重新填充
-        if (positionQueue.size < updateCount) {
-            refillPositionQueue()
-        }
-        
-        // 取出前5个位置
-        val positions = positionQueue.take(updateCount).toList()
-        positionQueue.removeAll(positions)
-        
-        logDebug("🎯 Selected positions for rotation: $positions (remaining in queue: ${positionQueue.size})")
+        val positions = artWallManager.takeNextRotationPositions(updateCount = 5)
+        val stats = artWallManager.rotationStats()
+        logDebug("🎯 Selected positions for rotation: $positions (remaining in queue: ${stats.positionQueueSize})")
         return positions
-    }
-    
-    // 重新填充位置队列
-    private fun refillPositionQueue() {
-        positionQueue = (0 until 15).shuffled().toMutableList()
-        currentRoundPositions.clear()
-        rotationRound++
-        logDebug("🔄 Position queue refilled for round $rotationRound")
     }
     
     // 获取下一批图片路径（避免重复）
     private fun getNextImagePaths(count: Int): List<String> {
-        val selectedPaths = mutableListOf<String>()
-        
-        // 如果没有可用图片，使用缓存图片作为备选
-        if (allImagePaths.isEmpty()) {
-            val cachedImages = getCachedImagePaths()
-            if (cachedImages.isNotEmpty()) {
-                repeat(count) {
-                    selectedPaths.add(cachedImages.random())
-                }
-            }
-            return selectedPaths
-        }
-        
-        for (i in 0 until count) {
-            // 如果路径池用完，重新填充
-            if (pathPoolIndex >= imagePathPool.size) {
-                refillImagePathPool()
-                pathPoolIndex = 0
-            }
-            
-            // 选择下一个路径，确保不与当前显示重复
-            var selectedPath = imagePathPool[pathPoolIndex]
-            var attempts = 0
-            
-            while (selectedPath in currentDisplayedPaths && attempts < imagePathPool.size) {
-                pathPoolIndex++
-                if (pathPoolIndex >= imagePathPool.size) {
-                    refillImagePathPool()
-                    pathPoolIndex = 0
-                }
-                selectedPath = imagePathPool[pathPoolIndex]
-                attempts++
-            }
-            
-            selectedPaths.add(selectedPath)
-            pathPoolIndex++
-        }
-        
-        logDebug("🖼️ Selected image paths: ${selectedPaths.size} images, pool index: $pathPoolIndex")
+        val selectedPaths = artWallManager.takeNextImagePaths(
+            count = count,
+            currentlyDisplayedPaths = currentDisplayedPaths,
+            fallbackImages = getCachedImagePaths()
+        )
+        val stats = artWallManager.rotationStats()
+        logDebug("🖼️ Selected image paths: ${selectedPaths.size} images, pool size: ${stats.imagePoolSize}")
         return selectedPaths
     }
     
-    // 重新填充图片路径池
-    private fun refillImagePathPool() {
-        imagePathPool = allImagePaths.shuffled().toMutableList()
-        logDebug("🔄 Image path pool refilled with ${imagePathPool.size} images")
+    private fun currentArtWallTargetSizePx(): Int = artWallCellSizePx.coerceAtLeast(1)
+
+    private fun captureArtWallDisplaySnapshot(): List<ArtWallManager.SlotSnapshot> {
+        return artWallManager.captureSnapshot(
+            images = artWallImages,
+            bitmapExtractor = { drawable -> coverArtDisplayManager.extractTerminalBitmap(drawable) }
+        )
     }
-    
-    private fun loadImageIntoArtWall(position: Int, imagePath: String) {
-        try {
-            val bitmap = BitmapFactory.decodeFile(imagePath)
-            if (bitmap != null && position < artWallImages.size) {
-                artWallImages[position]?.setImageBitmap(bitmap)
-                artWallImages[position]?.tag = imagePath  // 记录图片路径用于追踪
-            }
-        } catch (e: Exception) {
-            logError("Failed to load image for art wall: ${e.message}")
+
+    private fun restoreArtWallDisplaySnapshot(snapshot: List<ArtWallManager.SlotSnapshot>): Int {
+        return artWallManager.restoreSnapshot(
+            images = artWallImages,
+            snapshot = snapshot,
+            currentDisplayedPaths = currentDisplayedPaths
+        )
+    }
+
+    private fun refreshRestoredArtWallBitmapsForCurrentCellSize() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { refreshRestoredArtWallBitmapsForCurrentCellSize() }
+            return
+        }
+        val targetSizePx = currentArtWallTargetSizePx()
+        artWallImages.forEachIndexed { index, imageView ->
+            val imagePath = imageView?.tag as? String ?: return@forEachIndexed
+            loadImageSafely(
+                imagePath = imagePath,
+                position = index,
+                animate = false,
+                targetSizePx = targetSizePx
+            )
         }
     }
     
     private fun updateRandomArtWallImages() {
-        activityScope.launch(Dispatchers.IO) {
-            try {
-                logDebug("🔄 Starting art wall rotation update...")
-                
-                // 检查内存状态
-                if (isMemoryLow()) {
-                    clearPreloadCache()
-                }
-                
-                // 获取当前显示的图片路径
-                currentDisplayedPaths.clear()
-                artWallImages.forEach { imageView ->
-                    imageView?.tag?.let { tag ->
-                        if (tag is String) {
-                            currentDisplayedPaths.add(tag)
-                        }
-                    }
-                }
-                
-                // 获取不重复的轮换位置
-                val positionsToUpdate = getNextRotationPositions()
-                if (positionsToUpdate.isEmpty()) {
-                    logDebug("❌ No positions available for rotation")
-                    return@launch
-                }
-                
-                // 获取新的图片路径
-                val newImagePaths = getNextImagePaths(positionsToUpdate.size)
-                if (newImagePaths.isEmpty()) {
-                    logDebug("❌ No image paths available for rotation")
-                    return@launch
-                }
-                
-                logDebug("🎨 Updating ${positionsToUpdate.size} positions with new images")
-                
-                // 在UI线程执行更新
-                mainHandler.post {
-                    positionsToUpdate.forEachIndexed { index, position ->
-                        if (index < newImagePaths.size) {
-                            val imagePath = newImagePaths[index]
-                            
-                            // 清理旧图片的显示缓存
-                            clearOldImageAtPosition(position)
-                            
-                            // 更新显示路径记录
-                            currentDisplayedPaths.add(imagePath)
-                            artWallImages[position]?.tag = imagePath
-                            
-                            // 异步加载并显示新图片
-                            loadImageSafely(imagePath, position)
-                        }
-                    }
-                    
-                    // 清理显示缓存
-                    clearOldDisplayCache()
-                    
-                    logDebug("✅ Art wall rotation update completed")
-                }
-                
-            } catch (e: Exception) {
-                logDebug("❌ Error in art wall rotation: ${e.message}")
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { updateRandomArtWallImages() }
+            return
+        }
+
+        try {
+            logDebug("🔄 Starting art wall rotation update...")
+
+            // 检查内存状态
+            if (isMemoryLow()) {
+                clearOldDisplayCache()
             }
+
+            // 获取当前显示的图片路径（仅在主线程读取/访问 UI）
+            currentDisplayedPaths.clear()
+            artWallImages.forEach { imageView ->
+                val tag = imageView?.tag
+                if (tag is String) {
+                    currentDisplayedPaths.add(tag)
+                }
+            }
+
+            // 获取不重复的轮换位置
+            val positionsToUpdate = getNextRotationPositions()
+            if (positionsToUpdate.isEmpty()) {
+                logDebug("❌ No positions available for rotation")
+                return
+            }
+
+            // 获取新的图片路径
+            val newImagePaths = getNextImagePaths(positionsToUpdate.size)
+            if (newImagePaths.isEmpty()) {
+                logDebug("❌ No image paths available for rotation")
+                return
+            }
+
+            logDebug("🎨 Updating ${positionsToUpdate.size} positions with new images")
+
+            positionsToUpdate.forEachIndexed { index, position ->
+                if (index >= newImagePaths.size) return@forEachIndexed
+                val imagePath = newImagePaths[index]
+
+                // 清理旧图片的显示缓存
+                clearOldImageAtPosition(position)
+
+                // 更新显示路径记录（主线程）
+                currentDisplayedPaths.add(imagePath)
+                artWallImages[position]?.tag = imagePath
+
+                // 异步加载并显示新图片
+                loadImageSafely(
+                    imagePath = imagePath,
+                    position = position,
+                    targetSizePx = currentArtWallTargetSizePx()
+                )
+            }
+
+            // 清理显示缓存
+            clearOldDisplayCache()
+
+            logDebug("✅ Art wall rotation update completed")
+        } catch (e: Exception) {
+            logDebug("❌ Error in art wall rotation: ${e.message}")
         }
     }
     
@@ -2859,13 +2831,62 @@ class MainActivity : Activity() {
         artWallImages[position]?.tag?.let { oldTag ->
             if (oldTag is String) {
                 currentDisplayedPaths.remove(oldTag)
-                displayImageCache.remove(oldTag)
+                removeDisplayCacheEntriesForPath(oldTag)
             }
+        }
+    }
+
+    private fun bindArtWallBitmap(
+        position: Int,
+        imagePath: String,
+        bitmap: Bitmap,
+        animate: Boolean
+    ) {
+        val imageView = artWallImages.getOrNull(position) ?: return
+        val currentTag = imageView.tag
+        if (currentTag != imagePath) {
+            logDebug("⏭️ Skip stale art wall bitmap at position $position")
+            return
+        }
+
+        if (animate) {
+            animateImageUpdate(position, imagePath, bitmap)
+        } else {
+            imageView.setImageBitmap(bitmap)
+            imageView.tag = imagePath
         }
     }
     
     // 安全地加载图片并显示
-    private fun loadImageSafely(imagePath: String, position: Int) {
+    private fun loadImageSafely(
+        imagePath: String,
+        position: Int,
+        animate: Boolean = true,
+        targetSizePx: Int = currentArtWallTargetSizePx()
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post {
+                loadImageSafely(
+                    imagePath = imagePath,
+                    position = position,
+                    animate = animate,
+                    targetSizePx = targetSizePx
+                )
+            }
+            return
+        }
+
+        val safeTargetSizePx = targetSizePx.coerceAtLeast(1)
+        getDisplayCachedArtWallBitmap(imagePath, safeTargetSizePx)?.let { cachedBitmap ->
+            bindArtWallBitmap(
+                position = position,
+                imagePath = imagePath,
+                bitmap = cachedBitmap,
+                animate = animate
+            )
+            return
+        }
+
         activityScope.launch(Dispatchers.IO) {
             try {
                 // 检查文件是否存在
@@ -2875,14 +2896,21 @@ class MainActivity : Activity() {
                 }
                 
                 // 加载压缩图片
-                val bitmap = loadCompressedImage(imagePath)
+                val bitmap = loadCompressedImage(
+                    imagePath = imagePath,
+                    targetWidth = safeTargetSizePx,
+                    targetHeight = safeTargetSizePx
+                )
                 if (bitmap != null) {
-                    // 更新显示缓存
-                    displayImageCache[imagePath] = bitmap
-                    
                     // 在UI线程更新显示
                     mainHandler.post {
-                        animateImageUpdate(position, imagePath, bitmap)
+                        putDisplayCachedArtWallBitmap(imagePath, safeTargetSizePx, bitmap)
+                        bindArtWallBitmap(
+                            position = position,
+                            imagePath = imagePath,
+                            bitmap = bitmap,
+                            animate = animate
+                        )
                     }
                 } else {
                     logDebug("❌ Failed to load image: $imagePath")
@@ -2894,47 +2922,10 @@ class MainActivity : Activity() {
         }
     }
     
-    // 原有的animateImageUpdate函数（用于兼容性），同样更新为呼吸动画
-    private fun animateImageUpdate(position: Int, imagePath: String) {
-        val imageView = artWallImages[position] ?: return
-        
-        val fadeOut = ObjectAnimator.ofFloat(imageView, "alpha", 1f, 0f)
-        val scaleDownX = ObjectAnimator.ofFloat(imageView, "scaleX", 1f, 0.95f)
-        val scaleDownY = ObjectAnimator.ofFloat(imageView, "scaleY", 1f, 0.95f)
-        
-        val fadeOutSet = AnimatorSet().apply {
-            playTogether(fadeOut, scaleDownX, scaleDownY)
-            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
-            interpolator = AccelerateDecelerateInterpolator()
-        }
-        
-        val fadeIn = ObjectAnimator.ofFloat(imageView, "alpha", 0f, 1f)
-        val scaleUpX = ObjectAnimator.ofFloat(imageView, "scaleX", 0.95f, 1f)
-        val scaleUpY = ObjectAnimator.ofFloat(imageView, "scaleY", 0.95f, 1f)
-        
-        val fadeInSet = AnimatorSet().apply {
-            playTogether(fadeIn, scaleUpX, scaleUpY)
-            duration = UIDesignTokens.ANIM_CROSSFADE_MS / 2
-            interpolator = AccelerateDecelerateInterpolator()
-        }
-        
-        fadeOutSet.addListener(object : android.animation.AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: android.animation.Animator) {
-                if (imageView.tag != imagePath) {
-                    loadImageIntoArtWall(position, imagePath)
-                }
-            }
-        })
-        
-        AnimatorSet().apply {
-            playSequentially(fadeOutSet, fadeInSet)
-            start()
-        }
-    }
-    
     // 优化后的animateImageUpdate函数（直接使用bitmap），采用呼吸式淡入淡出与极简缩放
     private fun animateImageUpdate(position: Int, imagePath: String, bitmap: Bitmap) {
         val imageView = artWallImages[position] ?: return
+        if (imageView.tag != imagePath) return
         
         // 淡出和缩小动画 (Cross-fade & Scale-down)
         val fadeOut = ObjectAnimator.ofFloat(imageView, "alpha", 1f, 0f)
@@ -2961,7 +2952,7 @@ class MainActivity : Activity() {
         var imageUpdated = false
         fadeOutSet.addListener(object : android.animation.AnimatorListenerAdapter() {
             override fun onAnimationEnd(animation: android.animation.Animator) {
-                if (!imageUpdated) {
+                if (!imageUpdated && imageView.tag == imagePath) {
                     imageView.setImageBitmap(bitmap)
                     imageView.tag = imagePath
                     imageUpdated = true
@@ -2978,14 +2969,14 @@ class MainActivity : Activity() {
     
     // 输出优化统计信息（用于验证）
     private fun logOptimizationStats() {
+        val rotationStats = artWallManager.rotationStats()
         logDebug("📊 === Art wall rotation stats ===")
-        logDebug("📁 Total images: ${allImagePaths.size}")
-        logDebug("🔄 Image pool size: ${imagePathPool.size}")
-        logDebug("📍 Position queue size: ${positionQueue.size}")
-        logDebug("🎯 Current rotation round: $rotationRound")
+        logDebug("📁 Total images: ${rotationStats.totalImages}")
+        logDebug("🔄 Image pool size: ${rotationStats.imagePoolSize}")
+        logDebug("📍 Position queue size: ${rotationStats.positionQueueSize}")
+        logDebug("🎯 Current rotation round: ${rotationStats.rotationRound}")
         logDebug("🖼️ Currently displayed images: ${currentDisplayedPaths.size}")
         logDebug("💾 Display cache size: ${displayImageCache.size}")
-        logDebug("⚡ Preload cache size: ${preloadImageCache.size}")
         
         val runtime = Runtime.getRuntime()
         val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024
@@ -2994,25 +2985,25 @@ class MainActivity : Activity() {
     }
     
     private fun startArtWallTimer() {
-        stopArtWallTimer()
-        artWallTimer = Timer().apply {
-            scheduleAtFixedRate(object : TimerTask() {
-                override fun run() {
-                    if (isArtWallMode) {
-                        updateRandomArtWallImages()
-                    }
+        artWallManager.startRotationTimer(intervalMs = artWallUpdateIntervalMs) {
+            mainHandler.post {
+                if (isArtWallMode) {
+                    updateRandomArtWallImages()
                 }
-            }, artWallUpdateIntervalMs, artWallUpdateIntervalMs)
+            }
         }
     }
     
     private fun stopArtWallTimer() {
-        artWallTimer?.cancel()
-        artWallTimer = null
+        artWallManager.stopRotationTimer()
     }
     
     
     private fun handlePlaybackStopped() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnMainThread { handlePlaybackStopped() }
+            return
+        }
         val hasActiveTransition = activeTransitionSession != null || 
             trackTransitionStore.state.value.phase != com.example.roonplayer.state.transition.UiPhase.STABLE
         
@@ -3032,37 +3023,42 @@ class MainActivity : Activity() {
     
     // 计划延迟切换到艺术墙模式
     private fun scheduleDelayedArtWallSwitch() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { scheduleDelayedArtWallSwitch() }
+            return
+        }
         logDebug("⏱️ Scheduling delayed art wall switch in 5 seconds")
         
-        // 取消之前的延迟计时器（但不重置状态标志）
-        delayedArtWallTimer?.cancel()
-        delayedArtWallTimer = null
+        // 取消之前的延迟任务（但不重置状态标志）
+        delayedArtWallSwitchRunnable?.let { mainHandler.removeCallbacks(it) }
+        delayedArtWallSwitchRunnable = null
         
         // 设置待切换状态
         isPendingArtWallSwitch = true
         
-        // 启动5秒延迟计时器
-        delayedArtWallTimer = Timer().apply {
-            schedule(object : TimerTask() {
-                override fun run() {
-                    runOnUiThread {
-                        if (isPendingArtWallSwitch && !isArtWallMode) {
-                            logDebug("⏱️ Delayed art wall switch executing")
-                            enterArtWallMode()
-                        }
-                        isPendingArtWallSwitch = false
-                    }
-                }
-            }, delayedArtWallSwitchDelayMs)
+        // 启动5秒延迟任务（主线程）
+        val pendingRunnable = Runnable {
+            if (isPendingArtWallSwitch && !isArtWallMode) {
+                logDebug("⏱️ Delayed art wall switch executing")
+                enterArtWallMode()
+            }
+            isPendingArtWallSwitch = false
+            delayedArtWallSwitchRunnable = null
         }
+        delayedArtWallSwitchRunnable = pendingRunnable
+        mainHandler.postDelayed(pendingRunnable, delayedArtWallSwitchDelayMs)
     }
     
     // 取消延迟切换到艺术墙模式
     private fun cancelDelayedArtWallSwitch() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { cancelDelayedArtWallSwitch() }
+            return
+        }
         if (isPendingArtWallSwitch) {
             logDebug("⏹️ Canceling delayed art wall switch")
-            delayedArtWallTimer?.cancel()
-            delayedArtWallTimer = null
+            delayedArtWallSwitchRunnable?.let { mainHandler.removeCallbacks(it) }
+            delayedArtWallSwitchRunnable = null
             isPendingArtWallSwitch = false
         }
     }
@@ -7658,6 +7654,9 @@ class MainActivity : Activity() {
         val startScaleY = albumArtView.scaleY
         val startTranslationX = albumArtView.translationX
 
+        if (::albumArtView.isInitialized) {
+            coverArtDisplayManager.cancelSwapAnimation(albumArtView, resetAlpha = false)
+        }
         activeTrackTransitionAnimator?.cancel()
 
         isTrackTransitionAnimating = true

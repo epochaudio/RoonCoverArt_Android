@@ -27,9 +27,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
+enum class TrackSkipRequestDirection { NEXT, PREVIOUS }
+
 interface ChoreographerDelegate {
-    fun onNextTrack()
-    fun onPreviousTrack()
+    fun onTrackSkipRequested(direction: TrackSkipRequestDirection)
     fun resolveLeftDragPreviewBitmap(): Bitmap?
     fun resolveRightDragPreviewBitmap(): Bitmap?
     fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable?
@@ -159,9 +160,9 @@ class TrackTransitionChoreographer(
                 if (shouldCommit) {
                     commandSent = true
                     if (finalShift < 0f) {
-                        delegate.onNextTrack()
+                        delegate.onTrackSkipRequested(direction = TrackSkipRequestDirection.NEXT)
                     } else {
-                        delegate.onPreviousTrack()
+                        delegate.onTrackSkipRequested(direction = TrackSkipRequestDirection.PREVIOUS)
                     }
                 }
 
