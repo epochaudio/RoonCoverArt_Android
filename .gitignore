@@ -28,3 +28,6 @@ app/build/
 
 # Local APK builds
 *.apk
+
+# Local planning/docs (not for repo)
+docs/

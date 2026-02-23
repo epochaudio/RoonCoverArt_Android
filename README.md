@@ -53,10 +53,11 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Version
 - **2.28 (Latest)**
-  - Added explicit bilingual onboarding guidance before pairing: enable CoverArt extension in Roon first
-  - Added bilingual post-pairing guidance to select a display zone in Roon extension settings
-  - Enforced silent cover-only display after pairing + zone selection (no success toasts/status hints on artwork)
-  - Fixed drag preview visual tint residue by clearing color filters on directional preview bitmaps
+  - Optimized Art Wall loading path: moved bitmap decoding off the main thread to reduce UI stutter
+  - Improved idle/playback switching stability by replacing delayed Timer switching with main-thread scheduling
+  - Added Art Wall snapshot/restore on rotation and size-aware bitmap caching for faster orientation changes
+  - Refactored cover display / art wall / layout responsibilities into dedicated managers for maintainability
+  - Added unit tests for Art Wall rotation pool logic
 - **2.26**
   - Improved first-pairing authorization hint reliability when registration responses are delayed or missing
   - Added fallback handling for empty registration responses to always surface Roon-side authorization guidance
@@ -134,10 +135,11 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 版本信息
 - **2.28（最新）**
-  - 增加正式配对前的中英双语引导：先在 Roon 启用 CoverArt 扩展
-  - 增加配对成功后的中英双语引导：在 Roon 扩展设置中选择展示封面的 Zone
-  - 达到“已配对 + 已选 Zone”后，主展示界面强制静默，仅展示封面
-  - 修复拖拽预览图残留色彩滤镜导致的发灰/发暗问题
+  - 优化艺术墙图片加载链路：Bitmap 解码移出主线程，降低卡顿
+  - 优化停播/恢复切换稳定性：延迟切换改为主线程调度，降低竞态风险
+  - 新增横竖屏切换时的艺术墙快照恢复与尺寸感知缓存，加快旋转恢复速度
+  - 拆分封面显示 / 艺术墙 / 布局编排职责，提升代码可维护性
+  - 新增艺术墙轮换池逻辑单元测试，增强回归保护
 - **2.26**
   - 优化首次配对授权提示可靠性，覆盖注册响应延迟/丢失场景
   - 新增注册空响应兜底处理，确保能提示去 Roon 侧完成授权
@@ -163,4 +165,4 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
   - 优化首次配对授权提示逻辑
 
 ### 支持
-- Issue / PR: [GitHub](https://github.com/epochaudio/CoverArtForAndroid/issues)
+- Issue / PR: [GitHub](https://github.com/epochaudio/RoonCoverArt_Android/issues)
