@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.28)
+# CoverArt for Android (v2.29)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,7 +34,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.28) is generated at project root: `CoverArtForAndroid-v2.28-debug.apk`
+2. Current packaged APK (v2.29) is generated at project root: `CoverArtForAndroid-v2.29-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +52,13 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.28 (Latest)**
+- **2.29 (Latest)**
+  - Hardened WebSocket, subscription registry, and connection-monitor lifecycle handling to reduce race conditions and leaks
+  - Simplified message processing into a single-threaded execution path for more predictable MOO handling
+  - Extracted MOO dispatch, image response processing, palette handling, and queue coordination into dedicated collaborators
+  - Added parser/input hardening for oversized `Content-Length` and IPv6 host parsing
+  - Expanded regression coverage for routing, parser limits, subscription removal, and connection-input parsing
+- **2.28**
   - Optimized Art Wall loading path: moved bitmap decoding off the main thread to reduce UI stutter
   - Improved idle/playback switching stability by replacing delayed Timer switching with main-thread scheduling
   - Added Art Wall snapshot/restore on rotation and size-aware bitmap caching for faster orientation changes
@@ -116,7 +122,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.28 APK 位于项目根目录：`CoverArtForAndroid-v2.28-debug.apk`
+2. 当前已打包的 v2.29 APK 位于项目根目录：`CoverArtForAndroid-v2.29-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -134,7 +140,13 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.28（最新）**
+- **2.29（最新）**
+  - 强化 WebSocket、订阅注册表与连接监控生命周期处理，降低竞态与资源泄漏风险
+  - 将消息处理链路收敛为单线程串行执行，提升 MOO 协议处理可预测性
+  - 拆出 MOO 路由、图片响应处理、主色调管理、队列协调等独立协作类，降低 `MainActivity` 复杂度
+  - 增强协议与输入健壮性，补上超大 `Content-Length` 限制与 IPv6 地址解析
+  - 补充路由、解析上限、订阅移除和连接输入解析相关回归测试
+- **2.28**
   - 优化艺术墙图片加载链路：Bitmap 解码移出主线程，降低卡顿
   - 优化停播/恢复切换稳定性：延迟切换改为主线程调度，降低竞态风险
   - 新增横竖屏切换时的艺术墙快照恢复与尺寸感知缓存，加快旋转恢复速度

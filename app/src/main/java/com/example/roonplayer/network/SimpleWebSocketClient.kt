@@ -6,6 +6,8 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
 
 // WebSocket客户端实现 - 使用Roon的官方WebSocket API
 class SimpleWebSocketClient(
@@ -16,8 +18,9 @@ class SimpleWebSocketClient(
     private val readTimeoutMs: Int,
     private val onMessage: (String) -> Unit
 ) {
+    @Volatile
     private var socket: Socket? = null
-    private var connected = false
+    private val connected = AtomicBoolean(false)
     
     companion object {
         private const val DEBUG_ENABLED = true
@@ -72,8 +75,8 @@ class SimpleWebSocketClient(
             logInfo("[WS][$event] $details")
         }
     }
-    
-    fun isConnected(): Boolean = connected
+
+    fun isConnected(): Boolean = connected.get()
     
     fun getHost(): String = host
     fun getPort(): Int = port
@@ -153,7 +156,7 @@ class SimpleWebSocketClient(
                 val response = headerBuffer.toString()
                 if (response.contains("101 Switching Protocols")) {
                     logLifecycle("CONNECT_OK", "$host:$port")
-                    connected = true
+                    connected.set(true)
                     
                     // Reset timeout for normal operation
                     sock.soTimeout = 0 
@@ -171,7 +174,7 @@ class SimpleWebSocketClient(
                         // Give a short delay to let the connection stabilize
                         delay(10)
                         
-                        while (isActive && connected && !sock.isClosed && sock.isConnected) {
+                        while (isActive && connected.get() && !sock.isClosed && sock.isConnected) {
                             try {
                                 // Set timeout for each read operation
                                 sock.soTimeout = readTimeoutMs
@@ -193,12 +196,12 @@ class SimpleWebSocketClient(
                                 // This is normal for read timeout if no data sent
                                 continue
                             } catch (e: java.io.IOException) {
-                                if (connected) {
+                                if (connected.get()) {
                                     logError("[WS][LOOP_IO_ERROR] ${e.message}")
                                     break
                                 }
                             } catch (e: Exception) {
-                                if (connected && e !is CancellationException) {
+                                if (connected.get() && e !is CancellationException) {
                                     logError("[WS][LOOP_UNEXPECTED_ERROR] ${e.message}", e)
                                 }
                                 break
@@ -210,8 +213,7 @@ class SimpleWebSocketClient(
                             logError("[WS][LOOP_FAILED] ${e.message}", e)
                         }
                     } finally {
-                        if (connected) {
-                            connected = false
+                        if (connected.compareAndSet(true, false)) {
                             try { sock.close() } catch (ignore: Exception) {}
                         }
                     }
@@ -219,7 +221,7 @@ class SimpleWebSocketClient(
             }
         } catch (e: Exception) {
             logError("[WS][CONNECT_FAIL] ${e.message}", e)
-            connected = false
+            connected.set(false)
             throw e
         }
     }
@@ -243,7 +245,7 @@ class SimpleWebSocketClient(
                 }
             } catch (e: Exception) {
                 logError("Send failed: ${e.message}", e)
-                connected = false
+                connected.set(false)
             }
         } ?: logError("Cannot send message: socket is null")
     }
@@ -264,7 +266,7 @@ class SimpleWebSocketClient(
                 logDebug("WebSocket frame sent successfully (${frame.size} bytes)")
             } catch (e: Exception) {
                 logError("WebSocket send failed: ${e.message}", e)
-                connected = false
+                connected.set(false)
             }
         } ?: logError("Cannot send WebSocket frame: socket is null")
     }
@@ -286,13 +288,8 @@ class SimpleWebSocketClient(
         // 客户端发送的 WS 帧必须带 mask；此处统一封装，避免分散实现导致协议不一致。
         val payloadLength = payload.size
         
-        // Generate random mask key (required for client-to-server frames)
-        val maskKey = byteArrayOf(
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte(),
-            (Math.random() * 256).toInt().toByte()
-        )
+        // RFC 6455 requires the client masking key to be unpredictable.
+        val maskKey = ByteArray(4).also(maskRandom::nextBytes)
         
         // Apply mask to payload
         val maskedPayload = ByteArray(payload.size)
@@ -321,7 +318,7 @@ class SimpleWebSocketClient(
     
     fun disconnect() {
         logLifecycle("DISCONNECT")
-        connected = false
+        connected.set(false)
         try {
             socket?.close()
         } catch (e: Exception) {
@@ -338,6 +335,8 @@ class SimpleWebSocketClient(
     }
     
     // WebSocket frame reassembly variables for handling fragmented binary messages
+    private val frameStateLock = Any()
+    private val maskRandom = SecureRandom()
     private var frameBuffer: ByteArrayOutputStream? = null
     private var framingInProgress: Boolean = false
     private var expectedFrameType: Int = -1
@@ -398,17 +397,21 @@ class SimpleWebSocketClient(
             var payloadLength = (secondByte and 0x7F).toLong()
             
             logFrameVerbose("WebSocket frame: fin=$fin, opcode=$opcode, masked=$masked, initial_length=$payloadLength")
-            val isUnexpectedContinuation = opcode == OPCODE_CONTINUATION && !framingInProgress
+            val isUnexpectedContinuation = synchronized(frameStateLock) {
+                opcode == OPCODE_CONTINUATION && !framingInProgress
+            }
             if (isUnexpectedContinuation) {
                 logWarning("Received continuation frame but no fragmentation in progress")
             }
-            if (opcode == OPCODE_TEXT || opcode == OPCODE_BINARY) {
-                if (framingInProgress) {
-                    logWarning("Starting new frame while fragmentation in progress, resetting buffer")
-                    frameBuffer?.reset()
-                    framingInProgress = false
+            synchronized(frameStateLock) {
+                if (opcode == OPCODE_TEXT || opcode == OPCODE_BINARY) {
+                    if (framingInProgress) {
+                        logWarning("Starting new frame while fragmentation in progress, resetting buffer")
+                        frameBuffer?.reset()
+                        framingInProgress = false
+                    }
+                    expectedFrameType = opcode
                 }
-                expectedFrameType = opcode
             }
             
             // Handle extended payload length
@@ -462,9 +465,11 @@ class SimpleWebSocketClient(
                     logFrameVerbose("WebSocket payload read: ${payload.size} bytes")
                     if (!fin) {
                         logFrameVerbose("Starting fragmented message reassembly")
-                        frameBuffer = ByteArrayOutputStream()
-                        frameBuffer!!.write(payload)
-                        framingInProgress = true
+                        synchronized(frameStateLock) {
+                            frameBuffer?.close()
+                            frameBuffer = ByteArrayOutputStream().apply { write(payload) }
+                            framingInProgress = true
+                        }
                         return readMooMessage(input)
                     }
                     return processCompleteMessage(payload, opcode)
@@ -473,17 +478,23 @@ class SimpleWebSocketClient(
                     if (isUnexpectedContinuation) {
                         return readMooMessage(input)
                     }
-                    if (frameBuffer == null) {
-                        frameBuffer = ByteArrayOutputStream()
-                    }
-                    frameBuffer!!.write(payload)
-                    if (fin) {
+                    val completePayload = synchronized(frameStateLock) {
+                        if (frameBuffer == null) {
+                            frameBuffer = ByteArrayOutputStream()
+                        }
+                        frameBuffer!!.write(payload)
+                        if (!fin) {
+                            return@synchronized null
+                        }
                         logFrameVerbose("Fragmented message reassembly complete")
-                        val completePayload = frameBuffer!!.toByteArray()
+                        val assembledPayload = frameBuffer!!.toByteArray()
                         frameBuffer!!.close()
                         frameBuffer = null
                         framingInProgress = false
-                        return processCompleteMessage(completePayload, expectedFrameType)
+                        assembledPayload to expectedFrameType
+                    }
+                    if (completePayload != null) {
+                        return processCompleteMessage(completePayload.first, completePayload.second)
                     }
                     return readMooMessage(input)
                 }
@@ -497,14 +508,20 @@ class SimpleWebSocketClient(
             // Re-throw timeout so caller can handle it (e.g. check loop condition)
             throw e
         } catch (e: Exception) {
-            if (connected) {
+            if (connected.get()) {
                 logError("Failed to read MOO message: ${e.message}", e)
             }
-            // Reset frame buffer on error
+            resetFrameAssembly()
+            return null
+        }
+    }
+
+    private fun resetFrameAssembly() {
+        synchronized(frameStateLock) {
             frameBuffer?.close()
             frameBuffer = null
             framingInProgress = false
-            return null
+            expectedFrameType = -1
         }
     }
 

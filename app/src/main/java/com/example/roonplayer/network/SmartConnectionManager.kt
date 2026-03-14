@@ -120,4 +120,8 @@ class SmartConnectionManager(
     fun unregisterNetworkMonitoring() {
         networkDetector.unregisterNetworkCallback()
     }
+
+    fun cleanup() {
+        networkDetector.cleanup()
+    }
 }

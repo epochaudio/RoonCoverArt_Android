@@ -62,6 +62,19 @@ class MooParserTest {
     }
 
     @Test
+    fun `parse returns null when content length exceeds supported limit`() {
+        val message = buildString {
+            append("MOO/1 RESPONSE com.roonlabs.registry:1/info\n")
+            append("Request-Id: 9\n")
+            append("Content-Type: application/json\n")
+            append("Content-Length: 52428801\n")
+            append("\n")
+        }
+
+        assertNull(parser.parse(message))
+    }
+
+    @Test
     fun `parse keeps non-json payload without json decode`() {
         val binaryLike = "\\u00FF\\u00D8binary" // simulated jpeg marker text in string form
         val message = buildString {

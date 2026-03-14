@@ -43,6 +43,20 @@ class SubscriptionRegistryTest {
     }
 
     @Test
+    fun `remove active subscription by request id without iterating active map`() {
+        val registry = SubscriptionRegistry(nowMs = { 210L })
+        registry.registerPending("active-request", "endpoint", "queue_active", "zone_a")
+        registry.activateByRequestId("active-request")
+
+        val removed = registry.removeByRequestId("active-request")
+
+        assertNotNull(removed)
+        assertEquals("queue_active", removed?.subscriptionKey)
+        assertEquals(0, registry.activeCount())
+        assertNull(registry.getBySubscriptionKey("queue_active"))
+    }
+
+    @Test
     fun `find active by endpoint and zone`() {
         val registry = SubscriptionRegistry(nowMs = { 300L })
         registry.registerPending("3", "com.roonlabs.transport:2/subscribe_queue", "queue_a", "zone_a")

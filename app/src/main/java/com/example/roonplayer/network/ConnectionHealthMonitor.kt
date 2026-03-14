@@ -21,6 +21,7 @@ class ConnectionHealthMonitor(
     }
 
     private val monitoringScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val monitoringLock = Any()
     private var monitoringJob: Job? = null
     private var currentInterval = defaultCheckIntervalMs
 
@@ -32,42 +33,48 @@ class ConnectionHealthMonitor(
         port: Int,
         onHealthChange: (HealthStatus) -> Unit
     ) {
-        if (isMonitoring) {
-            Log.w(TAG, "Health monitor is already running")
-            return
-        }
+        synchronized(monitoringLock) {
+            if (isMonitoring) {
+                Log.w(TAG, "Health monitor is already running")
+                return
+            }
 
-        Log.i(TAG, "Starting health monitor: $ip:$port")
-        isMonitoring = true
-        consecutiveFailures = 0
-        currentInterval = defaultCheckIntervalMs
+            Log.i(TAG, "Starting health monitor: $ip:$port")
+            isMonitoring = true
+            consecutiveFailures = 0
+            currentInterval = defaultCheckIntervalMs
 
-        monitoringJob = monitoringScope.launch {
-            while (isActive && isMonitoring) {
-                try {
-                    val healthStatus = checkConnectionHealth(ip, port)
-                    onHealthChange(healthStatus)
-                    
-                    adjustMonitoringInterval(healthStatus)
-                    
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error during health check", e)
-                    onHealthChange(HealthStatus.Error("Health check error: ${e.message}"))
+            monitoringJob = monitoringScope.launch {
+                while (isActive && isMonitoring) {
+                    try {
+                        val healthStatus = checkConnectionHealth(ip, port)
+                        onHealthChange(healthStatus)
+
+                        adjustMonitoringInterval(healthStatus)
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error during health check", e)
+                        onHealthChange(HealthStatus.Error("Health check error: ${e.message}"))
+                    }
+
+                    delay(currentInterval)
                 }
-
-                delay(currentInterval)
             }
         }
     }
 
     fun stopMonitoring() {
-        Log.i(TAG, "Stopping health monitor")
-        isMonitoring = false
-        monitoringJob?.cancel()
+        val jobToCancel = synchronized(monitoringLock) {
+            Log.i(TAG, "Stopping health monitor")
+            isMonitoring = false
+            val currentJob = monitoringJob
+            monitoringJob = null
+            consecutiveFailures = 0
+            currentInterval = defaultCheckIntervalMs
+            currentJob
+        }
+        jobToCancel?.cancel()
         monitoringScope.coroutineContext.cancelChildren()
-        monitoringJob = null
-        consecutiveFailures = 0
-        currentInterval = defaultCheckIntervalMs
     }
 
     private suspend fun checkConnectionHealth(ip: String, port: Int): HealthStatus = withContext(Dispatchers.IO) {

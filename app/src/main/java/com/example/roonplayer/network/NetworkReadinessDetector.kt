@@ -8,7 +8,7 @@ import java.net.Socket
 import java.net.InetSocketAddress
 
 class NetworkReadinessDetector(
-    private val context: Context,
+    context: Context,
     private val networkReadyPollIntervalMs: Long,
     private val connectivityCheckTimeoutMs: Int,
     private val dnsTestHost: String,
@@ -25,7 +25,8 @@ class NetworkReadinessDetector(
         data class Error(val message: String) : NetworkState()
     }
 
-    private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val connectivityManager =
+        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -114,6 +115,8 @@ class NetworkReadinessDetector(
     }
 
     fun registerNetworkCallback(onNetworkChange: (NetworkState) -> Unit) {
+        check(callbackScope.isActive) { "NetworkReadinessDetector has been cleaned up" }
+
         // 先清掉旧回调和旧任务，避免重复注册导致状态通知重入。
         unregisterNetworkCallback()
 
@@ -150,8 +153,17 @@ class NetworkReadinessDetector(
     fun unregisterNetworkCallback() {
         callbackScope.coroutineContext.cancelChildren()
         networkCallback?.let {
-            connectivityManager.unregisterNetworkCallback(it)
+            try {
+                connectivityManager.unregisterNetworkCallback(it)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Network callback was already unregistered: ${e.message}")
+            }
             networkCallback = null
         }
+    }
+
+    fun cleanup() {
+        unregisterNetworkCallback()
+        callbackScope.cancel()
     }
 }

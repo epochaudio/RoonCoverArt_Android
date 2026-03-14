@@ -231,31 +231,9 @@ class MainActivity : Activity() {
         val timestamp: Long = System.currentTimeMillis()
     )
     
-    // Message wrapper for sequential processing
-    data class WebSocketMessage(
-        val content: String,
-        val timestamp: Long = System.currentTimeMillis()
-    )
-
     data class TrackPreviewFrame(
         val trackId: String,
         val bitmap: Bitmap
-    )
-
-    private data class QueueTrackInfo(
-        val title: String?,
-        val artist: String?,
-        val album: String?,
-        val imageKey: String?,
-        val stableId: String?,
-        val queueItemId: String?,
-        val itemKey: String?,
-        val isCurrent: Boolean
-    )
-
-    private data class QueueSnapshot(
-        val items: List<QueueTrackInfo>,
-        val currentIndex: Int
     )
 
     private data class PendingTrackTransition(
@@ -265,19 +243,6 @@ class MainActivity : Activity() {
         val deadlineMs: Long
     )
 
-    private enum class ImageRequestPurpose {
-        CURRENT_ALBUM,
-        NEXT_PREVIEW,
-        PREVIOUS_PREVIEW,
-        QUEUE_PREFETCH
-    }
-
-    private data class ImageRequestContext(
-        val purpose: ImageRequestPurpose,
-        val imageKey: String,
-        val trackId: String? = null
-    )
-    
     // Multi-click detection for media keys
     private var lastPlayPauseKeyTime = 0L
     private var playPauseClickCount = 0
@@ -1021,7 +986,10 @@ class MainActivity : Activity() {
     
     // State synchronization and message processing
     private val stateLock = ReentrantLock()
+    private val connectionLock = Any()
     private val imageCacheLock = Any()
+    private val previewImageCacheLock = Any()
+    private val displayImageCacheLock = Any()
     private val currentState = AtomicReference(TrackState())
     private lateinit var gestureDetector: GestureDetector
     private var swipeMinDistancePx = 0f
@@ -1066,8 +1034,6 @@ class MainActivity : Activity() {
     private val pendingImageRequests = ConcurrentHashMap<String, ImageRequestContext>()
     private val imageBitmapByImageKey = LinkedHashMap<String, Bitmap>(48, 0.75f, true)
     
-    // Message processing queue for sequential handling
-    private val messageQueue = LinkedBlockingQueue<WebSocketMessage>()
     private val messageProcessor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
         LinkedBlockingQueue<Runnable>()
@@ -1079,6 +1045,19 @@ class MainActivity : Activity() {
     private val coverArtDisplayManager = CoverArtDisplayManager()
     private val artWallManager = ArtWallManager()
     private val layoutOrchestrator = LayoutOrchestrator()
+    private val paletteManager = PaletteManager(object : PaletteManager.Delegate {
+        override fun logDebug(message: String) {
+            this@MainActivity.logDebug(message)
+        }
+
+        override fun logWarning(message: String) {
+            this@MainActivity.logWarning(message)
+        }
+
+        override fun logError(message: String) {
+            this@MainActivity.logError(message)
+        }
+    })
     private val layoutOrchestratorDelegate = object : LayoutOrchestrator.Delegate {
         override fun refreshScreenMetrics() {
             screenAdapter = ScreenAdapter()
@@ -1124,6 +1103,250 @@ class MainActivity : Activity() {
             this@MainActivity.logDebug(message)
         }
     }
+    private val mooMessageDispatcher = MooMessageDispatcher(object : MooMessageDispatcher.Delegate {
+        override fun logDebug(message: String) {
+            this@MainActivity.logDebug(message)
+        }
+
+        override fun logInfo(message: String) {
+            this@MainActivity.logRuntimeInfo(message)
+        }
+
+        override fun logWarning(message: String) {
+            this@MainActivity.logWarning(message)
+        }
+
+        override fun updateStatus(status: String) {
+            mainHandler.post { this@MainActivity.updateStatus(status) }
+        }
+
+        override fun isAuthDialogShown(): Boolean = authDialogShown
+
+        override fun isConnectionHealthy(): Boolean = this@MainActivity.isConnectionHealthy()
+
+        override fun sendRegistration() {
+            this@MainActivity.sendRegistration()
+        }
+
+        override fun sendEmptyMooComplete(servicePath: String, requestId: String?) {
+            this@MainActivity.sendEmptyMooComplete(servicePath, requestId)
+        }
+
+        override fun handleSettingsProtocolMessage(
+            servicePath: String,
+            originalMessage: String,
+            payload: JSONObject?
+        ) {
+            this@MainActivity.handleSettingsProtocolMessage(servicePath, originalMessage, payload)
+        }
+
+        override fun handleInfoResponse(jsonBody: JSONObject?) {
+            this@MainActivity.handleInfoResponse(jsonBody)
+        }
+
+        override fun handleRegistrationResponse(jsonBody: JSONObject?) {
+            this@MainActivity.handleRegistrationResponse(jsonBody)
+        }
+
+        override fun handleQueueUpdate(jsonBody: JSONObject) {
+            this@MainActivity.handleQueueUpdate(jsonBody)
+        }
+
+        override fun handleZoneUpdate(jsonBody: JSONObject) {
+            this@MainActivity.handleZoneUpdate(jsonBody)
+        }
+
+        override fun handleNowPlayingChanged(jsonBody: JSONObject) {
+            this@MainActivity.handleNowPlayingChanged(jsonBody)
+        }
+
+        override fun handleZoneStateChanged(jsonBody: JSONObject) {
+            this@MainActivity.handleZoneStateChanged(jsonBody)
+        }
+
+        override fun handleImageResponse(requestId: String?, jsonBody: JSONObject?, originalMessage: String) {
+            this@MainActivity.handleImageResponse(requestId, jsonBody, originalMessage)
+        }
+
+        override fun hasQueuePayload(body: JSONObject): Boolean = this@MainActivity.hasQueuePayload(body)
+
+        override fun lastRegisterRequestId(): String? = lastRegisterRequestId
+
+        override fun mooCompleteSuccess(): String = MOO_COMPLETE_SUCCESS
+    })
+    private val imageResponseProcessor = ImageResponseProcessor(object : ImageResponseProcessor.Delegate {
+        override fun logDebug(message: String) {
+            this@MainActivity.logDebug(message)
+        }
+
+        override fun logWarning(message: String) {
+            this@MainActivity.logWarning(message)
+        }
+
+        override fun logError(message: String, error: Exception?) {
+            this@MainActivity.logError(message, error)
+        }
+
+        override fun logRuntimeInfo(message: String) {
+            this@MainActivity.logRuntimeInfo(message)
+        }
+
+        override fun logRuntimeWarning(message: String) {
+            this@MainActivity.logRuntimeWarning(message)
+        }
+
+        override fun removePendingImageRequest(requestId: String): ImageRequestContext? {
+            return pendingImageRequests.remove(requestId)
+        }
+
+        override fun rememberPreviewBitmap(imageKey: String, bitmap: Bitmap) {
+            this@MainActivity.rememberPreviewBitmapForImageKey(imageKey, bitmap)
+        }
+
+        override fun shouldIgnoreCurrentAlbumResponse(requestContext: ImageRequestContext?): Boolean {
+            return this@MainActivity.shouldIgnoreCurrentAlbumResponse(requestContext)
+        }
+
+        override fun updateAlbumImage(bitmap: Bitmap?, imageRef: String?) {
+            this@MainActivity.updateAlbumImage(bitmap, imageRef)
+        }
+
+        override fun generateImageHash(bytes: ByteArray): String {
+            return this@MainActivity.generateImageHash(bytes)
+        }
+
+        override fun loadImageFromCache(imageHash: String): Bitmap? {
+            return this@MainActivity.loadImageFromCache(imageHash)
+        }
+
+        override fun saveImageToCacheAsync(imageHash: String, bytes: ByteArray) {
+            activityScope.launch(Dispatchers.IO) {
+                val cachedPath = saveImageToCache(bytes)
+                if (cachedPath != null) {
+                    logDebug("Image saved to cache: $imageHash")
+                } else {
+                    logDebug("Image already in cache: $imageHash")
+                }
+            }
+        }
+
+        override fun expectedPreviewTrackId(purpose: ImageRequestPurpose): String? {
+            return when (purpose) {
+                ImageRequestPurpose.CURRENT_ALBUM,
+                ImageRequestPurpose.QUEUE_PREFETCH -> null
+                ImageRequestPurpose.NEXT_PREVIEW -> expectedNextPreviewTrackId
+                ImageRequestPurpose.PREVIOUS_PREVIEW -> expectedPreviousPreviewTrackId
+            }
+        }
+
+        override fun setDirectionalPreviewFrame(
+            purpose: ImageRequestPurpose,
+            trackId: String,
+            bitmap: Bitmap,
+            imageKey: String,
+            sourceLabel: String
+        ) {
+            val preview = scalePreviewBitmap(bitmap)
+            when (purpose) {
+                ImageRequestPurpose.NEXT_PREVIEW -> {
+                    queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = trackId, bitmap = preview)
+                    logRuntimeInfo("Next preview loaded from $sourceLabel: trackId=$trackId imageKey=$imageKey")
+                }
+                ImageRequestPurpose.PREVIOUS_PREVIEW -> {
+                    queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = trackId, bitmap = preview)
+                    logRuntimeInfo("Previous preview loaded from $sourceLabel: trackId=$trackId imageKey=$imageKey")
+                }
+                ImageRequestPurpose.CURRENT_ALBUM,
+                ImageRequestPurpose.QUEUE_PREFETCH -> Unit
+            }
+        }
+
+        override fun promotePrefetchedDirectionalPreviewsIfNeeded(imageKey: String, bitmap: Bitmap) {
+            this@MainActivity.promotePrefetchedDirectionalPreviewsIfNeeded(imageKey, bitmap)
+        }
+
+        override fun checkForImageHeaders(bytes: ByteArray) {
+            this@MainActivity.checkForImageHeaders(bytes)
+        }
+    })
+    private val queueManager = QueueManager(object : QueueManager.Delegate {
+        override fun logError(message: String, error: Exception?) {
+            this@MainActivity.logError(message, error)
+        }
+
+        override fun logRuntimeInfo(message: String) {
+            this@MainActivity.logRuntimeInfo(message)
+        }
+
+        override fun logStructuredNetworkEvent(event: String, zoneId: String?, details: String) {
+            this@MainActivity.logStructuredNetworkEvent(event = event, zoneId = zoneId, details = details)
+        }
+
+        override fun isNewZoneStoreEnabled(): Boolean = featureFlags.newZoneStore
+
+        override fun updateQueueStoreIfMatchesCurrentZone(payloadZoneId: String?, body: JSONObject): Any? {
+            return queueStore.updateIfMatchesCurrentZone(payloadZoneId, body)
+        }
+
+        override fun currentQueueStoreZoneId(): String? = queueStore.snapshot().currentZoneId
+
+        override fun resolveTransportZoneId(): String? = this@MainActivity.resolveTransportZoneId()
+
+        override fun currentQueueAnchor(): CurrentQueueAnchor {
+            val stateSnapshot = currentState.get()
+            return CurrentQueueAnchor(
+                nowPlayingQueueItemId = currentNowPlayingQueueItemId,
+                nowPlayingItemKey = currentNowPlayingItemKey,
+                currentImageKey = sharedPreferences.getString("current_image_key", ""),
+                currentTrackText = stateSnapshot.trackText,
+                currentArtistText = stateSnapshot.artistText
+            )
+        }
+
+        override fun clearTrackPreviewHistory() {
+            this@MainActivity.clearTrackPreviewHistory()
+        }
+
+        override fun clearQueuePreviewFetchStateForFullRefresh() {
+            this@MainActivity.clearQueuePreviewFetchStateForFullRefresh()
+        }
+
+        override fun requestQueueSnapshotRefresh(reason: String) {
+            this@MainActivity.requestQueueSnapshotRefresh(reason)
+        }
+
+        override fun getQueueSnapshot(): QueueSnapshot? = queueSnapshot
+
+        override fun setQueueSnapshot(snapshot: QueueSnapshot?) {
+            queueSnapshot = snapshot
+        }
+
+        override fun getLastQueueListFingerprint(): String? = lastQueueListFingerprint
+
+        override fun setLastQueueListFingerprint(value: String?) {
+            lastQueueListFingerprint = value
+        }
+
+        override fun updateQueuePreviousPreview(previousTrack: QueueTrackInfo, forceNetworkRefresh: Boolean) {
+            this@MainActivity.updateQueuePreviousPreview(previousTrack, forceNetworkRefresh)
+        }
+
+        override fun clearQueuePreviousPreviewState() {
+            this@MainActivity.clearQueuePreviousPreviewState()
+        }
+
+        override fun updateQueueNextPreview(nextTrack: QueueTrackInfo, forceNetworkRefresh: Boolean) {
+            this@MainActivity.updateQueueNextPreview(nextTrack, forceNetworkRefresh)
+        }
+
+        override fun clearQueueNextPreviewState() {
+            this@MainActivity.clearQueueNextPreviewState()
+        }
+
+        override fun prefetchQueuePreviewImages(snapshot: QueueSnapshot, forceNetworkRefresh: Boolean) {
+            this@MainActivity.prefetchQueuePreviewImages(snapshot, forceNetworkRefresh)
+        }
+    })
     private var isArtWallMode = false
     private var lastPlaybackTime = 0L
     private lateinit var artWallContainer: RelativeLayout
@@ -1308,34 +1531,7 @@ class MainActivity : Activity() {
     }
     
     private fun initializeMessageProcessor() {
-        logDebug("🔧 Initializing message processor for sequential handling")
-        
-        // Start the message processing thread that consumes from our custom queue
-        activityScope.launch(Dispatchers.IO) {
-            try {
-                while (!messageProcessor.isShutdown) {
-                    try {
-                        // Take messages from our custom queue with timeout
-                        val message = messageQueue.poll(1, TimeUnit.SECONDS)
-                        if (message != null) {
-                            // Submit the message processing as a task to the executor
-                            messageProcessor.submit {
-                                handleMessageSequentially(message)
-                            }
-                        }
-                    } catch (e: InterruptedException) {
-                        logDebug("Message processor interrupted, shutting down")
-                        break
-                    } catch (e: Exception) {
-                        logError("Error in message processor: ${e.message}", e)
-                    }
-                }
-            } catch (e: Exception) {
-                logError("Message processor thread failed: ${e.message}", e)
-            }
-        }
-        
-        logDebug("✅ Message processor initialized")
+        logDebug("✅ Message processor ready (single-thread executor)")
     }
     
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -1704,147 +1900,18 @@ class MainActivity : Activity() {
 
     private fun rememberPreviewBitmapForImageKey(imageKey: String, bitmap: Bitmap) {
         val previewBitmap = scalePreviewBitmap(bitmap)
-        imageBitmapByImageKey[imageKey] = previewBitmap
-        while (imageBitmapByImageKey.size > 48) {
-            val oldestKey = imageBitmapByImageKey.entries.firstOrNull()?.key ?: break
-            imageBitmapByImageKey.remove(oldestKey)
+        synchronized(previewImageCacheLock) {
+            imageBitmapByImageKey[imageKey] = previewBitmap
+            while (imageBitmapByImageKey.size > 48) {
+                val oldestKey = imageBitmapByImageKey.entries.firstOrNull()?.key ?: break
+                imageBitmapByImageKey.remove(oldestKey)
+            }
         }
     }
 
     private fun getPreviewBitmapForImageKey(imageKey: String): Bitmap? {
-        return imageBitmapByImageKey[imageKey]
-    }
-    
-    private fun extractDominantColor(bitmap: Bitmap): Int {
-        return try {
-            // ColorThief优化：提高图片分辨率和采样质量
-            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 150, 150, false)
-            val pixels = IntArray(scaledBitmap.width * scaledBitmap.height)
-            scaledBitmap.getPixels(pixels, 0, scaledBitmap.width, 0, 0, scaledBitmap.width, scaledBitmap.height)
-            
-            val colorFrequency = mutableMapOf<Int, Int>()
-            val quality = 8 // 更高质量采样，参考ColorThief标准
-            
-            // ColorThief标准像素过滤和采样
-            for (i in pixels.indices step quality) {
-                val pixel = pixels[i]
-                val a = Color.alpha(pixel)
-                val r = Color.red(pixel)
-                val g = Color.green(pixel) 
-                val b = Color.blue(pixel)
-                
-                // ColorThief过滤条件：透明度阈值 + 极值颜色过滤
-                if (a >= 125 && !(r > 250 && g > 250 && b > 250) && !(r < 5 && g < 5 && b < 5)) {
-                    // 5bit颜色量化，减少颜色空间复杂度
-                    val quantizedColor = Color.rgb(
-                        (r shr 3) shl 3,
-                        (g shr 3) shl 3, 
-                        (b shr 3) shl 3
-                    )
-                    colorFrequency[quantizedColor] = (colorFrequency[quantizedColor] ?: 0) + 1
-                }
-            }
-            
-            if (colorFrequency.isEmpty()) {
-                return 0xFF1a1a1a.toInt()
-            }
-            
-            // 获取前5个最频繁的颜色作为调色板
-            val topColors = colorFrequency.entries
-                .sortedByDescending { it.value }
-                .take(5)
-                .map { it.key }
-            
-            // 智能选择最适合背景的颜色
-            val bestColor = selectBestBackgroundColor(topColors)
-            optimizeBackgroundColor(bestColor)
-            
-        } catch (e: Exception) {
-            logError("Error extracting dominant color: ${e.message}")
-            0xFF1a1a1a.toInt()
-        }
-    }
-    
-    // 智能背景色选择策略
-    private fun selectBestBackgroundColor(colors: List<Int>): Int {
-        return colors.maxByOrNull { color ->
-            val hsv = FloatArray(3)
-            Color.colorToHSV(color, hsv)
-            
-            // 评分策略：偏向饱和度适中、亮度适合背景的颜色
-            val saturationScore = when {
-                hsv[1] < 0.3f -> 0.6f  // 低饱和度
-                hsv[1] < 0.7f -> 1.0f  // 适中饱和度（最佳）
-                else -> 0.8f           // 高饱和度
-            }
-            
-            val brightnessScore = when {
-                hsv[2] < 0.2f -> 0.4f  // 太暗
-                hsv[2] < 0.8f -> 1.0f  // 适中（最佳）
-                else -> 0.6f           // 太亮
-            }
-            
-            // 避免过于鲜艳的颜色组合
-            val vibrancyPenalty = if (hsv[1] > 0.9f && hsv[2] > 0.9f) 0.5f else 1.0f
-            
-            saturationScore * brightnessScore * vibrancyPenalty
-        } ?: 0xFF1a1a1a.toInt()
-    }
-    
-    private fun optimizeBackgroundColor(color: Int): Int {
-        val hsv = FloatArray(3)
-        Color.colorToHSV(color, hsv)
-        
-        // 根据原色调整饱和度和亮度，确保适合做背景
-        hsv[1] = (hsv[1] * 0.6f).coerceAtMost(0.8f) // 适度降低饱和度
-        hsv[2] = when {
-            hsv[2] > 0.7f -> hsv[2] * 0.25f  // 亮色大幅降低亮度
-            hsv[2] > 0.4f -> hsv[2] * 0.4f   // 中等亮度适度降低
-            else -> (hsv[2] * 0.8f).coerceAtLeast(0.15f) // 暗色略微调整，保持可见度
-        }
-        
-        return Color.HSVToColor(hsv)
-    }
-    
-    
-    private fun updateTextColors(backgroundColor: Int) {
-        try {
-            // 计算最佳文字颜色，基于WCAG对比度标准
-            val textColor = getBestTextColor(backgroundColor)
-            
-            // 查找并更新所有文字视图
-            updateTextViewColor(mainLayout, textColor)
-            
-            logDebug("Text colors updated based on background: ${String.format("#%06X", backgroundColor and 0xFFFFFF)}, text color: ${String.format("#%06X", textColor and 0xFFFFFF)}")
-        } catch (e: Exception) {
-            logWarning("Failed to update text colors: ${e.message}")
-        }
-    }
-    
-    private fun getBestTextColor(backgroundColor: Int): Int {
-        val whiteContrast = calculateContrastRatio(0xFFFFFFFF.toInt(), backgroundColor)
-        val blackContrast = calculateContrastRatio(0xFF000000.toInt(), backgroundColor)
-        
-        // WCAG AA标准要求对比度至少4.5:1，AAA标准要求7:1
-        return when {
-            whiteContrast >= 4.5f -> 0xFFFFFFFF.toInt() // 白色文字
-            blackContrast >= 4.5f -> 0xFF000000.toInt() // 黑色文字
-            whiteContrast > blackContrast -> 0xFFFFFFFF.toInt() // 选择对比度更高的
-            else -> 0xFF000000.toInt()
-        }
-    }
-    
-    private fun updateTextViewColor(view: android.view.View, textColor: Int) {
-        when (view) {
-            is android.widget.TextView -> {
-                view.setTextColor(textColor)
-            }
-            is android.view.ViewGroup -> {
-                // 递归处理子视图
-                for (i in 0 until view.childCount) {
-                    updateTextViewColor(view.getChildAt(i), textColor)
-                }
-            }
+        return synchronized(previewImageCacheLock) {
+            imageBitmapByImageKey[imageKey]
         }
     }
     
@@ -2630,16 +2697,18 @@ class MainActivity : Activity() {
     }
     
     private fun clearOldDisplayCache() {
-        if (displayImageCache.size > maxDisplayCache) {
-            val entriesToRemove = displayImageCache.size - maxDisplayCache
-            val iterator = displayImageCache.iterator()
-            repeat(entriesToRemove) {
-                if (iterator.hasNext()) {
-                    iterator.next()
-                    iterator.remove()
+        synchronized(displayImageCacheLock) {
+            if (displayImageCache.size > maxDisplayCache) {
+                val entriesToRemove = displayImageCache.size - maxDisplayCache
+                val iterator = displayImageCache.iterator()
+                repeat(entriesToRemove) {
+                    if (iterator.hasNext()) {
+                        iterator.next()
+                        iterator.remove()
+                    }
                 }
+                logDebug("🧹 Display cache cleaned: removed $entriesToRemove old entries")
             }
-            logDebug("🧹 Display cache cleaned: removed $entriesToRemove old entries")
         }
     }
 
@@ -2648,19 +2717,25 @@ class MainActivity : Activity() {
     }
 
     private fun getDisplayCachedArtWallBitmap(imagePath: String, targetSizePx: Int): Bitmap? {
-        return displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)]
+        return synchronized(displayImageCacheLock) {
+            displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)]
+        }
     }
 
     private fun putDisplayCachedArtWallBitmap(imagePath: String, targetSizePx: Int, bitmap: Bitmap) {
-        displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)] = bitmap
+        synchronized(displayImageCacheLock) {
+            displayImageCache[artWallBitmapCacheKey(imagePath, targetSizePx)] = bitmap
+        }
     }
 
     private fun removeDisplayCacheEntriesForPath(imagePath: String) {
-        val iterator = displayImageCache.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.key.startsWith("$imagePath@")) {
-                iterator.remove()
+        synchronized(displayImageCacheLock) {
+            val iterator = displayImageCache.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key.startsWith("$imagePath@")) {
+                    iterator.remove()
+                }
             }
         }
     }
@@ -2976,7 +3051,7 @@ class MainActivity : Activity() {
         logDebug("📍 Position queue size: ${rotationStats.positionQueueSize}")
         logDebug("🎯 Current rotation round: ${rotationStats.rotationRound}")
         logDebug("🖼️ Currently displayed images: ${currentDisplayedPaths.size}")
-        logDebug("💾 Display cache size: ${displayImageCache.size}")
+        logDebug("💾 Display cache size: ${synchronized(displayImageCacheLock) { displayImageCache.size }}")
         
         val runtime = Runtime.getRuntime()
         val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024
@@ -3065,7 +3140,7 @@ class MainActivity : Activity() {
     
     private fun updateBackgroundColor(bitmap: Bitmap) {
         activityScope.launch(Dispatchers.IO) {
-            val dominantColor = extractDominantColor(bitmap)
+            val dominantColor = paletteManager.extractDominantColor(bitmap)
             mainHandler.post {
                 if (!::mainLayout.isInitialized) return@post
                 val fromColor = currentDominantColor
@@ -3081,7 +3156,7 @@ class MainActivity : Activity() {
                 paletteAnimator.addUpdateListener { animator ->
                     val animatedColor = animator.animatedValue as Int
                     colorDrawable.color = animatedColor
-                    updateTextColors(animatedColor)
+                    paletteManager.updateTextColors(mainLayout, animatedColor)
                     if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
                         updateScrimOpacity(calculateScrimOpacity(animatedColor))
                     }
@@ -3161,36 +3236,6 @@ class MainActivity : Activity() {
             brightness > 0.75f -> 0.48f // 亮色封面：稍微增加到48%
             else -> 0.40f // 其他情况：统一40%不透明度
         }
-    }
-    
-    private fun calculateContrastRatio(color1: Int, color2: Int): Float {
-        val luminance1 = calculateLuminance(color1)
-        val luminance2 = calculateLuminance(color2)
-        
-        val brighter = maxOf(luminance1, luminance2)
-        val darker = minOf(luminance1, luminance2)
-        
-        return (brighter + 0.05f) / (darker + 0.05f)
-    }
-    
-    private fun calculateLuminance(color: Int): Float {
-        val red = android.graphics.Color.red(color) / 255f
-        val green = android.graphics.Color.green(color) / 255f
-        val blue = android.graphics.Color.blue(color) / 255f
-        
-        fun adjustColor(c: Float): Float {
-            return if (c <= 0.03928f) {
-                c / 12.92f
-            } else {
-                Math.pow(((c + 0.055f) / 1.055f).toDouble(), 2.4).toFloat()
-            }
-        }
-        
-        val adjustedRed = adjustColor(red)
-        val adjustedGreen = adjustColor(green)
-        val adjustedBlue = adjustColor(blue)
-        
-        return 0.2126f * adjustedRed + 0.7152f * adjustedGreen + 0.0722f * adjustedBlue
     }
     
     private fun updateScrimOpacity(opacity: Float) {
@@ -3385,8 +3430,6 @@ class MainActivity : Activity() {
                 }
                 
                 mainHandler.post {
-                    multicastLock?.release()
-
                     val selectedCore = orchestrationResult.selectedCore
                     if (selectedCore != null) {
                         logDebug("Auto-connecting to discovered core: ${selectedCore.ip}:${selectedCore.port}")
@@ -3411,10 +3454,10 @@ class MainActivity : Activity() {
                 logError("Automatic discovery failed: ${e.message}", e)
                 connectionOrchestrator.transition(RoonConnectionState.Failed, e.message)
                 mainHandler.post {
-                    multicastLock?.release()
                     updateStatus("Auto-discovery failed. Check your network and try again.")
                 }
             } finally {
+                safeReleaseMulticastLock()
                 discoveryGuard.finish()
             }
         }
@@ -4026,7 +4069,7 @@ class MainActivity : Activity() {
         activityScope.launch(Dispatchers.IO) {
             try {
                 // Prevent concurrent connection attempts
-                synchronized(this@MainActivity) {
+                synchronized(connectionLock) {
                     if (webSocketClient?.isConnected() == true) {
                         mainHandler.post {
                             updateStatus("Connected")
@@ -4325,27 +4368,24 @@ class MainActivity : Activity() {
             return
         }
         
-        // Queue message for sequential processing to avoid race conditions
-        val websocketMessage = WebSocketMessage(message)
         try {
-            messageQueue.offer(websocketMessage)
-            logDebug("📥 Message queued for sequential processing (queue size: ${messageQueue.size})")
+            messageProcessor.submit {
+                handleMessageSequentially(message)
+            }
+            logDebug("📥 Message submitted for sequential processing (queue size: ${messageProcessor.queue.size})")
         } catch (e: Exception) {
-            logError("❌ Failed to queue message: ${e.message}")
+            logError("❌ Failed to submit message: ${e.message}")
             // Fallback to direct processing if queue fails
             handleMessage(message)
         }
     }
     
-    private fun handleMessageSequentially(websocketMessage: WebSocketMessage) {
+    private fun handleMessageSequentially(message: String) {
         try {
-            logDebug("🔄 Processing message sequentially: ${websocketMessage.content.take(100)}...")
-            
-            stateLock.withLock {
-                // Process the message with state synchronization
-                handleMessage(websocketMessage.content)
-            }
-            
+            logDebug("🔄 Processing message sequentially: ${message.take(100)}...")
+
+            handleMessage(message)
+
             logDebug("✅ Message processed successfully")
         } catch (e: Exception) {
             logError("❌ Error in sequential message processing: ${e.message}", e)
@@ -4504,189 +4544,29 @@ class MainActivity : Activity() {
                 }
             }
             
-            // Send default success response for REQUEST to prevent timeout on Roon side
-            if (verb == "REQUEST") {
-                 // But don't send response for registry/changed as it might not expect it or we handle it by action
-                 // Actually, for REQUEST we should usually acknowledge.
-                 // Let's handle specific requests first.
-            }
-
-            
-            when (verb) {
-                "REQUEST" -> {
-                    when {
-                         servicePath.contains("registry") && servicePath.contains("changed") -> {
-                             logDebug("Received registry changed event")
-                             // This is the signal that authorization status might have changed (e.g. user clicked Enable)
-                             if (authDialogShown || !isConnectionHealthy()) {
-                                 logDebug("Registry changed - triggering re-registration check")
-                                 mainHandler.post {
-                                     updateStatus("Detected Roon settings change. Updating registration...")
-                                 }
-                                 // Trigger a single registration attempt
-                                 sendRegistration()
-                             }
-                             
-                             // Acknowledge the request
-                             val response = "MOO/1 COMPLETE $servicePath\nRequest-Id: $requestId\nContent-Type: application/json\nContent-Length: 0\n\n"
-                             sendMoo(response)
-                         }
-                        servicePath.contains("settings") -> {
-                            // Roon 会以 REQUEST 调用扩展 settings 服务；必须在 REQUEST 分支直接处理。
-                            // 若被 generic REQUEST 兜底吞掉，只会返回空响应，设置页就会失去 Zone 选择控件。
-                            handleSettingsProtocolMessage(
-                                servicePath = servicePath,
-                                originalMessage = message,
-                                payload = jsonBody
-                            )
-                         }
-                         else -> {
-                             logDebug("Received generic REQUEST: $servicePath")
-                             // Acknowledge to be polite
-                             val response = "MOO/1 COMPLETE $servicePath\nRequest-Id: $requestId\nContent-Type: application/json\nContent-Length: 0\n\n"
-                             sendMoo(response)
-                         }
-                    }
-                }
-                "RESPONSE" -> {
-                    when {
-                        servicePath.contains("registry") && servicePath.contains("info") -> {
-                            logDebug("Received core info response, proceeding to registration...")
-                            handleInfoResponse(jsonBody)
-                        }
-                        servicePath.contains("registry") && servicePath.contains("register") -> {
-                            handleRegistrationResponse(jsonBody)
-                        }
-                        servicePath.contains("transport") && servicePath.contains("subscribe_zones") -> {
-                            mainHandler.post {
-                                updateStatus("Subscribed to transport service. Waiting for music data...")
-                            }
-                        }
-                        servicePath.contains("transport") && servicePath.contains("subscribe_queue") -> {
-                            logRuntimeInfo("Queue subscription acknowledged: $servicePath, requestId=$requestId")
-                            jsonBody?.let { handleQueueUpdate(it) }
-                        }
-                        servicePath.contains("image") && servicePath.contains("get_image") -> {
-                            handleImageResponse(requestId, jsonBody, message)
-                        }
-                        servicePath.contains("settings") -> {
-                            // settings 服务由 Roon Core 主动 REQUEST，RESPONSE 分支不应再次回包，避免协议环路。
-                            logDebug("Ignore settings RESPONSE message: $servicePath")
-                        }
-                    }
-                }
-                
-                "CONTINUE" -> {
-                    when {
-                        servicePath.contains("Registered") -> {
-                            logDebug("Received registration CONTINUE, processing...")
-                            handleRegistrationResponse(jsonBody)
-                        }
-                        servicePath.contains("settings") -> {
-                            // settings 服务不依赖 CONTINUE 事件，记录日志便于诊断即可。
-                            logDebug("Ignore settings CONTINUE message: $servicePath")
-                        }
-                        servicePath.contains("transport") && servicePath.contains("subscribe_queue") -> {
-                            jsonBody?.let { handleQueueUpdate(it) }
-                        }
-                        jsonBody?.has("zones") == true -> {
-                            handleZoneUpdate(jsonBody)
-                        }
-                        else -> {
-                            // 检查是否有zone相关的事件
-                            jsonBody?.let { body ->
-                                when {
-                                    body.has("zones_changed") -> {
-                                        logDebug("🎵 Zone event - zones_changed")
-                                        handleZoneUpdate(body)
-                                    }
-                                    body.has("zones_now_playing_changed") -> {
-                                        logDebug("🎵 Zone event - zones_now_playing_changed")
-                                        handleNowPlayingChanged(body)
-                                    }
-                                    body.has("zones_state_changed") -> {
-                                        logDebug("🎵 Zone event - zones_state_changed")
-                                        handleZoneStateChanged(body)
-                                    }
-                                    body.has("zones_seek_changed") -> {
-                                        // 静默忽略播放进度变化
-                                    }
-                                    hasQueuePayload(body) -> {
-                                        handleQueueUpdate(body)
-                                    }
-                                    else -> {
-                                        logDebug("🔍 Unknown CONTINUE event: $servicePath")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                "COMPLETE" -> {
-                    // 处理完整消息（可能是 info 响应或订阅数据）
-                    val isRegisterCompleteSuccess =
-                        servicePath.contains(MOO_COMPLETE_SUCCESS) &&
-                            requestId != null &&
-                            requestId == lastRegisterRequestId
-                    when {
-                        isRegisterCompleteSuccess -> {
-                            logDebug("Received registration COMPLETE, processing...")
-                            handleRegistrationResponse(jsonBody)
-                        }
-                        servicePath.contains("Success") && jsonBody?.has("core_id") == true -> {
-                            logDebug("Received core info via COMPLETE, proceeding to registration...")
-                            handleInfoResponse(jsonBody)
-                            // Registration is handled inside handleInfoResponse via sendRegisterMessage()
-                        }
-                        servicePath.contains("Success") && message.contains("Content-Type: image/") -> {
-                            logDebug("🖼️ Received image response via COMPLETE")
-                            handleImageResponse(requestId, jsonBody, message)
-                        }
-                        jsonBody?.has("zones") == true -> {
-                            handleZoneUpdate(jsonBody)
-                        }
-                        servicePath.contains("transport") && servicePath.contains("subscribe_queue") && jsonBody != null -> {
-                            handleQueueUpdate(jsonBody)
-                        }
-                        jsonBody != null && hasQueuePayload(jsonBody) -> {
-                            handleQueueUpdate(jsonBody)
-                        }
-                        servicePath.contains("NotCompatible") -> {
-                            logWarning("Service compatibility issue: $jsonBody")
-                            val missingServices = jsonBody?.optJSONArray("required_services_missing")
-                            if (missingServices != null) {
-                                val servicesList = (0 until missingServices.length()).map { 
-                                    missingServices.getString(it) 
-                                }
-                                logWarning("Missing services: $servicesList")
-                                
-                                // We provide Settings service, so settings-related missing services are not an issue
-                                logDebug("Missing services: $servicesList")
-                                
-                                // Only retry if core services are missing, not settings
-                                val coreServicesMissing = servicesList.filter { 
-                                    !it.contains("settings") 
-                                }
-                                
-                                if (coreServicesMissing.isNotEmpty()) {
-                                    logInfo("Core services missing: $coreServicesMissing")
-                                }
-                            }
-                            
-                            mainHandler.post {
-                                updateStatus("❌ Service compatibility issue. Check your Roon version.")
-                            }
-                        }
-                        else -> {
-                            logDebug("Received COMPLETE message: $servicePath")
-                        }
-                    }
-                }
-            }
+            mooMessageDispatcher.dispatch(
+                verb = verb,
+                servicePath = servicePath,
+                requestId = requestId,
+                jsonBody = jsonBody,
+                originalMessage = message
+            )
         } catch (e: Exception) {
             logError("Message parsing error: ${e.message}", e)
         }
+    }
+
+    private fun sendEmptyMooComplete(servicePath: String, requestId: String?) {
+        val response = buildString {
+            append("MOO/1 COMPLETE $servicePath\n")
+            if (!requestId.isNullOrBlank()) {
+                append("Request-Id: $requestId\n")
+            }
+            append("Content-Type: application/json\n")
+            append("Content-Length: 0\n")
+            append("\n")
+        }
+        sendMoo(response)
     }
     
     private fun handleInfoResponse(jsonBody: JSONObject?) {
@@ -5345,363 +5225,19 @@ class MainActivity : Activity() {
         }
     }
     
-    private fun hasQueuePayload(body: JSONObject): Boolean {
-        if (body.has("queue")) return true
-        if (body.has("items")) return true
-        if (body.has("queues")) return true
-        if (body.has("queues_changed")) return true
-        if (body.has("queue_items")) return true
-        if (body.has("queued_items")) return true
-        if (body.has("queue_changed")) return true
-        return false
-    }
-
-    private fun hasDetailedQueueItemsPayload(body: JSONObject): Boolean {
-        if (body.has("items")) return true
-        if (body.has("queue_items")) return true
-        if (body.has("queued_items")) return true
-
-        body.optJSONObject("queue")?.let { queue ->
-            if (queue.has("items") || queue.has("queue_items")) return true
-        }
-        body.optJSONObject("queue_changed")?.let { queue ->
-            if (queue.has("items") || queue.has("queue_items")) return true
-        }
-
-        body.optJSONArray("queues")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val queueObj = queues.optJSONObject(i) ?: continue
-                if (queueObj.has("items") || queueObj.has("queue_items")) return true
-            }
-        }
-        body.optJSONArray("queues_changed")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val queueObj = queues.optJSONObject(i) ?: continue
-                if (queueObj.has("items") || queueObj.has("queue_items")) return true
-            }
-        }
-
-        val zoneKeys = listOf("zones", "zones_changed", "zones_now_playing_changed", "zones_state_changed")
-        for (zoneKey in zoneKeys) {
-            body.optJSONArray(zoneKey)?.let { zones ->
-                for (i in 0 until zones.length()) {
-                    val zoneObj = zones.optJSONObject(i) ?: continue
-                    if (zoneObj.has("queue_items") || zoneObj.has("queued_items")) return true
-                    zoneObj.optJSONObject("queue")?.let { queue ->
-                        if (queue.has("items") || queue.has("queue_items")) return true
-                    }
-                }
-            }
-        }
-
-        return false
-    }
-
     private fun handleQueueUpdate(body: JSONObject) {
-        try {
-            if (featureFlags.newZoneStore) {
-                val payloadZoneId = extractQueuePayloadZoneId(body)
-                val accepted = queueStore.updateIfMatchesCurrentZone(payloadZoneId, body)
-                if (accepted == null) {
-                    logStructuredNetworkEvent(
-                        event = "QUEUE_IGNORED_NON_CURRENT_ZONE",
-                        zoneId = payloadZoneId,
-                        details = "current_zone=${queueStore.snapshot().currentZoneId}"
-                    )
-                    return
-                }
-            }
-
-            val hasDetailedQueue = hasDetailedQueueItemsPayload(body)
-            val snapshot = extractQueueSnapshot(body) ?: run {
-                val keys = buildString {
-                    val iterator = body.keys()
-                    while (iterator.hasNext()) {
-                        if (isNotEmpty()) append(",")
-                        append(iterator.next())
-                    }
-                }
-                clearTrackPreviewHistory()
-                queueSnapshot = null
-                lastQueueListFingerprint = null
-                if (hasDetailedQueue) {
-                    logRuntimeInfo("Queue update has detailed queue but no valid snapshot. clearing preview and forcing refresh. keys=[$keys], payload=${body.toString().take(260)}")
-                    requestQueueSnapshotRefresh("invalid-detailed-queue-snapshot")
-                } else {
-                    logRuntimeInfo("Queue update has no detailed queue items. clearing stale queue preview and forcing refresh. keys=[$keys], payload=${body.toString().take(260)}")
-                    requestQueueSnapshotRefresh("incremental-queue-update")
-                }
-                return
-            }
-
-            val queueListFingerprint = buildQueueListFingerprint(snapshot)
-            val isNewQueueList = queueListFingerprint != lastQueueListFingerprint
-            lastQueueListFingerprint = queueListFingerprint
-            if (isNewQueueList) {
-                clearTrackPreviewHistory()
-                clearQueuePreviewFetchStateForFullRefresh()
-                logRuntimeInfo(
-                    "Queue list changed. force refresh all covers: total=${snapshot.items.size} currentIndex=${snapshot.currentIndex}"
-                )
-            }
-
-            queueSnapshot = snapshot
-            resolvePreviousQueueTrack(snapshot)?.let { previousTrack ->
-                updateQueuePreviousPreview(
-                    previousTrack = previousTrack,
-                    forceNetworkRefresh = isNewQueueList
-                )
-            } ?: run {
-                clearQueuePreviousPreviewState()
-            }
-            resolveNextQueueTrack(snapshot)?.let { nextTrack ->
-                updateQueueNextPreview(
-                    nextTrack = nextTrack,
-                    forceNetworkRefresh = isNewQueueList
-                )
-            } ?: run {
-                clearQueueNextPreviewState()
-            }
-            prefetchQueuePreviewImages(
-                snapshot = snapshot,
-                forceNetworkRefresh = isNewQueueList
-            )
-        } catch (e: Exception) {
-            logError("Error handling queue update: ${e.message}", e)
-        }
-    }
-
-    private fun extractQueuePayloadZoneId(body: JSONObject): String? {
-        val directZone = body.optString("zone_or_output_id").takeIf { it.isNotBlank() }
-        if (directZone != null) return directZone
-
-        body.optJSONObject("queue")?.optString("zone_or_output_id")
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-        body.optJSONObject("queue_changed")?.optString("zone_or_output_id")
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-
-        body.optJSONArray("queues")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val zoneId = queues.optJSONObject(i)
-                    ?.optString("zone_or_output_id")
-                    ?.takeIf { it.isNotBlank() }
-                if (zoneId != null) return zoneId
-            }
-        }
-        body.optJSONArray("queues_changed")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val zoneId = queues.optJSONObject(i)
-                    ?.optString("zone_or_output_id")
-                    ?.takeIf { it.isNotBlank() }
-                if (zoneId != null) return zoneId
-            }
-        }
-
-        val zoneKeys = listOf("zones", "zones_changed", "zones_now_playing_changed", "zones_state_changed")
-        for (zoneKey in zoneKeys) {
-            body.optJSONArray(zoneKey)?.let { zones ->
-                for (i in 0 until zones.length()) {
-                    val zoneId = zones.optJSONObject(i)
-                        ?.optString("zone_id")
-                        ?.takeIf { it.isNotBlank() }
-                    if (zoneId != null) return zoneId
-                }
-            }
-        }
-        return null
-    }
-
-    private fun buildQueueListFingerprint(snapshot: QueueSnapshot): String {
-        val builder = StringBuilder()
-        builder.append(snapshot.items.size).append('#')
-        for (item in snapshot.items) {
-            builder.append(item.queueItemId ?: "")
-                .append('|')
-                .append(item.itemKey ?: "")
-                .append('|')
-                .append(item.imageKey ?: "")
-                .append(';')
-        }
-        return builder.toString()
+        queueManager.handleQueueUpdate(body)
     }
 
     private fun clearQueuePreviewFetchStateForFullRefresh() {
-        imageBitmapByImageKey.clear()
+        synchronized(previewImageCacheLock) {
+            imageBitmapByImageKey.clear()
+        }
         pendingImageRequests.entries.removeIf { entry ->
             entry.value.purpose == ImageRequestPurpose.PREVIOUS_PREVIEW ||
             entry.value.purpose == ImageRequestPurpose.NEXT_PREVIEW ||
                 entry.value.purpose == ImageRequestPurpose.QUEUE_PREFETCH
         }
-    }
-
-    private fun extractQueueSnapshot(body: JSONObject): QueueSnapshot? {
-        val queueArrays = mutableListOf<JSONArray>()
-        val preferredZoneId = resolveTransportZoneId()
-
-        fun addArrayIfAny(array: JSONArray?) {
-            if (array != null && array.length() > 0) {
-                queueArrays.add(array)
-            }
-        }
-
-        addArrayIfAny(body.optJSONArray("items"))
-        addArrayIfAny(body.optJSONArray("queue_items"))
-        addArrayIfAny(body.optJSONArray("queued_items"))
-
-        body.optJSONObject("queue")?.let { queue ->
-            addArrayIfAny(queue.optJSONArray("items"))
-            addArrayIfAny(queue.optJSONArray("queue_items"))
-        }
-        body.optJSONObject("queue_changed")?.let { queue ->
-            addArrayIfAny(queue.optJSONArray("items"))
-            addArrayIfAny(queue.optJSONArray("queue_items"))
-        }
-
-        body.optJSONArray("queues")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val queueObj = queues.optJSONObject(i) ?: continue
-                val zoneOrOutputId = queueObj.optString("zone_or_output_id")
-                if (!matchesPreferredZoneId(zoneOrOutputId, preferredZoneId)) {
-                    continue
-                }
-                addArrayIfAny(queueObj.optJSONArray("items"))
-                addArrayIfAny(queueObj.optJSONArray("queue_items"))
-            }
-        }
-        body.optJSONArray("queues_changed")?.let { queues ->
-            for (i in 0 until queues.length()) {
-                val queueObj = queues.optJSONObject(i) ?: continue
-                val zoneOrOutputId = queueObj.optString("zone_or_output_id")
-                if (!matchesPreferredZoneId(zoneOrOutputId, preferredZoneId)) {
-                    continue
-                }
-                addArrayIfAny(queueObj.optJSONArray("items"))
-                addArrayIfAny(queueObj.optJSONArray("queue_items"))
-            }
-        }
-
-        val zoneKeys = listOf("zones", "zones_changed", "zones_now_playing_changed", "zones_state_changed")
-        for (zoneKey in zoneKeys) {
-            body.optJSONArray(zoneKey)?.let { zones ->
-                for (i in 0 until zones.length()) {
-                    val zoneObj = zones.optJSONObject(i) ?: continue
-                    val zoneId = zoneObj.optString("zone_id")
-                    if (!matchesPreferredZoneId(zoneId, preferredZoneId)) continue
-                    addArrayIfAny(zoneObj.optJSONArray("items"))
-                    addArrayIfAny(zoneObj.optJSONArray("queue_items"))
-                    addArrayIfAny(zoneObj.optJSONArray("queued_items"))
-                    zoneObj.optJSONObject("queue")?.let { queue ->
-                        addArrayIfAny(queue.optJSONArray("items"))
-                        addArrayIfAny(queue.optJSONArray("queue_items"))
-                    }
-                }
-            }
-        }
-
-        var bestSnapshot: QueueSnapshot? = null
-        var bestScore = Int.MIN_VALUE
-        for (items in queueArrays) {
-            val snapshot = parseQueueSnapshot(items) ?: continue
-            val score = snapshot.items.size + if (snapshot.currentIndex >= 0) 1000 else 0
-            if (score > bestScore) {
-                bestScore = score
-                bestSnapshot = snapshot
-            }
-        }
-        return bestSnapshot
-    }
-
-    private fun matchesPreferredZoneId(candidateZoneOrOutputId: String, preferredZoneId: String?): Boolean {
-        if (preferredZoneId.isNullOrBlank()) return true
-        if (candidateZoneOrOutputId.isBlank()) return true
-        return candidateZoneOrOutputId == preferredZoneId
-    }
-
-    private fun parseQueueSnapshot(items: JSONArray): QueueSnapshot? {
-        val parsedItems = mutableListOf<QueueTrackInfo>()
-        for (i in 0 until items.length()) {
-            val item = items.optJSONObject(i) ?: continue
-            parseQueueTrackInfo(item)?.let { parsedItems.add(it) }
-        }
-        if (parsedItems.isEmpty()) return null
-        val currentIndex = resolveQueueCurrentIndex(parsedItems)
-        return QueueSnapshot(
-            items = parsedItems,
-            currentIndex = currentIndex
-        )
-    }
-
-    private fun resolveQueueCurrentIndex(items: List<QueueTrackInfo>): Int {
-        val nowPlayingQueueItemId = currentNowPlayingQueueItemId.orEmpty()
-        if (nowPlayingQueueItemId.isNotBlank()) {
-            val currentByQueueItemId = items.indexOfFirst { item ->
-                item.queueItemId == nowPlayingQueueItemId || item.stableId == nowPlayingQueueItemId
-            }
-            if (currentByQueueItemId >= 0) return currentByQueueItemId
-        }
-
-        val nowPlayingItemKey = currentNowPlayingItemKey.orEmpty()
-        if (nowPlayingItemKey.isNotBlank()) {
-            val currentByItemKey = items.indexOfFirst { item ->
-                item.itemKey == nowPlayingItemKey
-            }
-            if (currentByItemKey >= 0) return currentByItemKey
-        }
-
-        val currentByFlag = items.indexOfFirst { it.isCurrent }
-        if (currentByFlag >= 0) return currentByFlag
-
-        val currentImageKey = sharedPreferences.getString("current_image_key", "").orEmpty()
-        if (currentImageKey.isNotBlank()) {
-            val currentByImage = items.indexOfFirst { it.imageKey == currentImageKey }
-            if (currentByImage >= 0) return currentByImage
-        }
-
-        val stateSnapshot = currentState.get()
-        val currentTrack = stateSnapshot.trackText.trim()
-        val currentArtist = stateSnapshot.artistText.trim()
-        if (currentTrack.isNotEmpty() && !currentTrack.equals("Nothing playing", ignoreCase = true)) {
-            val currentByMeta = items.indexOfFirst { item ->
-                val titleMatch = item.title?.trim()?.equals(currentTrack, ignoreCase = true) == true
-                val artistMatch = currentArtist.isEmpty() ||
-                    item.artist.isNullOrBlank() ||
-                    item.artist.trim().equals(currentArtist, ignoreCase = true)
-                titleMatch && artistMatch
-            }
-            if (currentByMeta >= 0) return currentByMeta
-        }
-
-        return -1
-    }
-
-    private fun resolveNextQueueTrack(snapshot: QueueSnapshot): QueueTrackInfo? {
-        val items = snapshot.items
-        if (items.isEmpty()) return null
-        if (items.size == 1) return null
-
-        val anchorIndex = resolveQueueAnchorIndex(snapshot)
-        if (anchorIndex !in items.indices) return null
-        val nextIndex = anchorIndex + 1
-        if (nextIndex !in items.indices) return null
-        return items[nextIndex]
-    }
-
-    private fun resolvePreviousQueueTrack(snapshot: QueueSnapshot): QueueTrackInfo? {
-        val items = snapshot.items
-        if (items.isEmpty()) return null
-        if (items.size == 1) return null
-        val anchorIndex = resolveQueueAnchorIndex(snapshot)
-        if (anchorIndex !in items.indices) return null
-        val previousIndex = anchorIndex - 1
-        if (previousIndex !in items.indices) return null
-        return items[previousIndex]
-    }
-
-    private fun resolveQueueAnchorIndex(snapshot: QueueSnapshot): Int {
-        if (snapshot.currentIndex in snapshot.items.indices) return snapshot.currentIndex
-        return resolveQueueCurrentIndex(snapshot.items)
     }
 
     private fun clearQueuePreviousPreviewState() {
@@ -5845,27 +5381,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun refreshQueuePreviewsFromCachedQueue(reason: String) {
-        val snapshot = queueSnapshot ?: return
-        val refreshed = snapshot.copy(currentIndex = resolveQueueCurrentIndex(snapshot.items))
-        queueSnapshot = refreshed
-
-        val previousTrack = resolvePreviousQueueTrack(refreshed)
-        if (previousTrack == null) {
-            clearQueuePreviousPreviewState()
-        } else {
-            updateQueuePreviousPreview(previousTrack)
-        }
-
-        val nextTrack = resolveNextQueueTrack(refreshed)
-        if (nextTrack == null) {
-            clearQueueNextPreviewState()
-            logRuntimeInfo(
-                "Queue next refresh cleared preview: reason=$reason currentIndex=${refreshed.currentIndex} total=${refreshed.items.size}"
-            )
-        } else {
-            updateQueueNextPreview(nextTrack)
-        }
+    private fun hasQueuePayload(body: JSONObject): Boolean {
+        return queueManager.hasQueuePayload(body)
     }
 
     private fun hasPendingImageRequestForKey(imageKey: String): Boolean {
@@ -5888,39 +5405,16 @@ class MainActivity : Activity() {
         return false
     }
 
-    private fun parseQueueTrackInfo(item: JSONObject): QueueTrackInfo? {
-        val threeLine = item.optJSONObject("three_line")
-        val oneLine = item.optJSONObject("one_line")
-        val title = threeLine?.optString("line1")?.takeIf { it.isNotBlank() }
-            ?: oneLine?.optString("line1")?.takeIf { it.isNotBlank() }
-            ?: item.optString("title").takeIf { it.isNotBlank() }
-            ?: item.optString("name").takeIf { it.isNotBlank() }
-        val artist = threeLine?.optString("line2")?.takeIf { it.isNotBlank() }
-            ?: item.optString("artist").takeIf { it.isNotBlank() }
-            ?: item.optString("subtitle").takeIf { it.isNotBlank() }
-        val album = threeLine?.optString("line3")?.takeIf { it.isNotBlank() }
-            ?: item.optString("album").takeIf { it.isNotBlank() }
-        val imageKey = item.optString("image_key").takeIf { it.isNotBlank() }
-        val queueItemId = item.optString("queue_item_id").takeIf { it.isNotBlank() }
-            ?: item.optString("queue_item_key").takeIf { it.isNotBlank() }
-        val itemKey = item.optString("item_key").takeIf { it.isNotBlank() }
-        val stableId = queueItemId ?: itemKey
-        val isCurrent = item.optBoolean("is_current") ||
-            item.optBoolean("is_currently_playing") ||
-            item.optBoolean("is_now_playing") ||
-            item.optBoolean("playing")
+    private fun refreshQueuePreviewsFromCachedQueue(reason: String) {
+        queueManager.refreshQueuePreviewsFromCachedQueue(reason)
+    }
 
-        if (title == null && artist == null && album == null && imageKey == null && stableId == null) return null
-        return QueueTrackInfo(
-            title = title,
-            artist = artist,
-            album = album,
-            imageKey = imageKey,
-            stableId = stableId,
-            queueItemId = queueItemId,
-            itemKey = itemKey,
-            isCurrent = isCurrent
-        )
+    private fun resolveNextQueueTrack(snapshot: QueueSnapshot): QueueTrackInfo? {
+        return queueManager.resolveNextTrack(snapshot)
+    }
+
+    private fun resolvePreviousQueueTrack(snapshot: QueueSnapshot): QueueTrackInfo? {
+        return queueManager.resolvePreviousTrack(snapshot)
     }
 
     private fun loadAlbumArt(imageKey: String) {
@@ -5982,7 +5476,9 @@ class MainActivity : Activity() {
             ImageRequestPurpose.PREVIOUS_PREVIEW -> {
                 logRuntimeInfo("Request previous preview image: imageKey=$imageKey trackId=$trackId requestId=$requestIdString")
             }
-            else -> Unit
+            ImageRequestPurpose.CURRENT_ALBUM,
+            ImageRequestPurpose.QUEUE_PREFETCH -> {
+            }
         }
 
         activityScope.launch(Dispatchers.IO) {
@@ -6001,239 +5497,7 @@ class MainActivity : Activity() {
     }
 
     private fun handleImageResponse(requestId: String?, jsonBody: JSONObject?, fullMessage: String) {
-        logDebug("🖼️ Processing image response with cache support")
-
-        val requestContext = requestId?.let { pendingImageRequests.remove(it) }
-        if (requestId != null && requestContext == null) {
-            logRuntimeWarning("Image response has no pending context: requestId=$requestId")
-            return
-        }
-        val purpose = requestContext?.purpose ?: ImageRequestPurpose.CURRENT_ALBUM
-
-        try {
-            var imageBytes: ByteArray? = null
-
-            jsonBody?.let { body ->
-                if (body.has("image_data")) {
-                    try {
-                        val base64Data = body.getString("image_data")
-                        imageBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
-                    } catch (e: Exception) {
-                        logWarning("Failed to decode base64 image: ${e.message}")
-                    }
-                }
-            }
-
-            if (imageBytes == null) {
-                val lines = fullMessage.split("\r\n", "\n")
-                var headerEndIndex = -1
-                var contentLength = 0
-                var contentType = ""
-
-                for (i in lines.indices) {
-                    val line = lines[i]
-                    if (line.isEmpty()) {
-                        headerEndIndex = i + 1
-                        break
-                    }
-
-                    val colonIndex = line.indexOf(':')
-                    if (colonIndex > 0) {
-                        val headerName = line.substring(0, colonIndex).trim().lowercase()
-                        val headerValue = line.substring(colonIndex + 1).trim()
-
-                        when (headerName) {
-                            "content-length" -> contentLength = headerValue.toIntOrNull() ?: 0
-                            "content-type" -> contentType = headerValue
-                        }
-                    }
-                }
-
-                logDebug("Image response - contentLength: $contentLength, contentType: $contentType, headerEndIndex: $headerEndIndex")
-
-                if (headerEndIndex >= 0 && contentLength > 0) {
-                    val messageBytes = fullMessage.toByteArray(Charsets.ISO_8859_1)
-                    var binaryStartPos = -1
-                    for (i in 0 until messageBytes.size - 1) {
-                        if (messageBytes[i] == 0xFF.toByte() && messageBytes[i + 1] == 0xD8.toByte()) {
-                            binaryStartPos = i
-                            break
-                        }
-                    }
-
-                    imageBytes = if (binaryStartPos != -1) {
-                        messageBytes.sliceArray(binaryStartPos until messageBytes.size)
-                    } else {
-                        val headerEndPattern = "\n\n"
-                        val headerEndPos = fullMessage.indexOf(headerEndPattern)
-                        if (headerEndPos != -1) {
-                            val dataStart = headerEndPos + headerEndPattern.length
-                            fullMessage.substring(dataStart).toByteArray(Charsets.ISO_8859_1)
-                        } else {
-                            null
-                        }
-                    }
-                }
-            }
-
-            imageBytes?.let { bytes ->
-                if (bytes.isEmpty()) {
-                    if (purpose == ImageRequestPurpose.CURRENT_ALBUM) {
-                        mainHandler.post { updateAlbumImage(null, null) }
-                    }
-                    return
-                }
-
-                val imageHash = generateImageHash(bytes)
-                val cachedBitmap = loadImageFromCache(imageHash)
-                if (cachedBitmap != null) {
-                    requestContext?.imageKey?.let { rememberPreviewBitmapForImageKey(it, cachedBitmap) }
-                    when (purpose) {
-                        ImageRequestPurpose.CURRENT_ALBUM -> {
-                            if (shouldIgnoreCurrentAlbumResponse(requestContext)) {
-                                return
-                            }
-                            val imageRef = requestContext?.imageKey ?: imageHash
-                            mainHandler.post { updateAlbumImage(cachedBitmap, imageRef) }
-                        }
-                        ImageRequestPurpose.NEXT_PREVIEW -> {
-                            val expectedTrackId = expectedNextPreviewTrackId
-                            val contextTrackId = requestContext?.trackId
-                            if (expectedTrackId != null && contextTrackId != expectedTrackId) {
-                                logRuntimeInfo("Ignore stale next preview image response: expected=$expectedTrackId actual=$contextTrackId")
-                                return
-                            }
-                            if (contextTrackId != null) {
-                                val preview = scalePreviewBitmap(cachedBitmap)
-                                queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
-                                logRuntimeInfo(
-                                    "Next preview loaded from cache: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
-                                )
-                            } else {
-                                Unit
-                            }
-                        }
-                        ImageRequestPurpose.PREVIOUS_PREVIEW -> {
-                            val expectedTrackId = expectedPreviousPreviewTrackId
-                            val contextTrackId = requestContext?.trackId
-                            if (expectedTrackId != null && contextTrackId != expectedTrackId) {
-                                logRuntimeInfo("Ignore stale previous preview image response: expected=$expectedTrackId actual=$contextTrackId")
-                                return
-                            }
-                            if (contextTrackId != null) {
-                                val preview = scalePreviewBitmap(cachedBitmap)
-                                queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
-                                logRuntimeInfo(
-                                    "Previous preview loaded from cache: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
-                                )
-                            } else {
-                                Unit
-                            }
-                        }
-                        ImageRequestPurpose.QUEUE_PREFETCH -> {
-                            requestContext?.imageKey?.let { imageKey ->
-                                promotePrefetchedDirectionalPreviewsIfNeeded(imageKey, cachedBitmap)
-                            }
-                        }
-                    }
-                    return
-                }
-
-                try {
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    if (bitmap != null) {
-                        requestContext?.imageKey?.let { rememberPreviewBitmapForImageKey(it, bitmap) }
-
-                        activityScope.launch(Dispatchers.IO) {
-                            val cachedPath = saveImageToCache(bytes)
-                            if (cachedPath != null) {
-                                logDebug("💾 Image saved to cache: $imageHash")
-                            } else {
-                                logDebug("📁 Image already in cache: $imageHash")
-                            }
-                        }
-
-                        when (purpose) {
-                            ImageRequestPurpose.CURRENT_ALBUM -> {
-                                if (shouldIgnoreCurrentAlbumResponse(requestContext)) {
-                                    return
-                                }
-                                val imageRef = requestContext?.imageKey ?: imageHash
-                                mainHandler.post { updateAlbumImage(bitmap, imageRef) }
-                            }
-                            ImageRequestPurpose.NEXT_PREVIEW -> {
-                                val expectedTrackId = expectedNextPreviewTrackId
-                                val contextTrackId = requestContext?.trackId
-                                if (expectedTrackId != null && contextTrackId != expectedTrackId) {
-                                    logRuntimeInfo(
-                                        "Ignore stale next preview image decode: expected=$expectedTrackId actual=$contextTrackId"
-                                    )
-                                    return
-                                }
-                                if (contextTrackId != null) {
-                                    val preview = scalePreviewBitmap(bitmap)
-                                    queueNextTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
-                                    logRuntimeInfo(
-                                        "Next preview loaded from network: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
-                                    )
-                                } else {
-                                    Unit
-                                }
-                            }
-                            ImageRequestPurpose.PREVIOUS_PREVIEW -> {
-                                val expectedTrackId = expectedPreviousPreviewTrackId
-                                val contextTrackId = requestContext?.trackId
-                                if (expectedTrackId != null && contextTrackId != expectedTrackId) {
-                                    logRuntimeInfo(
-                                        "Ignore stale previous preview image decode: expected=$expectedTrackId actual=$contextTrackId"
-                                    )
-                                    return
-                                }
-                                if (contextTrackId != null) {
-                                    val preview = scalePreviewBitmap(bitmap)
-                                    queuePreviousTrackPreviewFrame = TrackPreviewFrame(trackId = contextTrackId, bitmap = preview)
-                                    logRuntimeInfo(
-                                        "Previous preview loaded from network: trackId=$contextTrackId imageKey=${requestContext.imageKey}"
-                                    )
-                                } else {
-                                    Unit
-                                }
-                            }
-                            ImageRequestPurpose.QUEUE_PREFETCH -> {
-                                requestContext?.imageKey?.let { imageKey ->
-                                    promotePrefetchedDirectionalPreviewsIfNeeded(imageKey, bitmap)
-                                }
-                            }
-                        }
-                    } else {
-                        logWarning("Failed to decode image bitmap - data may be corrupted")
-                        checkForImageHeaders(bytes)
-                        if (purpose == ImageRequestPurpose.CURRENT_ALBUM) {
-                            mainHandler.post { updateAlbumImage(null, null) }
-                        } else {
-                            Unit
-                        }
-                    }
-                } catch (e: Exception) {
-                    logError("Error decoding image: ${e.message}", e)
-                    if (purpose == ImageRequestPurpose.CURRENT_ALBUM) {
-                        mainHandler.post { updateAlbumImage(null, null) }
-                    } else {
-                        Unit
-                    }
-                }
-            } ?: run {
-                logWarning("Invalid image response format")
-                if (purpose == ImageRequestPurpose.CURRENT_ALBUM) {
-                    mainHandler.post { updateAlbumImage(null, null) }
-                }
-            }
-        } catch (e: Exception) {
-            logError("Error processing image response: ${e.message}", e)
-            if (purpose == ImageRequestPurpose.CURRENT_ALBUM) {
-                mainHandler.post { updateAlbumImage(null, null) }
-            }
-        }
+        imageResponseProcessor.handleImageResponse(requestId, jsonBody, fullMessage)
     }
 
     private fun promotePrefetchedDirectionalPreviewsIfNeeded(imageKey: String, bitmap: Bitmap) {
@@ -8309,7 +7573,7 @@ class MainActivity : Activity() {
             logWarning("Error closing track transition store: ${e.message}")
         }
         
-        smartConnectionManager.unregisterNetworkMonitoring()
+        smartConnectionManager.cleanup()
         healthMonitor.stopMonitoring()
         
         // Clear screen wake flag
@@ -8326,6 +7590,11 @@ class MainActivity : Activity() {
         stopArtWallTimer()
         cancelDelayedArtWallSwitch()
         
+        safeReleaseMulticastLock()
+        webSocketClient?.disconnect()
+    }
+
+    private fun safeReleaseMulticastLock() {
         try {
             multicastLock?.let { lock ->
                 if (lock.isHeld) {
@@ -8335,17 +7604,12 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             logWarning("MulticastLock release failed: ${e.message}")
         }
-        webSocketClient?.disconnect()
     }
     
     private fun cleanupMessageProcessor() {
         logDebug("🔧 Cleaning up message processor")
         
         try {
-            // Clear any remaining messages in the queue
-            messageQueue.clear()
-            logDebug("📤 Message queue cleared (${messageQueue.size} messages)")
-            
             // Shutdown the message processor
             messageProcessor.shutdown()
             
@@ -8400,7 +7664,6 @@ class MainActivity : Activity() {
                 coverDragFallbackNextBitmap = null
                 coverDragLoggedMissingNextPreview = false
             }
-            else -> Unit
         }
         // Feed all events to GestureDetector first so fling detection gets a full sequence.
         val gestureHandled = ::gestureDetector.isInitialized && gestureDetector.onTouchEvent(ev)

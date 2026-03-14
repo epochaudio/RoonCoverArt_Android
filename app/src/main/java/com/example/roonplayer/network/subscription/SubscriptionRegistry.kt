@@ -19,6 +19,7 @@ class SubscriptionRegistry(
 ) {
     private val pendingByRequestId = ConcurrentHashMap<String, SubscriptionMetadata>()
     private val activeBySubscriptionKey = ConcurrentHashMap<String, SubscriptionMetadata>()
+    private val activeSubscriptionKeyByRequestId = ConcurrentHashMap<String, String>()
 
     fun registerPending(
         requestId: String,
@@ -41,6 +42,7 @@ class SubscriptionRegistry(
         val pending = pendingByRequestId.remove(requestId) ?: return null
         val active = pending.copy(activatedAtMs = nowMs())
         activeBySubscriptionKey[active.subscriptionKey] = active
+        activeSubscriptionKeyByRequestId[requestId] = active.subscriptionKey
         return active
     }
 
@@ -48,6 +50,7 @@ class SubscriptionRegistry(
         val active = activeBySubscriptionKey.remove(subscriptionKey)
         if (active != null) {
             pendingByRequestId.remove(active.requestId)
+            activeSubscriptionKeyByRequestId.remove(active.requestId)
         }
         return active
     }
@@ -59,17 +62,8 @@ class SubscriptionRegistry(
             return pending
         }
 
-        var removed: SubscriptionMetadata? = null
-        val iterator = activeBySubscriptionKey.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.value.requestId == requestId) {
-                removed = entry.value
-                iterator.remove()
-                break
-            }
-        }
-        return removed
+        val activeSubscriptionKey = activeSubscriptionKeyByRequestId.remove(requestId) ?: return null
+        return activeBySubscriptionKey.remove(activeSubscriptionKey)
     }
 
     fun getBySubscriptionKey(subscriptionKey: String): SubscriptionMetadata? {
@@ -89,6 +83,7 @@ class SubscriptionRegistry(
     fun clear() {
         pendingByRequestId.clear()
         activeBySubscriptionKey.clear()
+        activeSubscriptionKeyByRequestId.clear()
     }
 
     fun activeCount(): Int = activeBySubscriptionKey.size

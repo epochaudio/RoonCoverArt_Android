@@ -58,13 +58,33 @@ class SimplifiedConnectionHelper(
      * 解析用户输入的主机和端口
      */
     private fun parseHostAndPort(input: String): Pair<String, Int> {
-        return if (input.contains(":")) {
-            val parts = input.split(":")
-            val host = parts[0].trim()
-            val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
-            Pair(host, port)
-        } else {
-            Pair(input.trim(), 0)
+        val normalizedInput = input.trim()
+        if (normalizedInput.startsWith("[")) {
+            val closingBracketIndex = normalizedInput.indexOf(']')
+            if (closingBracketIndex > 0) {
+                val host = normalizedInput.substring(1, closingBracketIndex).trim()
+                val suffix = normalizedInput.substring(closingBracketIndex + 1)
+                val port = if (suffix.startsWith(":")) {
+                    suffix.substring(1).trim().toIntOrNull() ?: 0
+                } else {
+                    0
+                }
+                return Pair(host, port)
+            }
         }
+
+        val colonCount = normalizedInput.count { it == ':' }
+        if (colonCount > 1) {
+            return Pair(normalizedInput, 0)
+        }
+
+        val separatorIndex = normalizedInput.lastIndexOf(':')
+        if (separatorIndex <= 0) {
+            return Pair(normalizedInput, 0)
+        }
+
+        val host = normalizedInput.substring(0, separatorIndex).trim()
+        val port = normalizedInput.substring(separatorIndex + 1).trim().toIntOrNull() ?: 0
+        return Pair(host, port)
     }
 }

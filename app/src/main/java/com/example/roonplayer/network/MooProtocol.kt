@@ -67,7 +67,7 @@ class MooParser {
                 when (headerName) {
                     HEADER_CONTENT_LENGTH -> {
                         val parsedLength = headerValue.toIntOrNull() ?: return null
-                        if (parsedLength < 0) return null
+                        if (parsedLength < 0 || parsedLength > MAX_CONTENT_LENGTH_BYTES) return null
                         contentLength = parsedLength
                     }
                     HEADER_REQUEST_ID -> {
@@ -135,5 +135,6 @@ class MooParser {
         private const val HEADER_REQUEST_ID = "request-id"
         private const val HEADER_CONTENT_LENGTH = "content-length"
         private const val HEADER_CONTENT_TYPE = "content-type"
+        private const val MAX_CONTENT_LENGTH_BYTES = 50 * 1024 * 1024
     }
 }
