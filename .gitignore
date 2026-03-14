@@ -6,6 +6,8 @@
 .vscode/
 *.iml
 .claude/
+AGENTS.md
+CLAUDE.md
 
 # Gradle
 .gradle/
