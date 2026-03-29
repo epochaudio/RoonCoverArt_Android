@@ -30,12 +30,12 @@ object TrackTransitionDesignTokens {
     }
 
     object TextTransition {
-        const val SLOT_SHIFT_DP = 18
-        const val SLOT_SHIFT_ROLLBACK_DP = 14
-        const val OUT_ALPHA = 0.25f
+        const val SLOT_SHIFT_DP = 24
+        const val SLOT_SHIFT_ROLLBACK_DP = 18
+        const val OUT_ALPHA = 0.16f
         const val OUT_DURATION_MS = 150L
-        const val IN_DURATION_MS = 250L
-        const val STAGGER_DELAY_MS = 30L
+        const val IN_DURATION_MS = 280L
+        const val STAGGER_DELAY_MS = 36L
     }
 
     object DirectionVectors {

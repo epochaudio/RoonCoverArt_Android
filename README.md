@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.29)
+# CoverArt for Android (v2.30)
 
 [English](#english) | [中文](#chinese)
 
@@ -34,7 +34,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.29) is generated at project root: `CoverArtForAndroid-v2.29-debug.apk`
+2. Current packaged APK (v2.30) is generated at project root: `CoverArtForAndroid-v2.30-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +52,14 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.29 (Latest)**
+- **2.30 (Latest)**
+  - Replaced metadata `TextView` rendering with a measured scene pipeline built from `TrackTextLayoutPolicy`, `AndroidTrackTextLayoutEngine`, and `TrackTextSceneView`
+  - Rebuilt portrait and landscape metadata layout around a cover-first `LayoutSpec` with short-edge-driven spacing and readability baselines
+  - Added `contentWidthPx` shrink-wrap and transition-time width freezing so short titles can breathe without horizontal jitter during skips
+  - Routed metadata transitions through scene interpolation and aligned timing, stagger, and shift tokens to remove mid-animation text mutation
+  - Migrated metadata colors to explicit `TrackTextPalette` ownership and isolated `statusText` overlay coloring from album-art palette updates
+  - Added JVM regression coverage for layout policy sizing, mixed-language and low-density readability, and scene transition state handoff
+- **2.29**
   - Hardened WebSocket, subscription registry, and connection-monitor lifecycle handling to reduce race conditions and leaks
   - Simplified message processing into a single-threaded execution path for more predictable MOO handling
   - Extracted MOO dispatch, image response processing, palette handling, and queue coordination into dedicated collaborators
@@ -122,7 +129,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.29 APK 位于项目根目录：`CoverArtForAndroid-v2.29-debug.apk`
+2. 当前已打包的 v2.30 APK 位于项目根目录：`CoverArtForAndroid-v2.30-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -140,7 +147,14 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.29（最新）**
+- **2.30（最新）**
+  - 用 `TrackTextLayoutPolicy`、`AndroidTrackTextLayoutEngine` 和 `TrackTextSceneView` 组成新的测量式 scene 文本渲染链路，替换元数据 `TextView` 直绘
+  - 围绕 cover-first `LayoutSpec` 重写横竖屏元数据布局，采用短边驱动的间距与远距离可读性基线
+  - 新增 `contentWidthPx` 基础 shrink-wrap，并在转场期间冻结 metadata 容器宽度，避免切歌时横向抖动
+  - 文本转场改为 scene 插值驱动，并统一时长、级联延迟与位移 token，移除动画中途直接改文案
+  - 元数据配色迁移为显式 `TrackTextPalette`，同时把 `statusText` overlay 颜色所有权从专辑主色联动里剥离
+  - 补充布局策略、低密度大屏/中英文混排可读性，以及 scene 转场状态衔接的 JVM 回归测试
+- **2.29**
   - 强化 WebSocket、订阅注册表与连接监控生命周期处理，降低竞态与资源泄漏风险
   - 将消息处理链路收敛为单线程串行执行，提升 MOO 协议处理可预测性
   - 拆出 MOO 路由、图片响应处理、主色调管理、队列协调等独立协作类，降低 `MainActivity` 复杂度

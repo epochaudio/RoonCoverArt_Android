@@ -118,6 +118,17 @@ import com.example.roonplayer.state.transition.TransitionDirection
 import com.example.roonplayer.state.transition.TransitionTrack
 import com.example.roonplayer.state.transition.UiPhase
 import com.example.roonplayer.state.zone.ZoneStateStore
+import com.example.roonplayer.ui.text.AndroidTrackTextLayoutEngine
+import com.example.roonplayer.ui.text.TrackTextBounds
+import com.example.roonplayer.ui.text.TrackTextField
+import com.example.roonplayer.ui.text.TrackTextLayoutPolicy
+import com.example.roonplayer.ui.text.TrackTextLayoutPolicyInput
+import com.example.roonplayer.ui.text.TrackTextOrientation
+import com.example.roonplayer.ui.text.TrackTextPalette
+import com.example.roonplayer.ui.text.TrackTextScene
+import com.example.roonplayer.ui.text.TrackTextScreenMetrics
+import com.example.roonplayer.ui.text.TrackTextSceneTransitionState
+import com.example.roonplayer.ui.text.TrackTextSceneView
 import kotlin.concurrent.withLock
 import kotlinx.coroutines.flow.collect
 
@@ -177,6 +188,8 @@ class MainActivity : Activity() {
         private const val QUEUE_PREFETCH_ITEM_COUNT = 12
         private const val PREVIEW_IMAGE_REQUEST_SIZE_PX = 420
         private const val QUEUE_RESUBSCRIBE_DEBOUNCE_MS = 1000L
+        private const val STATUS_OVERLAY_TEXT_COLOR = 0xFFE0E0E0.toInt()
+        private const val METADATA_CONTAINER_TAG = "text_container"
         
         // --- 统一设计语言池 (Design Tokens) ---
         object UIDesignTokens {
@@ -219,6 +232,25 @@ class MainActivity : Activity() {
     enum class ScreenType {
         HD, FHD, FHD_PLUS, QHD_2K, UHD_4K
     }
+
+    data class LayoutSpec(
+        val screenWidthPx: Int,
+        val screenHeightPx: Int,
+        val density: Float,
+        val shortEdgePx: Int,
+        val isLandscape: Boolean,
+        val outerMarginPx: Int,
+        val topMarginPx: Int,
+        val bottomMarginPx: Int,
+        val gapPx: Int,
+        val contentPaddingHorizontalPx: Int,
+        val contentPaddingVerticalPx: Int,
+        val coverSizePx: Int,
+        val maxTextWidthPx: Int,
+        val maxTextHeightPx: Int,
+        val minReadableTextHeightPx: Int,
+        val minLandscapeTextWidthPx: Int
+    )
     
     // TrackState data class for unified state management
     data class TrackState(
@@ -235,6 +267,27 @@ class MainActivity : Activity() {
         val trackId: String,
         val bitmap: Bitmap
     )
+
+    private fun TrackState.withMetadata(
+        track: String,
+        artist: String,
+        album: String
+    ): TrackState {
+        return copy(
+            trackText = track,
+            artistText = artist,
+            albumText = album,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    private fun TrackState.withMetadata(track: TransitionTrack): TrackState {
+        return withMetadata(
+            track = track.title,
+            artist = track.artist,
+            album = track.album
+        )
+    }
 
     private data class PendingTrackTransition(
         val key: CorrelationKey,
@@ -277,7 +330,13 @@ class MainActivity : Activity() {
         val screenWidth = resources.displayMetrics.widthPixels
         val screenHeight = resources.displayMetrics.heightPixels
         val density = resources.displayMetrics.density
+        val shortEdge = minOf(screenWidth, screenHeight)
+        val longEdge = maxOf(screenWidth, screenHeight)
         val isLandscape = screenWidth > screenHeight
+        val spacingXs = (shortEdge * 0.015f).toInt().coerceIn(8.dpToPx(), 24.dpToPx())
+        val spacingSm = (shortEdge * 0.025f).toInt().coerceIn(12.dpToPx(), 36.dpToPx())
+        val spacingMd = (shortEdge * 0.04f).toInt().coerceIn(16.dpToPx(), 56.dpToPx())
+        val spacingLg = (shortEdge * 0.06f).toInt().coerceIn(24.dpToPx(), 80.dpToPx())
         
         // Detect screen type based on width
         val screenType = when {
@@ -287,6 +346,7 @@ class MainActivity : Activity() {
             screenWidth >= 1080 -> ScreenType.FHD       // FHD: 1080×1920
             else -> ScreenType.HD                       // HD: 720p及以下
         }
+        val layoutSpec: LayoutSpec by lazy { resolveLayoutSpec() }
         
         // Get responsive font size based on screen size, density, and text area
         fun getResponsiveFontSize(baseSp: Int, textElement: TextElement = TextElement.NORMAL): Float {
@@ -331,51 +391,99 @@ class MainActivity : Activity() {
         
         // Get optimal image size with text area consideration
         fun getOptimalImageSize(): Pair<Int, Int> {
-            return if (isLandscape) {
-                // Landscape: Create stable square container for constraints
-                val maxWidth = (screenWidth * UIDesignTokens.PROPORTION_LANDSCAPE_IMAGE_WIDTH).toInt()
-                val maxHeight = (screenHeight * 0.92).toInt() // Margin top/bottom safe zone
-                val size = minOf(maxWidth, maxHeight) 
-                Pair(size, size)
-            } else {
-                // Portrait: Maximum width
-                val (_, textAreaHeight) = getTextAreaSize()
-                val margin = getResponsiveMargin()
-                val availableHeight = screenHeight - textAreaHeight - (margin * 6)
-                val imageWidth = (screenWidth * UIDesignTokens.PROPORTION_PORTRAIT_IMAGE_WIDTH).toInt()
-                val imageHeight = minOf(imageWidth, availableHeight) 
-                Pair(imageWidth, imageHeight)
-            }
+            return layoutSpec.coverSizePx to layoutSpec.coverSizePx
         }
         
         // Get text area dimensions with adaptive sizing
         fun getTextAreaSize(): Pair<Int, Int> {
-            return if (isLandscape) {
-                // Landscape: Adaptive height based on screen size, constrained width
-                val width = (screenWidth * UIDesignTokens.PROPORTION_LANDSCAPE_TEXT_WIDTH).toInt()
-                val height = (screenHeight * UIDesignTokens.PROPORTION_LANDSCAPE_HEIGHT).toInt() 
-                Pair(width, height)
-            } else {
-                // Portrait: full width, adaptive height for multi-line text display
-                val width = screenWidth
-                val baseHeight = (screenHeight * UIDesignTokens.PROPORTION_PORTRAIT_TEXT_HEIGHT).toInt() 
-                // 根据屏幕密度调整文字区域高度
-                val adjustedHeight = when {
-                    density > 3.0f -> (baseHeight * 1.2).toInt() // 高密度屏需要更多空间
-                    density < 1.5f -> (baseHeight * 0.9).toInt() // 低密度屏可以节省空间
-                    else -> baseHeight
-                }
-                Pair(width, adjustedHeight.coerceAtMost((screenHeight * 0.4).toInt())) // 最大不超过屏幕40%
-            }
+            return layoutSpec.maxTextWidthPx to layoutSpec.maxTextHeightPx
         }
         
         // Get responsive margins and padding
         fun getResponsiveMargin(): Int {
-            return (minOf(screenWidth, screenHeight) * 0.02).toInt()
+            return layoutSpec.outerMarginPx
         }
         
         fun getResponsiveGap(): Int {
-            return (minOf(screenWidth, screenHeight) * 0.01).toInt()
+            return layoutSpec.gapPx
+        }
+
+        private fun resolveLayoutSpec(): LayoutSpec {
+            val outerMargin = spacingMd
+            val topMargin = if (isLandscape) spacingMd else spacingSm
+            val bottomMargin = spacingMd
+            val gap = spacingSm
+            val contentPaddingHorizontal = spacingSm
+            val contentPaddingVertical = spacingXs
+            val minReadableTextHeight = (shortEdge * 0.22f).toInt()
+                .coerceIn(180.dpToPx(), 360.dpToPx())
+            val minLandscapeTextWidth = (shortEdge * 0.28f).toInt()
+                .coerceIn(280.dpToPx(), 520.dpToPx())
+
+            return if (isLandscape) {
+                val maxCoverByHeight = (screenHeight - topMargin - bottomMargin).coerceAtLeast(0)
+                val maxCoverByWidth = (
+                    screenWidth - outerMargin - gap - outerMargin - minLandscapeTextWidth
+                    ).coerceAtLeast(0)
+                val desiredCover = (screenHeight * 0.90f).toInt()
+                val coverSize = minOf(desiredCover, maxCoverByHeight, maxCoverByWidth, shortEdge)
+                    .coerceAtLeast(0)
+                val maxTextWidth = (
+                    screenWidth - outerMargin - coverSize - gap - outerMargin
+                    ).coerceAtLeast(minLandscapeTextWidth)
+                val maxTextHeight = (screenHeight - topMargin - bottomMargin).coerceAtLeast(0)
+
+                LayoutSpec(
+                    screenWidthPx = screenWidth,
+                    screenHeightPx = screenHeight,
+                    density = density,
+                    shortEdgePx = shortEdge,
+                    isLandscape = true,
+                    outerMarginPx = outerMargin,
+                    topMarginPx = topMargin,
+                    bottomMarginPx = bottomMargin,
+                    gapPx = gap,
+                    contentPaddingHorizontalPx = contentPaddingHorizontal,
+                    contentPaddingVerticalPx = contentPaddingVertical,
+                    coverSizePx = coverSize,
+                    maxTextWidthPx = maxTextWidth,
+                    maxTextHeightPx = maxTextHeight,
+                    minReadableTextHeightPx = minReadableTextHeight,
+                    minLandscapeTextWidthPx = minLandscapeTextWidth
+                )
+            } else {
+                val portraitCoverWidthRatio = 0.94f
+                val maxCoverByWidth = (screenWidth - outerMargin * 2).coerceAtLeast(0)
+                val maxCoverByHeight = (
+                    screenHeight - topMargin - gap - bottomMargin - minReadableTextHeight
+                    ).coerceAtLeast(0)
+                val desiredCover = (screenWidth * portraitCoverWidthRatio).toInt()
+                val coverSize = minOf(desiredCover, maxCoverByWidth, maxCoverByHeight, shortEdge)
+                    .coerceAtLeast(0)
+                val maxTextWidth = (screenWidth - outerMargin * 2).coerceAtLeast(0)
+                val maxTextHeight = (
+                    screenHeight - topMargin - coverSize - gap - bottomMargin
+                    ).coerceAtLeast(minReadableTextHeight)
+
+                LayoutSpec(
+                    screenWidthPx = screenWidth,
+                    screenHeightPx = screenHeight,
+                    density = density,
+                    shortEdgePx = shortEdge,
+                    isLandscape = false,
+                    outerMarginPx = outerMargin,
+                    topMarginPx = topMargin,
+                    bottomMarginPx = bottomMargin,
+                    gapPx = gap,
+                    contentPaddingHorizontalPx = contentPaddingHorizontal,
+                    contentPaddingVerticalPx = contentPaddingVertical,
+                    coverSizePx = coverSize,
+                    maxTextWidthPx = maxTextWidth,
+                    maxTextHeightPx = maxTextHeight,
+                    minReadableTextHeightPx = minReadableTextHeight,
+                    minLandscapeTextWidthPx = minLandscapeTextWidth
+                )
+            }
         }
     }
     
@@ -451,9 +559,9 @@ class MainActivity : Activity() {
         stateLock.withLock {
             val oldState = currentState.get()
             val snapshotState = oldState.copy(
-                trackText = if (::trackText.isInitialized) trackText.text.toString() else oldState.trackText,
-                artistText = if (::artistText.isInitialized) artistText.text.toString() else oldState.artistText,
-                albumText = if (::albumText.isInitialized) albumText.text.toString() else oldState.albumText,
+                trackText = oldState.trackText,
+                artistText = oldState.artistText,
+                albumText = oldState.albumText,
                 statusText = if (::statusText.isInitialized) statusText.text.toString() else oldState.statusText,
                 albumBitmap = if (::albumArtView.isInitialized) getCurrentAlbumBitmap() else oldState.albumBitmap,
                 timestamp = System.currentTimeMillis()
@@ -488,6 +596,249 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun applyMetadataTextPalette(palette: TrackTextPalette) {
+        if (palette == currentTrackTextPalette) {
+            return
+        }
+
+        currentTrackTextPalette = palette
+        if (::trackTextSceneView.isInitialized) {
+            trackTextSceneView.setPalette(palette)
+        }
+    }
+
+    private fun applyStatusTextColor() {
+        if (::statusText.isInitialized) {
+            statusText.setTextColor(STATUS_OVERLAY_TEXT_COLOR)
+        }
+    }
+
+    private fun resetMetadataLayoutBudget(layoutSpec: LayoutSpec) {
+        metadataWidthBudgetPx = layoutSpec.maxTextWidthPx
+        metadataHeightBudgetPx = layoutSpec.maxTextHeightPx
+    }
+
+    private fun resolveMetadataContainerGroup(): ViewGroup? {
+        return resolveMetadataContainerView() as? ViewGroup
+    }
+
+    private fun applyStableMetadataContainerWidth(scene: TrackTextScene?) {
+        if (!::screenAdapter.isInitialized || screenAdapter.isLandscape) {
+            return
+        }
+
+        val container = resolveMetadataContainerGroup() ?: return
+        val layoutParams = container.layoutParams as? RelativeLayout.LayoutParams ?: return
+        val maxWidth = screenAdapter.layoutSpec.maxTextWidthPx
+        val horizontalPadding = container.paddingLeft + container.paddingRight
+        val desiredWidth = when {
+            scene == null -> maxWidth
+            else -> (scene.contentWidthPx + horizontalPadding).coerceIn(horizontalPadding, maxWidth)
+        }
+
+        if (layoutParams.width != desiredWidth) {
+            layoutParams.width = desiredWidth
+            container.layoutParams = layoutParams
+        }
+    }
+
+    private fun freezeMetadataContainerWidthForTransition(
+        sourceScene: TrackTextScene,
+        targetScene: TrackTextScene
+    ) {
+        if (!::screenAdapter.isInitialized || screenAdapter.isLandscape) {
+            return
+        }
+
+        val container = resolveMetadataContainerGroup() ?: return
+        val layoutParams = container.layoutParams as? RelativeLayout.LayoutParams ?: return
+        val maxWidth = screenAdapter.layoutSpec.maxTextWidthPx
+        val horizontalPadding = container.paddingLeft + container.paddingRight
+        val frozenWidth = (
+            maxOf(sourceScene.contentWidthPx, targetScene.contentWidthPx) + horizontalPadding
+            ).coerceIn(horizontalPadding, maxWidth)
+
+        if (layoutParams.width != frozenWidth) {
+            layoutParams.width = frozenWidth
+            container.layoutParams = layoutParams
+        }
+    }
+
+    private fun measureTrackTextScene(
+        state: TrackState = currentState.get(),
+        persistAsLastMeasured: Boolean = true
+    ): TrackTextScene? {
+        val input = prepareTrackTextLayoutInput(state) ?: return null
+        val plan = trackTextLayoutPolicy.resolve(input)
+        val scene = trackTextLayoutEngine.measure(
+            plan = plan,
+            palette = currentTrackTextPalette
+        )
+        if (persistAsLastMeasured) {
+            lastMeasuredTrackTextScene = scene
+        }
+        return scene
+    }
+
+    private fun renderTrackTextScene(
+        state: TrackState = currentState.get(),
+        reason: String
+    ): Boolean {
+        if (!::trackTextSceneView.isInitialized || trackTextSceneView.parent == null) {
+            return false
+        }
+        if (trackTextSceneView.isTransitionRunning()) {
+            logDebug("Track text scene render deferred during transition: reason=$reason")
+            return false
+        }
+        val scene = measureTrackTextScene(state) ?: run {
+            trackTextSceneView.clearScene()
+            return false
+        }
+        trackTextSceneView.setScene(scene)
+        applyStableMetadataContainerWidth(scene)
+        logDebug(
+            "Track text scene rendered: reason=$reason " +
+                "width_px=${scene.bounds.widthPx} height_px=${scene.contentHeightPx}"
+        )
+        return true
+    }
+
+    private fun prepareTrackTextSceneTransition(
+        session: TransitionAnimationSession,
+        motion: DirectionalMotion
+    ): Boolean {
+        if (!::trackTextSceneView.isInitialized || trackTextSceneView.parent == null) {
+            return false
+        }
+
+        val sourceScene = lastMeasuredTrackTextScene ?: measureTrackTextScene(currentState.get()) ?: return false
+        val targetState = currentState.get().withMetadata(session.targetTrack)
+        val targetScene = measureTrackTextScene(
+            state = targetState,
+            persistAsLastMeasured = false
+        ) ?: return false
+        freezeMetadataContainerWidthForTransition(sourceScene, targetScene)
+        val transitionState = TrackTextSceneTransitionState(
+            sourceScene = sourceScene,
+            targetScene = targetScene,
+            fieldOrder = motion.cascade.map { it.toTrackTextField() },
+            directionVector = motion.vector,
+            shiftPx = resolveTrackTextTransitionShiftPx(session.phase),
+            outAlpha = TrackTransitionDesignTokens.TextTransition.OUT_ALPHA
+        )
+        trackTextSceneView.startTransition(transitionState)
+        return true
+    }
+
+    private fun updateTrackTextSceneTransitionProgress(progress: Float) {
+        if (!::trackTextSceneView.isInitialized) {
+            return
+        }
+        trackTextSceneView.setTransitionProgress(progress)
+    }
+
+    private fun completeTrackTextSceneTransition() {
+        if (!::trackTextSceneView.isInitialized) {
+            return
+        }
+        trackTextSceneView.finishTransition()
+        lastMeasuredTrackTextScene = measureTrackTextScene(currentState.get())
+        applyStableMetadataContainerWidth(lastMeasuredTrackTextScene)
+    }
+
+    private fun cancelTrackTextSceneTransition(useTargetScene: Boolean) {
+        if (!::trackTextSceneView.isInitialized) {
+            return
+        }
+        trackTextSceneView.cancelTransition(useTargetScene)
+        applyStableMetadataContainerWidth(lastMeasuredTrackTextScene)
+    }
+
+    private fun TextCascadeField.toTrackTextField(): TrackTextField {
+        return when (this) {
+            TextCascadeField.TRACK -> TrackTextField.TITLE
+            TextCascadeField.ARTIST -> TrackTextField.ARTIST
+            TextCascadeField.ALBUM -> TrackTextField.ALBUM
+        }
+    }
+
+    private fun resolveTrackTextTransitionShiftPx(phase: UiPhase): Float {
+        val shiftDp = if (phase == UiPhase.ROLLING_BACK) {
+            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_ROLLBACK_DP
+        } else {
+            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_DP
+        }
+        return shiftDp.dpToPx().toFloat()
+    }
+
+    private fun prepareTrackTextLayoutInput(
+        state: TrackState = currentState.get()
+    ): TrackTextLayoutPolicyInput? {
+        if (!::screenAdapter.isInitialized) {
+            return null
+        }
+
+        val availableBounds = resolveTrackTextAvailableBounds()
+        if (availableBounds.widthPx <= 0 || availableBounds.heightPx <= 0) {
+            return null
+        }
+
+        return TrackTextLayoutPolicyInput(
+            title = state.trackText,
+            artist = state.artistText,
+            album = state.albumText,
+            screenMetrics = TrackTextScreenMetrics(
+                widthPx = screenAdapter.screenWidth,
+                heightPx = screenAdapter.screenHeight,
+                density = screenAdapter.density,
+                shortEdgePx = screenAdapter.shortEdge,
+                orientation = if (screenAdapter.isLandscape) {
+                    TrackTextOrientation.LANDSCAPE
+                } else {
+                    TrackTextOrientation.PORTRAIT
+                }
+            ),
+            availableBounds = availableBounds
+        )
+    }
+
+    private fun resolveTrackTextAvailableBounds(): TrackTextBounds {
+        if (!::screenAdapter.isInitialized) {
+            return TrackTextBounds(widthPx = 0, heightPx = 0)
+        }
+
+        val layoutSpec = screenAdapter.layoutSpec
+        val container = resolveMetadataContainerView()
+        val containerWidthPx = container?.width?.takeIf { it > 0 }?.let {
+            (it - container.paddingLeft - container.paddingRight).coerceAtLeast(0)
+        }
+        val containerHeightPx = container?.height?.takeIf { it > 0 }?.let {
+            (it - container.paddingTop - container.paddingBottom).coerceAtLeast(0)
+        }
+        val widthBudget = metadataWidthBudgetPx.takeIf { it > 0 } ?: layoutSpec.maxTextWidthPx
+        val heightBudget = metadataHeightBudgetPx.takeIf { it > 0 } ?: layoutSpec.maxTextHeightPx
+        val resolvedWidth = widthBudget
+            .takeIf { it > 0 }
+            ?: containerWidthPx
+            ?: layoutSpec.maxTextWidthPx
+        val resolvedHeight = containerHeightPx
+            ?.let { minOf(heightBudget, it) }
+            ?: heightBudget
+
+        return TrackTextBounds(
+            widthPx = resolvedWidth,
+            heightPx = resolvedHeight
+        )
+    }
+
+    private fun resolveMetadataContainerView(): View? {
+        return when {
+            ::trackTextSceneView.isInitialized && trackTextSceneView.parent is View -> trackTextSceneView.parent as View
+            else -> null
+        }
+    }
+
     private fun nextRequestId(): Int {
         // 请求可能从多个协程并发发出，使用原子递增保证 Request-Id 唯一，
         // 避免响应关联到错误请求。
@@ -517,9 +868,7 @@ class MainActivity : Activity() {
 
     private fun renderState(state: TrackState) {
         if (::statusText.isInitialized) statusText.text = state.statusText
-        if (::trackText.isInitialized) trackText.text = state.trackText
-        if (::artistText.isInitialized) artistText.text = state.artistText
-        if (::albumText.isInitialized) albumText.text = state.albumText
+        renderMetadataState(state, reason = "render_state")
 
         if (::albumArtView.isInitialized) {
             if (state.albumBitmap != null) {
@@ -537,19 +886,17 @@ class MainActivity : Activity() {
             return
         }
         stateLock.withLock {
-            val newState = currentState.get().copy(
-                trackText = track,
-                artistText = artist,
-                albumText = album,
-                timestamp = System.currentTimeMillis()
-            )
+            val newState = currentState.get().withMetadata(track, artist, album)
             currentState.set(newState)
-
-            if (::trackText.isInitialized) trackText.text = track
-            if (::artistText.isInitialized) artistText.text = artist
-            if (::albumText.isInitialized) albumText.text = album
-            
+            renderMetadataState(newState, reason = "update_track_info")
         }
+    }
+
+    private fun renderMetadataState(
+        state: TrackState,
+        reason: String
+    ): Boolean {
+        return renderTrackTextScene(state, reason)
     }
     
     private fun updateAlbumImage(bitmap: Bitmap?, imageUri: String? = null) {
@@ -705,8 +1052,10 @@ class MainActivity : Activity() {
     }
 
     private fun applyTrackBinding(track: TransitionTrack) {
-        updateTrackInfo(track.title, track.artist, track.album)
-        lastRenderedTransitionTrackId = track.id
+        val renderState = currentState.get().withMetadata(track)
+        if (renderMetadataState(renderState, reason = "apply_track_binding")) {
+            lastRenderedTransitionTrackId = track.id
+        }
     }
 
     private fun commitTrackStateOnly(track: TransitionTrack) {
@@ -715,12 +1064,7 @@ class MainActivity : Activity() {
             return
         }
         stateLock.withLock {
-            val newState = currentState.get().copy(
-                trackText = track.title,
-                artistText = track.artist,
-                albumText = track.album,
-                timestamp = System.currentTimeMillis()
-            )
+            val newState = currentState.get().withMetadata(track)
             currentState.set(newState)
         }
     }
@@ -864,9 +1208,7 @@ class MainActivity : Activity() {
     }
     
     private lateinit var statusText: TextView
-    private lateinit var trackText: TextView
-    private lateinit var artistText: TextView
-    private lateinit var albumText: TextView
+    private lateinit var trackTextSceneView: TrackTextSceneView
     private lateinit var albumArtView: ImageView
     private lateinit var trackTransitionChoreographer: com.example.roonplayer.state.transition.TrackTransitionChoreographer
 
@@ -949,6 +1291,8 @@ class MainActivity : Activity() {
     private var autoReconnectAttempted = false
     private val pairedCores = ConcurrentHashMap<String, PairedCoreInfo>()
     private var statusOverlayContainer: View? = null
+    private var metadataWidthBudgetPx: Int = 0
+    private var metadataHeightBudgetPx: Int = 0
     private var lastHealthyConnectionAtMs: Long = 0L
     private val statusOverlayDisconnectGraceMs: Long = 5_000L
     private var discoveryStartedAtMs: Long = 0L
@@ -1000,10 +1344,9 @@ class MainActivity : Activity() {
     private var isTrackTransitionAnimating = false
     private var activeTransitionSession: TransitionAnimationSession? = null
     private var activeTrackTransitionAnimator: AnimatorSet? = null
-    private var activeTextTransitionAnimator: AnimatorSet? = null
+    private var activeTextTransitionAnimator: Animator? = null
     private var activePaletteAnimator: ValueAnimator? = null
     private var activeRollbackTintAnimator: ValueAnimator? = null
-    private val activeTextFieldAnimators = mutableListOf<Animator>()
     private var lastRenderedTransitionTrackId: String? = null
     private var touchSlopPx = 0f
     private var isCoverDragArmed = false
@@ -1045,6 +1388,10 @@ class MainActivity : Activity() {
     private val coverArtDisplayManager = CoverArtDisplayManager()
     private val artWallManager = ArtWallManager()
     private val layoutOrchestrator = LayoutOrchestrator()
+    private val trackTextLayoutPolicy = TrackTextLayoutPolicy()
+    private val trackTextLayoutEngine = AndroidTrackTextLayoutEngine()
+    private var currentTrackTextPalette = TrackTextPalette.defaultDark()
+    private var lastMeasuredTrackTextScene: TrackTextScene? = null
     private val paletteManager = PaletteManager(object : PaletteManager.Delegate {
         override fun logDebug(message: String) {
             this@MainActivity.logDebug(message)
@@ -1075,9 +1422,7 @@ class MainActivity : Activity() {
 
         override fun detachReusableViews() {
             if (::albumArtView.isInitialized) detachFromParent(albumArtView)
-            if (::trackText.isInitialized) detachFromParent(trackText)
-            if (::artistText.isInitialized) detachFromParent(artistText)
-            if (::albumText.isInitialized) detachFromParent(albumText)
+            if (::trackTextSceneView.isInitialized) detachFromParent(trackTextSceneView)
             if (::statusText.isInitialized) detachFromParent(statusText)
         }
 
@@ -1653,9 +1998,14 @@ class MainActivity : Activity() {
             albumArtView = createAlbumArtView()
         }
         
-        if (!::trackText.isInitialized || !::artistText.isInitialized || !::albumText.isInitialized || !::statusText.isInitialized) {
-            logWarning("⚠️ Some TextViews not initialized, creating them")
-            createTextViews()
+        if (!::statusText.isInitialized) {
+            logWarning("⚠️ statusText not initialized, creating it")
+            createStatusTextView()
+        }
+
+        if (!::trackTextSceneView.isInitialized) {
+            logWarning("⚠️ trackTextSceneView not initialized, creating it")
+            ensureTrackTextSceneViewInitialized()
         }
     }
     
@@ -1970,10 +2320,6 @@ class MainActivity : Activity() {
             albumArtView = albumArtView,
             nextPreviewImageView = nextPreviewImageView,
             previousPreviewImageView = previousPreviewImageView,
-            trackText = if (::trackText.isInitialized) trackText else null,
-            artistText = if (::artistText.isInitialized) artistText else null,
-            albumText = if (::albumText.isInitialized) albumText else null,
-            mainLayout = mainLayout,
             delegate = object : com.example.roonplayer.state.transition.ChoreographerDelegate {
                 override fun onTrackSkipRequested(direction: com.example.roonplayer.state.transition.TrackSkipRequestDirection) {
                     when (direction) {
@@ -1984,9 +2330,19 @@ class MainActivity : Activity() {
                 override fun resolveLeftDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveLeftDragPreviewBitmap()
                 override fun resolveRightDragPreviewBitmap(): Bitmap? = this@MainActivity.resolveRightDragPreviewBitmap()
                 override fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable? = this@MainActivity.resolveCurrentAlbumPreviewDrawable()
-                override fun applyTrackBinding(track: com.example.roonplayer.state.transition.TransitionTrack) { this@MainActivity.applyTrackBinding(track) }
-                override fun commitTrackStateOnly(track: com.example.roonplayer.state.transition.TransitionTrack) { this@MainActivity.commitTrackStateOnly(track) }
-                override fun resolveTextForField(track: com.example.roonplayer.state.transition.TransitionTrack, field: com.example.roonplayer.state.transition.TextCascadeField): String = this@MainActivity.resolveTextForField(track, field)
+                override fun prepareTrackTextSceneTransition(
+                    session: com.example.roonplayer.state.transition.TransitionAnimationSession,
+                    motion: com.example.roonplayer.state.transition.DirectionalMotion
+                ): Boolean = this@MainActivity.prepareTrackTextSceneTransition(session, motion)
+                override fun updateTrackTextSceneTransitionProgress(progress: Float) {
+                    this@MainActivity.updateTrackTextSceneTransitionProgress(progress)
+                }
+                override fun completeTrackTextSceneTransition() {
+                    this@MainActivity.completeTrackTextSceneTransition()
+                }
+                override fun cancelTrackTextSceneTransition(useTargetScene: Boolean) {
+                    this@MainActivity.cancelTrackTextSceneTransition(useTargetScene)
+                }
             },
             touchSlopPx = touchSlopPx,
             screenWidth = screenAdapter.screenWidth
@@ -2011,14 +2367,26 @@ class MainActivity : Activity() {
             logDebug("♻️ Reusing existing albumArtView")
         }
         
-        // 初始化或复用TextViews
-        if (!::trackText.isInitialized || !::artistText.isInitialized || !::albumText.isInitialized || !::statusText.isInitialized) {
-            logDebug("📝 Creating new TextViews")
-            createTextViews()
+        if (!::statusText.isInitialized) {
+            logDebug("📝 Creating status text view")
+            createStatusTextView()
         } else {
-            logDebug("♻️ Reusing existing TextViews")
-            updateTextViewProperties()
+            logDebug("♻️ Reusing status text view")
         }
+        ensureTrackTextSceneViewInitialized()
+    }
+
+    private fun ensureTrackTextSceneViewInitialized() {
+        if (::trackTextSceneView.isInitialized) {
+            return
+        }
+        trackTextSceneView = TrackTextSceneView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        trackTextSceneView.setPalette(currentTrackTextPalette)
     }
     
     private fun removeExistingViews() {
@@ -2027,21 +2395,10 @@ class MainActivity : Activity() {
             (albumArtView.parent as? ViewGroup)?.removeView(albumArtView)
             logDebug("🗑️ Removed albumArtView from parent")
         }
-        
-        // 移除textViews
-        if (::trackText.isInitialized && trackText.parent != null) {
-            (trackText.parent as? ViewGroup)?.removeView(trackText)
-            logDebug("🗑️ Removed trackText from parent")
-        }
-        
-        if (::artistText.isInitialized && artistText.parent != null) {
-            (artistText.parent as? ViewGroup)?.removeView(artistText)
-            logDebug("🗑️ Removed artistText from parent")
-        }
-        
-        if (::albumText.isInitialized && albumText.parent != null) {
-            (albumText.parent as? ViewGroup)?.removeView(albumText)
-            logDebug("🗑️ Removed albumText from parent")
+
+        if (::trackTextSceneView.isInitialized && trackTextSceneView.parent != null) {
+            (trackTextSceneView.parent as? ViewGroup)?.removeView(trackTextSceneView)
+            logDebug("🗑️ Removed trackTextSceneView from parent")
         }
 
         if (::statusText.isInitialized && statusText.parent != null) {
@@ -2159,6 +2516,7 @@ class MainActivity : Activity() {
             maxWidth = (screenAdapter.screenWidth - margin * 2).coerceAtLeast(0)
             setPadding(0, 0, 0, 0)
         }
+        applyStatusTextColor()
 
         val overlayBackground = GradientDrawable().apply {
             setColor(0x66000000.toInt()) // semi-transparent scrim for readability
@@ -2241,55 +2599,34 @@ class MainActivity : Activity() {
             container.bringToFront()
         }
     }
-    
-    private fun updateTextViewProperties() {
-        // 使用智能响应式字体，确保完整显示
-        val titleSize = screenAdapter.getResponsiveFontSize(32, TextElement.TITLE)
-        val subtitleSize = screenAdapter.getResponsiveFontSize(28, TextElement.SUBTITLE)
-        val captionSize = screenAdapter.getResponsiveFontSize(24, TextElement.CAPTION)
-        
-        trackText.apply {
-            textSize = titleSize
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_TITLE
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
-            logDebug("Track text size: ${titleSize}sp")
-        }
-        
-        artistText.apply {
-            textSize = subtitleSize
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_ARTIST
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
-            logDebug("Artist text size: ${subtitleSize}sp")
-        }
-        
-        albumText.apply {
-            textSize = captionSize
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_ALBUM
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = if (isLandscape()) android.view.Gravity.START else android.view.Gravity.CENTER
-            letterSpacing = UIDesignTokens.TEXT_LETTER_SPACING_ALBUM
-            logDebug("Album text size: ${captionSize}sp")
-        }
-        
-        logDebug("📝 Updated TextView properties with intelligent responsive fonts - Density: ${screenAdapter.density}, Screen: ${screenAdapter.screenWidth}x${screenAdapter.screenHeight}")
+
+    private fun createPortraitBottomGradientBackground(): GradientDrawable {
+        return GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
+                Color.TRANSPARENT,
+                0x14000000,
+                0x38000000
+            )
+        )
     }
     
     private fun applyPortraitLayout() {
         logDebug("📱 Applying portrait layout parameters - Optimized for distance viewing")
         
         try {
-            // Use screen adapter for responsive design
-            val (imageWidth, imageHeight) = screenAdapter.getOptimalImageSize()
-            val (textAreaWidth, textAreaHeight) = screenAdapter.getTextAreaSize()
-            val responsiveMargin = screenAdapter.getResponsiveMargin()
-            val safeAreaTop = (screenAdapter.screenHeight * 0.05).toInt() // Reduced from 144px to 5%
-            val spacingBelowCover = responsiveMargin
+            val layoutSpec = screenAdapter.layoutSpec
+            resetMetadataLayoutBudget(layoutSpec)
+            val coverSize = layoutSpec.coverSizePx
+            val margin = layoutSpec.outerMarginPx
+            val topMargin = layoutSpec.topMarginPx
+            val bottomMargin = layoutSpec.bottomMarginPx
+            val gap = layoutSpec.gapPx
+
+            logDebug(
+                "Portrait layout - cover=${coverSize}px text_budget=${layoutSpec.maxTextWidthPx}x${layoutSpec.maxTextHeightPx}"
+            )
             
-            logDebug("Portrait layout - Image: ${imageWidth}x${imageHeight}, Text area: ${textAreaWidth}x${textAreaHeight}")
-            
-            // 创建封面容器 - 图片占比最大化
             val coverContainer = RelativeLayout(this).apply {
                 id = View.generateViewId()
                 layoutParams = RelativeLayout.LayoutParams(
@@ -2297,75 +2634,68 @@ class MainActivity : Activity() {
                     RelativeLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
                     addRule(RelativeLayout.ALIGN_PARENT_TOP)
-                    setMargins(responsiveMargin, safeAreaTop, responsiveMargin, spacingBelowCover)
+                    setMargins(margin, topMargin, margin, gap)
                 }
             }
             
-            // 确保albumArtView已初始化
             if (!::albumArtView.isInitialized) {
                 logError("❌ albumArtView not initialized in applyPortraitLayout")
                 return
             }
             
-            // 设置albumArtView布局参数 - 85%屏幕宽度，最大化图片显示
-            albumArtView.layoutParams = RelativeLayout.LayoutParams(imageWidth, imageHeight).apply {
+            albumArtView.layoutParams = RelativeLayout.LayoutParams(coverSize, coverSize).apply {
                 addRule(RelativeLayout.CENTER_HORIZONTAL)
             }
             
             coverContainer.addView(albumArtView)
-            
-            // 创建分隔线 - 使用响应式尺寸，不再限制文本容器高度
-            val separator = android.view.View(this).apply {
-                id = View.generateViewId()
+
+            val gradientHeight = maxOf(
+                layoutSpec.maxTextHeightPx + (layoutSpec.contentPaddingVerticalPx * 2) + bottomMargin,
+                (screenAdapter.screenHeight * 0.24f).toInt()
+            )
+            val bottomGradientView = View(this).apply {
                 layoutParams = RelativeLayout.LayoutParams(
-                    (screenAdapter.screenWidth * 0.6).toInt(),
-                    6 // 增加分隔线高度以适应远距离观看
+                    RelativeLayout.LayoutParams.MATCH_PARENT,
+                    gradientHeight
+                ).apply {
+                    addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
+                }
+                background = createPortraitBottomGradientBackground()
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+
+            val textContainer = LinearLayout(this).apply {
+                id = View.generateViewId()
+                tag = METADATA_CONTAINER_TAG
+                orientation = LinearLayout.VERTICAL
+                layoutParams = RelativeLayout.LayoutParams(
+                    layoutSpec.maxTextWidthPx,
+                    RelativeLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
                     addRule(RelativeLayout.BELOW, coverContainer.id)
                     addRule(RelativeLayout.CENTER_HORIZONTAL)
-                    setMargins(0, responsiveMargin / 2, 0, responsiveMargin / 2)
-                }
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    orientation = android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT
-                    colors = intArrayOf(
-                        android.graphics.Color.TRANSPARENT,
-                        (currentDominantColor and 0x00FFFFFF) or 0x60000000,
-                        android.graphics.Color.TRANSPARENT
-                    )
-                    cornerRadius = 8f
-                }
-            }
-            
-            // 创建文字容器 - 使用WRAP_CONTENT自适应高度
-            val textContainer = LinearLayout(this).apply {
-                id = View.generateViewId()
-                orientation = LinearLayout.VERTICAL
-                layoutParams = RelativeLayout.LayoutParams(
-                    textAreaWidth,
-                    RelativeLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    addRule(RelativeLayout.BELOW, separator.id)
-                    addRule(RelativeLayout.CENTER_HORIZONTAL)
-                    setMargins(responsiveMargin, 0, responsiveMargin, responsiveMargin)
+                    setMargins(margin, 0, margin, bottomMargin)
                 }
                 gravity = android.view.Gravity.CENTER_HORIZONTAL
-                setPadding(responsiveMargin, responsiveMargin / 2, responsiveMargin, responsiveMargin / 2)
+                background = null
+                setPadding(
+                    layoutSpec.contentPaddingHorizontalPx,
+                    layoutSpec.contentPaddingVerticalPx,
+                    layoutSpec.contentPaddingHorizontalPx,
+                    layoutSpec.contentPaddingVerticalPx
+                )
             }
             
-            // 确保TextViews已初始化并添加到容器
-            if (::trackText.isInitialized && ::artistText.isInitialized && ::albumText.isInitialized) {
-                textContainer.addView(trackText)
-                textContainer.addView(artistText)
-                textContainer.addView(albumText)
-                updateTextViewProperties() // 更新属性以适应当前方向
+            ensureTrackTextSceneViewInitialized()
+            textContainer.addView(trackTextSceneView)
+            if (!trackTextSceneView.isTransitionRunning()) {
+                renderTrackTextScene(currentState.get(), reason = "portrait_layout")
             } else {
-                logError("❌ Some TextViews not initialized in applyPortraitLayout")
-                return
+                trackTextSceneView.invalidate()
             }
             
-            // 添加到主布局
             mainLayout.addView(coverContainer)
-            mainLayout.addView(separator)
+            mainLayout.addView(bottomGradientView)
             mainLayout.addView(textContainer)
             
             logDebug("✅ Portrait layout applied successfully")
@@ -2380,57 +2710,57 @@ class MainActivity : Activity() {
         logDebug("🖥️ Applying landscape layout parameters - Optimized for distance viewing")
         
         try {
-            // Use screen adapter for responsive design
-            val (imageWidth, imageHeight) = screenAdapter.getOptimalImageSize()
-            val (textAreaWidth, textAreaHeight) = screenAdapter.getTextAreaSize()
-            val responsiveMargin = screenAdapter.getResponsiveMargin()
-            val gap = responsiveMargin
+            val layoutSpec = screenAdapter.layoutSpec
+            resetMetadataLayoutBudget(layoutSpec)
+            val coverSize = layoutSpec.coverSizePx
+            val margin = layoutSpec.outerMarginPx
+            val gap = layoutSpec.gapPx
+
+            logDebug(
+                "Landscape layout - cover=${coverSize}px text_budget=${layoutSpec.maxTextWidthPx}x${layoutSpec.maxTextHeightPx}"
+            )
             
-            logDebug("Landscape layout - Image: ${imageWidth}x${imageHeight}, Text area: ${textAreaWidth}x${textAreaHeight}")
-            
-            // 确保albumArtView已初始化
             if (!::albumArtView.isInitialized) {
                 logError("❌ albumArtView not initialized in applyLandscapeLayout")
                 return
             }
             
-            // 设置albumArtView布局参数 - 65%屏幕宽度，稍微右移以平衡布局
-            albumArtView.layoutParams = RelativeLayout.LayoutParams(imageWidth, imageHeight).apply {
+            albumArtView.layoutParams = RelativeLayout.LayoutParams(coverSize, coverSize).apply {
                 addRule(RelativeLayout.ALIGN_PARENT_LEFT)
                 addRule(RelativeLayout.CENTER_VERTICAL)
-                setMargins(responsiveMargin * 3, responsiveMargin, gap, responsiveMargin)
+                setMargins(margin, layoutSpec.topMarginPx, gap, layoutSpec.bottomMarginPx)
             }
             
-            // 创建文字容器 - 32%屏幕宽度，保持左右分栏布局
             val textContainer = LinearLayout(this).apply {
                 id = View.generateViewId()
-                tag = "text_container"
+                tag = METADATA_CONTAINER_TAG
                 orientation = LinearLayout.VERTICAL
                 layoutParams = RelativeLayout.LayoutParams(
-                    textAreaWidth,
-                    textAreaHeight
+                    layoutSpec.maxTextWidthPx,
+                    RelativeLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
                     addRule(RelativeLayout.RIGHT_OF, albumArtView.id)
                     addRule(RelativeLayout.CENTER_VERTICAL)
-                    setMargins(0, responsiveMargin, responsiveMargin, responsiveMargin)
+                    setMargins(0, layoutSpec.topMarginPx, margin, layoutSpec.bottomMarginPx)
                 }
-                setPadding(responsiveMargin, responsiveMargin, responsiveMargin, responsiveMargin)
+                setPadding(
+                    layoutSpec.contentPaddingHorizontalPx,
+                    layoutSpec.contentPaddingVerticalPx,
+                    layoutSpec.contentPaddingHorizontalPx,
+                    layoutSpec.contentPaddingVerticalPx
+                )
                 background = null
                 gravity = android.view.Gravity.CENTER_VERTICAL
             }
             
-            // 确保TextViews已初始化并添加到容器
-            if (::trackText.isInitialized && ::artistText.isInitialized && ::albumText.isInitialized) {
-                textContainer.addView(trackText)
-                textContainer.addView(artistText)
-                textContainer.addView(albumText)
-                updateTextViewProperties() // 更新属性以适应当前方向
+            ensureTrackTextSceneViewInitialized()
+            textContainer.addView(trackTextSceneView)
+            if (!trackTextSceneView.isTransitionRunning()) {
+                renderTrackTextScene(currentState.get(), reason = "landscape_layout")
             } else {
-                logError("❌ Some TextViews not initialized in applyLandscapeLayout")
-                return
+                trackTextSceneView.invalidate()
             }
             
-            // 添加到主布局
             mainLayout.addView(albumArtView)
             mainLayout.addView(textContainer)
             
@@ -2443,63 +2773,16 @@ class MainActivity : Activity() {
     }
     
     
-    private fun createTextViews() {
+    private fun createStatusTextView() {
         statusText = TextView(this).apply {
             text = "Not connected to Roon"
             textSize = 14f
-            setTextColor(0xFF999999.toInt())
+            setTextColor(STATUS_OVERLAY_TEXT_COLOR)
             setPadding(0, 0, 0, 20)
             alpha = 0.8f
         }
-        
-        trackText = TextView(this).apply {
-            text = "Nothing playing"
-            // 智能响应式字体：确保完整显示
-            textSize = screenAdapter.getResponsiveFontSize(32, TextElement.TITLE)
-            setTextColor(0xFFffffff.toInt()) // 87% 不透明白色
-            alpha = 0.87f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD // Semibold效果
-            // 响应式间距
-            val responsivePadding = screenAdapter.getResponsiveMargin() / 3
-            setPadding(0, 0, 0, responsivePadding)
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_TITLE 
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            
-            gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
-                android.view.Gravity.START else android.view.Gravity.CENTER
-        }
-        
-        artistText = TextView(this).apply {
-            text = "Unknown artist"
-            // 智能响应式字体：确保完整显示
-            textSize = screenAdapter.getResponsiveFontSize(28, TextElement.SUBTITLE)
-            setTextColor(0xFFffffff.toInt()) // 60% 不透明度白色
-            alpha = 0.60f
-            typeface = android.graphics.Typeface.DEFAULT // Regular
-            // 响应式间距
-            val responsivePadding = screenAdapter.getResponsiveMargin() / 4
-            setPadding(0, 0, 0, responsivePadding)
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_ARTIST
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
-                android.view.Gravity.START else android.view.Gravity.CENTER
-        }
-        
-        albumText = TextView(this).apply {
-            text = "Unknown album"
-            // 智能响应式字体：确保完整显示
-            textSize = screenAdapter.getResponsiveFontSize(24, TextElement.CAPTION)
-            setTextColor(0xFFffffff.toInt()) // 60% 不透明度白色
-            alpha = 0.60f
-            typeface = android.graphics.Typeface.DEFAULT // Regular
-            letterSpacing = UIDesignTokens.TEXT_LETTER_SPACING_ALBUM
-            // 最后一个元素无底部间距
-            setPadding(0, 0, 0, 0)
-            maxLines = UIDesignTokens.TEXT_MAX_LINES_ALBUM
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 
-                android.view.Gravity.START else android.view.Gravity.CENTER
-        }
+
+        applyStatusTextColor()
     }
     
     
@@ -3156,10 +3439,9 @@ class MainActivity : Activity() {
                 paletteAnimator.addUpdateListener { animator ->
                     val animatedColor = animator.animatedValue as Int
                     colorDrawable.color = animatedColor
-                    paletteManager.updateTextColors(mainLayout, animatedColor)
-                    if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-                        updateScrimOpacity(calculateScrimOpacity(animatedColor))
-                    }
+                    applyMetadataTextPalette(
+                        paletteManager.createTrackTextPalette(animatedColor)
+                    )
                 }
                 paletteAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: android.animation.Animator) {
@@ -3225,28 +3507,6 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) {
             logWarning("Failed to update album art shadow: ${e.message}")
-        }
-    }
-    
-    private fun calculateScrimOpacity(backgroundColor: Int): Float {
-        // 统一基准：40%不透明度，根据对比度微调
-        val brightness = getBrightness(backgroundColor)
-        
-        return when {
-            brightness > 0.75f -> 0.48f // 亮色封面：稍微增加到48%
-            else -> 0.40f // 其他情况：统一40%不透明度
-        }
-    }
-    
-    private fun updateScrimOpacity(opacity: Float) {
-        try {
-            // 查找文字容器并更新其背景透明度
-            mainLayout.findViewWithTag<LinearLayout>("text_container")?.let { textContainer ->
-                val scrimColor = (0xFF000000.toInt() and 0x00FFFFFF) or ((opacity * 255).toInt() shl 24)
-                (textContainer.background as? android.graphics.drawable.GradientDrawable)?.setColor(scrimColor)
-            }
-        } catch (e: Exception) {
-            logWarning("Failed to update scrim opacity: ${e.message}")
         }
     }
     
@@ -4195,7 +4455,9 @@ class MainActivity : Activity() {
         activeTrackTransitionAnimator = null
         activeTextTransitionAnimator?.cancel()
         activeTextTransitionAnimator = null
-        cancelActiveTextAnimators()
+        if (::trackTransitionChoreographer.isInitialized) {
+            trackTransitionChoreographer.cancelOngoingAnimations()
+        }
         activeRollbackTintAnimator?.cancel()
         activeRollbackTintAnimator = null
         connectionGuard.finish()
@@ -6173,7 +6435,9 @@ class MainActivity : Activity() {
         activeTrackTransitionAnimator = null
         activeTextTransitionAnimator?.cancel()
         activeTextTransitionAnimator = null
-        cancelActiveTextAnimators()
+        if (::trackTransitionChoreographer.isInitialized) {
+            trackTransitionChoreographer.cancelOngoingAnimations()
+        }
         activeRollbackTintAnimator?.cancel()
         activeRollbackTintAnimator = null
         updateTrackInfo("Nothing playing", "Unknown artist", "Unknown album")
@@ -6871,29 +7135,10 @@ class MainActivity : Activity() {
             return
         }
         if (::trackTransitionChoreographer.isInitialized) {
-            trackTransitionChoreographer.animateTrackTransition(session, motion) {
-                if (isSessionActive(session)) {
-                    session.commitHandoffOnce {
-                        applyTrackBinding(session.targetTrack)
-                        commitTrackStateOnly(session.targetTrack)
-                    }
-                    dispatchTrackTransitionIntent(com.example.roonplayer.state.transition.TrackTransitionIntent.AnimationCompleted(session.key))
-                }
-                if (activeTransitionSession?.sessionId == session.sessionId) {
-                    activeTransitionSession = null
-                }
-            }
+            trackTransitionChoreographer.animateTrackTransition(session, motion) { }
             return
         }
         if (!::albumArtView.isInitialized || albumArtView.visibility != View.VISIBLE) {
-            if (isSessionActive(session)) {
-                session.commitHandoffOnce {
-                    applyTrackBinding(session.targetTrack)
-                    commitTrackStateOnly(session.targetTrack)
-                }
-                dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
-            }
-            activeTransitionSession = null
             return
         }
 
@@ -6946,16 +7191,6 @@ class MainActivity : Activity() {
                         isTrackTransitionAnimating = false
                         activeTrackTransitionAnimator = null
                         albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
-                        if (isSessionActive(session)) {
-                            session.commitHandoffOnce {
-                                applyTrackBinding(session.targetTrack)
-                                commitTrackStateOnly(session.targetTrack)
-                            }
-                            dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
-                        }
-                        if (activeTransitionSession?.sessionId == session.sessionId) {
-                            activeTransitionSession = null
-                        }
                     }
                 }
 
@@ -7048,16 +7283,6 @@ class MainActivity : Activity() {
                     isTrackTransitionAnimating = false
                     activeTrackTransitionAnimator = null
                     albumArtView.setLayerType(View.LAYER_TYPE_NONE, null)
-                    if (isSessionActive(session)) {
-                        session.commitHandoffOnce {
-                            applyTrackBinding(session.targetTrack)
-                            commitTrackStateOnly(session.targetTrack)
-                        }
-                        dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
-                    }
-                    if (activeTransitionSession?.sessionId == session.sessionId) {
-                        activeTransitionSession = null
-                    }
                 }
             }
 
@@ -7082,120 +7307,64 @@ class MainActivity : Activity() {
             return
         }
         if (::trackTransitionChoreographer.isInitialized) {
-            trackTransitionChoreographer.animateTrackTextTransition(session, motion) {}
+            trackTransitionChoreographer.animateTrackTextTransition(session, motion) {
+                if (isSessionActive(session)) {
+                    session.commitHandoffOnce {
+                        applyTrackBinding(session.targetTrack)
+                        commitTrackStateOnly(session.targetTrack)
+                    }
+                    dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
+                }
+                if (activeTransitionSession?.sessionId == session.sessionId) {
+                    activeTransitionSession = null
+                }
+            }
             return
         }
-        if (!::trackText.isInitialized || !::artistText.isInitialized || !::albumText.isInitialized) {
-            return
-        }
-
         activeTextTransitionAnimator?.cancel()
         activeTextTransitionAnimator = null
-        cancelActiveTextAnimators()
-
-        val baseOffsetDp = if (session.phase == UiPhase.ROLLING_BACK) {
-            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_ROLLBACK_DP
-        } else {
-            TrackTransitionDesignTokens.TextTransition.SLOT_SHIFT_DP
+        if (!prepareTrackTextSceneTransition(session, motion)) {
+            return
         }
-        val outOffset = baseOffsetDp.dpToPx().toFloat() * motion.vector
-        val inOffset = -outOffset
-
-        val exitInterpolator = PathInterpolator(
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X1,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y1,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X2,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y2
-        )
-        val enterInterpolator = PathInterpolator(
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X1,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y1,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X2,
-            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y2
-        )
-
-        motion.cascade.forEachIndexed { index, field ->
-            val view = resolveTextViewForField(field) ?: return@forEachIndexed
-            val delayMs = index * TrackTransitionDesignTokens.TextTransition.STAGGER_DELAY_MS
-            mainHandler.postDelayed({
-                if (!isSessionActive(session)) return@postDelayed
-                val outAnimator = AnimatorSet().apply {
-                    playTogether(
-                        ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, view.translationY, outOffset),
-                        ObjectAnimator.ofFloat(view, View.ALPHA, view.alpha, TrackTransitionDesignTokens.TextTransition.OUT_ALPHA)
-                    )
-                    duration = TrackTransitionDesignTokens.TextTransition.OUT_DURATION_MS
-                    interpolator = exitInterpolator
-                }
-                outAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        if (!isSessionActive(session)) return
-                        session.commitFieldOnce(field.name.lowercase()) {
+        val totalDurationMs =
+            TrackTransitionDesignTokens.TextTransition.OUT_DURATION_MS +
+                TrackTransitionDesignTokens.TextTransition.IN_DURATION_MS +
+                ((motion.cascade.size - 1).coerceAtLeast(0) * TrackTransitionDesignTokens.TextTransition.STAGGER_DELAY_MS)
+        lateinit var animator: ValueAnimator
+        animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = totalDurationMs
+            interpolator = AccelerateDecelerateInterpolator()
+            addUpdateListener { valueAnimator ->
+                updateTrackTextSceneTransitionProgress(valueAnimator.animatedValue as Float)
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (activeTextTransitionAnimator === animator) {
+                        activeTextTransitionAnimator = null
+                        completeTrackTextSceneTransition()
+                        if (isSessionActive(session)) {
                             session.commitHandoffOnce {
+                                applyTrackBinding(session.targetTrack)
                                 commitTrackStateOnly(session.targetTrack)
-                                lastRenderedTransitionTrackId = session.targetTrack.id
                             }
-                            view.text = resolveTextForField(session.targetTrack, field)
+                            dispatchTrackTransitionIntent(TrackTransitionIntent.AnimationCompleted(session.key))
                         }
-                        view.translationY = inOffset
-                        view.alpha = 0f
-                        val inAnimator = AnimatorSet().apply {
-                            playTogether(
-                                ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, inOffset, 0f),
-                                ObjectAnimator.ofFloat(view, View.ALPHA, 0f, 1f)
-                            )
-                            duration = TrackTransitionDesignTokens.TextTransition.IN_DURATION_MS
-                            interpolator = enterInterpolator
+                        if (activeTransitionSession?.sessionId == session.sessionId) {
+                            activeTransitionSession = null
                         }
-                        registerTextAnimator(inAnimator)
-                        inAnimator.start()
                     }
-                })
-                registerTextAnimator(outAnimator)
-                outAnimator.start()
-            }, delayMs.toLong())
+                }
+
+                override fun onAnimationCancel(animation: Animator) {
+                    if (activeTextTransitionAnimator === animator) {
+                        activeTextTransitionAnimator = null
+                        cancelTrackTextSceneTransition(useTargetScene = false)
+                    }
+                }
+            })
         }
-    }
-
-    private fun resolveTextViewForField(field: TextCascadeField): TextView? {
-        return when (field) {
-            TextCascadeField.TRACK -> if (::trackText.isInitialized) trackText else null
-            TextCascadeField.ARTIST -> if (::artistText.isInitialized) artistText else null
-            TextCascadeField.ALBUM -> if (::albumText.isInitialized) albumText else null
-        }
-    }
-
-    private fun resolveTextForField(
-        track: TransitionTrack,
-        field: TextCascadeField
-    ): String {
-        return when (field) {
-            TextCascadeField.TRACK -> track.title
-            TextCascadeField.ARTIST -> track.artist
-            TextCascadeField.ALBUM -> track.album
-        }
-    }
-
-    private fun registerTextAnimator(animator: Animator) {
-        activeTextFieldAnimators.add(animator)
-        animator.addListener(object : android.animation.AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                activeTextFieldAnimators.remove(animator)
-            }
-
-            override fun onAnimationCancel(animation: Animator) {
-                activeTextFieldAnimators.remove(animator)
-            }
-        })
-    }
-
-    private fun cancelActiveTextAnimators() {
-        if (activeTextFieldAnimators.isEmpty()) return
-        val snapshot = activeTextFieldAnimators.toList()
-        activeTextFieldAnimators.clear()
-        snapshot.forEach { animator ->
-            runCatching { animator.cancel() }
-        }
+        activeTextTransitionAnimator = animator
+        animator.start()
     }
 
     private fun animateRollbackTintCue() {
@@ -7557,7 +7726,9 @@ class MainActivity : Activity() {
         activeTrackTransitionAnimator = null
         activeTextTransitionAnimator?.cancel()
         activeTextTransitionAnimator = null
-        cancelActiveTextAnimators()
+        if (::trackTransitionChoreographer.isInitialized) {
+            trackTransitionChoreographer.cancelOngoingAnimations()
+        }
         activeRollbackTintAnimator?.cancel()
         activeRollbackTintAnimator = null
         

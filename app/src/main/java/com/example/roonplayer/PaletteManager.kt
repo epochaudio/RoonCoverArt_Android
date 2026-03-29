@@ -2,9 +2,7 @@ package com.example.roonplayer
 
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.view.View
-import android.view.ViewGroup
-import android.widget.TextView
+import com.example.roonplayer.ui.text.TrackTextPalette
 
 class PaletteManager(
     private val delegate: Delegate
@@ -56,16 +54,14 @@ class PaletteManager(
         }
     }
 
-    fun updateTextColors(rootView: View, backgroundColor: Int) {
-        try {
-            val textColor = getBestTextColor(backgroundColor)
-            updateTextViewColor(rootView, textColor)
-            delegate.logDebug(
-                "Text colors updated based on background: ${String.format("#%06X", backgroundColor and 0xFFFFFF)}, text color: ${String.format("#%06X", textColor and 0xFFFFFF)}"
-            )
-        } catch (e: Exception) {
-            delegate.logWarning("Failed to update text colors: ${e.message}")
-        }
+    fun createTrackTextPalette(backgroundColor: Int): TrackTextPalette {
+        return TrackTextPalette(
+            primaryTextColor = 0xFFFFFFFF.toInt(),
+            secondaryTextColor = 0xFFFFFFFF.toInt(),
+            captionTextColor = 0xFFFFFFFF.toInt(),
+            backgroundColor = backgroundColor,
+            shadowColor = 0x73000000.toInt()
+        )
     }
 
     fun calculateContrastRatio(color1: Int, color2: Int): Float {
@@ -127,16 +123,12 @@ class PaletteManager(
         }
     }
 
-    private fun updateTextViewColor(view: View, textColor: Int) {
-        when (view) {
-            is TextView -> {
-                view.setTextColor(textColor)
-            }
-            is ViewGroup -> {
-                for (i in 0 until view.childCount) {
-                    updateTextViewColor(view.getChildAt(i), textColor)
-                }
-            }
+    private fun resolveShadowColor(textColor: Int): Int {
+        val isLightText = calculateLuminance(textColor) > 0.5f
+        return if (isLightText) {
+            0x66000000.toInt()
+        } else {
+            0x33000000.toInt()
         }
     }
 

@@ -4,27 +4,18 @@ import android.animation.Animator
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
-import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.drawable.ColorDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
-import android.view.animation.DecelerateInterpolator
 import android.view.animation.PathInterpolator
 import android.widget.ImageView
-import android.widget.TextView
 import androidx.dynamicanimation.animation.DynamicAnimation
 import androidx.dynamicanimation.animation.SpringAnimation
 import androidx.dynamicanimation.animation.SpringForce
-import com.example.roonplayer.MainActivity
-import com.example.roonplayer.R
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 enum class TrackSkipRequestDirection { NEXT, PREVIOUS }
@@ -34,19 +25,16 @@ interface ChoreographerDelegate {
     fun resolveLeftDragPreviewBitmap(): Bitmap?
     fun resolveRightDragPreviewBitmap(): Bitmap?
     fun resolveCurrentAlbumPreviewDrawable(): android.graphics.drawable.Drawable?
-    fun applyTrackBinding(track: TransitionTrack)
-    fun commitTrackStateOnly(track: TransitionTrack)
-    fun resolveTextForField(track: TransitionTrack, field: TextCascadeField): String
+    fun prepareTrackTextSceneTransition(session: TransitionAnimationSession, motion: DirectionalMotion): Boolean
+    fun updateTrackTextSceneTransitionProgress(progress: Float)
+    fun completeTrackTextSceneTransition()
+    fun cancelTrackTextSceneTransition(useTargetScene: Boolean)
 }
 
 class TrackTransitionChoreographer(
     private val albumArtView: ImageView,
     private val nextPreviewImageView: ImageView,
     private val previousPreviewImageView: ImageView,
-    private val trackText: TextView?,
-    private val artistText: TextView?,
-    private val albumText: TextView?,
-    private val mainLayout: View,
     private val delegate: ChoreographerDelegate,
     private val touchSlopPx: Float,
     private val screenWidth: Int
@@ -64,8 +52,6 @@ class TrackTransitionChoreographer(
     // Tracking active transitions
     private var activeTrackTransitionAnimator: Animator? = null
     private var activeTextTransitionAnimator: Animator? = null
-    private val activeTextFieldAnimators = mutableSetOf<Animator>()
-    private var activeRollbackTintAnimator: ValueAnimator? = null
     var isTrackTransitionAnimating = false
         private set
 
@@ -286,27 +272,81 @@ class TrackTransitionChoreographer(
     // Architecture Transition Animators
     // -------------------------------------------------------------
 
-    fun animateTrackTransition(session: TransitionAnimationSession, motion: DirectionalMotion, onComplete: () -> Unit) {
-        val entryInterpolator = PathInterpolator(0.2f, 0.0f, 0.0f, 1.0f) // Soft Breathing
-        val shift = 160f * motion.vector // 60dp roughly
+    fun animateTrackTransition(
+        @Suppress("UNUSED_PARAMETER") session: TransitionAnimationSession,
+        motion: DirectionalMotion,
+        onComplete: () -> Unit
+    ) {
+        val exitInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.EXIT_Y2
+        )
+        val entryInterpolator = PathInterpolator(
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y1,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_X2,
+            TrackTransitionDesignTokens.CoverTransition.Interpolator.SOFT_SPRING_Y2
+        )
+        val shift = TrackTransitionDesignTokens.CoverTransition.SHIFT_DP * albumArtView.resources.displayMetrics.density * motion.vector
 
         val out = AnimatorSet().apply {
             playTogether(
-                ObjectAnimator.ofFloat(albumArtView, View.ALPHA, albumArtView.alpha, 0f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_X, albumArtView.scaleX, 0.9f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_Y, albumArtView.scaleY, 0.9f)
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.ALPHA,
+                    albumArtView.alpha,
+                    TrackTransitionDesignTokens.CoverTransition.OUT_ALPHA
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_X,
+                    albumArtView.scaleX,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_Y,
+                    albumArtView.scaleY,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.TRANSLATION_X,
+                    albumArtView.translationX,
+                    shift
+                )
             )
-            duration = 400
+            duration = TrackTransitionDesignTokens.CoverTransition.OUT_DURATION_MS
+            interpolator = exitInterpolator
         }
 
         val `in` = AnimatorSet().apply {
             playTogether(
-                ObjectAnimator.ofFloat(albumArtView, View.ALPHA, 0f, 1f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_X, 0.95f, 1.0f),
-                ObjectAnimator.ofFloat(albumArtView, View.SCALE_Y, 0.95f, 1.0f),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.ALPHA,
+                    TrackTransitionDesignTokens.CoverTransition.OUT_ALPHA,
+                    1f
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_X,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION,
+                    TrackTransitionDesignTokens.CoverTransition.RETURN_OVERSHOOT_SCALE,
+                    1.0f
+                ),
+                ObjectAnimator.ofFloat(
+                    albumArtView,
+                    View.SCALE_Y,
+                    TrackTransitionDesignTokens.CoverTransition.SCALE_DEPRESSION,
+                    TrackTransitionDesignTokens.CoverTransition.RETURN_OVERSHOOT_SCALE,
+                    1.0f
+                ),
                 ObjectAnimator.ofFloat(albumArtView, View.TRANSLATION_X, shift, 0f)
             )
-            duration = 600
+            duration = TrackTransitionDesignTokens.CoverTransition.IN_DURATION_MS
             interpolator = entryInterpolator
         }
 
@@ -325,60 +365,61 @@ class TrackTransitionChoreographer(
     }
 
     fun animateTrackTextTransition(session: TransitionAnimationSession, motion: DirectionalMotion, onComplete: () -> Unit) {
-        cancelActiveTextAnimators()
-        
-        val exitInterpolator = PathInterpolator(0.2f, 0.0f, 0.0f, 1.0f)
-        val inOffset = -30f * motion.vector
+        animateTrackTextSceneTransition(session, motion, onComplete)
+    }
 
-        // Text Cascade Implementation
-        motion.cascade.forEachIndexed { index, field ->
-            val view = resolveTextViewForField(field) ?: return@forEachIndexed
-            var delayMs = index * 45L // Cascading delays
+    private fun animateTrackTextSceneTransition(
+        session: TransitionAnimationSession,
+        motion: DirectionalMotion,
+        onComplete: () -> Unit
+    ) {
+        if (!delegate.prepareTrackTextSceneTransition(session, motion)) {
+            onComplete()
+            return
+        }
 
-            mainHandler.postDelayed({
-                val outAnimator = AnimatorSet().apply {
-                    playTogether(
-                        ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, view.translationY, -40f),
-                        ObjectAnimator.ofFloat(view, View.ALPHA, view.alpha, 0f)
-                    )
-                    duration = 350
-                    interpolator = exitInterpolator
+        activeTextTransitionAnimator?.cancel()
+        val totalDurationMs =
+            TrackTransitionDesignTokens.TextTransition.OUT_DURATION_MS +
+                TrackTransitionDesignTokens.TextTransition.IN_DURATION_MS +
+                ((motion.cascade.size - 1).coerceAtLeast(0) * TrackTransitionDesignTokens.TextTransition.STAGGER_DELAY_MS)
+
+        lateinit var sceneAnimator: ValueAnimator
+        sceneAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = totalDurationMs
+            interpolator = AccelerateDecelerateInterpolator()
+            addUpdateListener { animator ->
+                delegate.updateTrackTextSceneTransitionProgress(animator.animatedValue as Float)
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (activeTextTransitionAnimator === sceneAnimator) {
+                        activeTextTransitionAnimator = null
+                        delegate.completeTrackTextSceneTransition()
+                        onComplete()
+                    }
                 }
 
-                outAnimator.addListener(object : android.animation.AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        view.text = delegate.resolveTextForField(session.targetTrack, field)
-                        view.translationY = 40f
-                        view.alpha = 0f
-                        val inAnimator = AnimatorSet().apply {
-                            playTogether(
-                                ObjectAnimator.ofFloat(view, View.TRANSLATION_Y, 40f, 0f),
-                                ObjectAnimator.ofFloat(view, View.ALPHA, 0f, 1f)
-                            )
-                            duration = 450
-                            interpolator = exitInterpolator
-                        }
-                        activeTextFieldAnimators.add(inAnimator)
-                        inAnimator.start()
+                override fun onAnimationCancel(animation: Animator) {
+                    if (activeTextTransitionAnimator === sceneAnimator) {
+                        activeTextTransitionAnimator = null
+                        delegate.cancelTrackTextSceneTransition(useTargetScene = false)
                     }
-                })
-                activeTextFieldAnimators.add(outAnimator)
-                outAnimator.start()
-            }, delayMs)
+                }
+            })
         }
+        activeTextTransitionAnimator = sceneAnimator
+        sceneAnimator.start()
     }
 
-    private fun resolveTextViewForField(field: TextCascadeField): TextView? {
-        return when (field) {
-            TextCascadeField.TRACK -> trackText
-            TextCascadeField.ARTIST -> artistText
-            TextCascadeField.ALBUM -> albumText
-        }
-    }
-
-    private fun cancelActiveTextAnimators() {
-        activeTextFieldAnimators.forEach { it.cancel() }
-        activeTextFieldAnimators.clear()
+    fun cancelOngoingAnimations() {
+        activeTrackTransitionAnimator?.cancel()
+        activeTrackTransitionAnimator = null
+        activeTextTransitionAnimator?.cancel()
+        activeTextTransitionAnimator = null
+        translationXSpring?.cancel()
+        isTrackTransitionAnimating = false
+        hideCoverDragPreviews(animated = false)
     }
 
     enum class SwipeDirection { LEFT, RIGHT, UP, DOWN }
