@@ -1,4 +1,4 @@
-# CoverArt for Android (v2.30)
+# CoverArt for Android (v2.31)
 
 [English](#english) | [中文](#chinese)
 
@@ -14,6 +14,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 - Automatically enters a 15-cover Art Wall when playback stops, then returns to single-cover mode when music resumes.
 - Supports both physical media keys and touch gestures for playback control.
 - Uses local cache and color-adaptive background/text styling for stable long-running display behavior.
+- Portrait now-playing uses a poster-style composition with a cover-first layout, bottom metadata band, and a conservative `Balanced` / `Airy` cover profile switch for sparse bright artwork.
 
 ### Playback Controls
 - Touch gestures:
@@ -34,7 +35,7 @@ It is designed for always-on screens and TV-class devices, showing current album
 
 ### Build & Install
 1. Open in Android Studio and run debug build, or use CLI: `./gradlew assembleDebug`
-2. Current packaged APK (v2.30) is generated at project root: `CoverArtForAndroid-v2.30-debug.apk`
+2. Current packaged APK (v2.31) is generated at project root: `CoverArt-2.31-debug.apk`
 3. Install the APK to your Android device.
 4. Ensure device and Roon Core are in the same LAN.
 
@@ -52,7 +53,12 @@ It is designed for always-on screens and TV-class devices, showing current album
 5. Use touch gestures or media keys to control playback directly from the display device.
 
 ### Version
-- **2.30 (Latest)**
+- **2.31 (Latest)**
+  - Refined portrait now-playing into a poster-style layout for 9:16 displays, with a bottom-aligned metadata band, left-aligned hierarchy, and warmer text tones for long-distance readability
+  - Added conservative `PortraitCoverProfile` routing plus `CoverCompositionAnalyzer` heuristics so bright sparse covers can opt into an `Airy` portrait treatment without affecting landscape mode
+  - Simplified metadata text rendering in `TrackTextSceneView` to a single-pass draw path, removing the shadow/fake-bold edge halo that could read like an outline on low-PPI framed displays
+  - Added JVM regression coverage for cover composition classification while keeping existing metadata layout policy tests green
+- **2.30**
   - Replaced metadata `TextView` rendering with a measured scene pipeline built from `TrackTextLayoutPolicy`, `AndroidTrackTextLayoutEngine`, and `TrackTextSceneView`
   - Rebuilt portrait and landscape metadata layout around a cover-first `LayoutSpec` with short-edge-driven spacing and readability baselines
   - Added `contentWidthPx` shrink-wrap and transition-time width freezing so short titles can breathe without horizontal jitter during skips
@@ -109,6 +115,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 - 播放停止后自动进入 15 宫格艺术墙；恢复播放后自动回到单封面模式。
 - 同时支持物理媒体键与触摸手势控制播放。
 - 本地缓存与主色调自适应背景/文字，提升长期运行稳定性与观感一致性。
+- 竖屏播放态采用更接近画框海报的 cover-first 构图，底部信息带左对齐，并通过保守的 `Balanced` / `Airy` 封面分流适配高亮度、大留白封面。
 
 ### 播放控制
 - 触摸手势：
@@ -129,7 +136,7 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 
 ### 构建与安装
 1. 使用 Android Studio 打开工程并运行，或命令行执行：`./gradlew assembleDebug`
-2. 当前已打包的 v2.30 APK 位于项目根目录：`CoverArtForAndroid-v2.30-debug.apk`
+2. 当前已打包的 v2.31 APK 位于项目根目录：`CoverArt-2.31-debug.apk`
 3. 安装生成的 APK 到 Android 设备。
 4. 确保设备与 Roon Core 在同一局域网。
 
@@ -147,7 +154,12 @@ CoverArt 是面向 Roon 生态的 Android 展示端应用。
 5. 可直接在屏幕上滑动控制播放，或使用媒体键操作。
 
 ### 版本信息
-- **2.30（最新）**
+- **2.31（最新）**
+  - 将竖屏 Now Playing 收敛为更适合 9:16 画屏的海报式布局：封面优先、底部信息带贴底、文字层级左对齐，并统一为偏暖文字色提升远看可读性
+  - 新增保守的 `PortraitCoverProfile` 分流与 `CoverCompositionAnalyzer` 轻量封面分析，让高亮度、大留白封面进入 `Airy` 竖屏样式，同时不影响横屏布局
+  - `TrackTextSceneView` 改为单层文字绘制，移除阴影叠画和标题 fake bold，降低低 PPI 画屏上容易被看成“文字有边框”的暗边感
+  - 补充封面分类相关 JVM 回归测试，并保持现有 metadata 布局策略测试通过
+- **2.30**
   - 用 `TrackTextLayoutPolicy`、`AndroidTrackTextLayoutEngine` 和 `TrackTextSceneView` 组成新的测量式 scene 文本渲染链路，替换元数据 `TextView` 直绘
   - 围绕 cover-first `LayoutSpec` 重写横竖屏元数据布局，采用短边驱动的间距与远距离可读性基线
   - 新增 `contentWidthPx` 基础 shrink-wrap，并在转场期间冻结 metadata 容器宽度，避免切歌时横向抖动

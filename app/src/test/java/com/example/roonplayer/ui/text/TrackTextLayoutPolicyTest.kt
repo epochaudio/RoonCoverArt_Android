@@ -1,5 +1,6 @@
 package com.example.roonplayer.ui.text
 
+import com.example.roonplayer.PortraitCoverProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -35,14 +36,16 @@ class TrackTextLayoutPolicyTest {
         val artist = requireNotNull(plan.block(TrackTextField.ARTIST))
         val album = requireNotNull(plan.block(TrackTextField.ALBUM))
 
-        assertEquals(expectedResponsiveFontSize(32, metrics, bounds.heightPx, 1.0f), title.style.fontSizeSp, 0.01f)
-        assertEquals(expectedResponsiveFontSize(28, metrics, bounds.heightPx, 0.85f), artist.style.fontSizeSp, 0.01f)
-        assertEquals(expectedResponsiveFontSize(24, metrics, bounds.heightPx, 0.72f), album.style.fontSizeSp, 0.01f)
-        assertEquals(0.76f, artist.style.alpha, 0.001f)
-        assertEquals(0.44f, album.style.alpha, 0.001f)
+        assertEquals(expectedResponsiveFontSize(38, metrics, bounds.heightPx, 1.02f), title.style.fontSizeSp, 0.01f)
+        assertEquals(expectedResponsiveFontSize(30, metrics, bounds.heightPx, 0.9f), artist.style.fontSizeSp, 0.01f)
+        assertEquals(expectedResponsiveFontSize(22, metrics, bounds.heightPx, 0.78f), album.style.fontSizeSp, 0.01f)
+        assertEquals(0.84f, artist.style.alpha, 0.001f)
+        assertEquals(0.66f, album.style.alpha, 0.001f)
         assertEquals(0, artist.bottomPaddingPx)
         assertTrue(album.topPaddingPx > 0)
-        assertEquals(TrackTextAlignment.CENTER, plan.alignment)
+        assertEquals(2, title.style.maxLines)
+        assertEquals(1, album.style.maxLines)
+        assertEquals(TrackTextAlignment.START, plan.alignment)
     }
 
     @Test
@@ -185,8 +188,8 @@ class TrackTextLayoutPolicyTest {
 
         assertNotNull(portraitTitle)
         assertNotNull(landscapeTitle)
-        assertEquals(TrackTextAlignment.CENTER, portraitPlan.alignment)
-        assertEquals(TrackTextAlignment.CENTER, portraitTitle?.style?.alignment)
+        assertEquals(TrackTextAlignment.START, portraitPlan.alignment)
+        assertEquals(TrackTextAlignment.START, portraitTitle?.style?.alignment)
         assertEquals(TrackTextAlignment.START, landscapePlan.alignment)
         assertEquals(TrackTextAlignment.START, landscapeTitle?.style?.alignment)
     }
@@ -262,6 +265,72 @@ class TrackTextLayoutPolicyTest {
         val highDensityTitle = requireNotNull(highDensityPlan.block(TrackTextField.TITLE))
 
         assertTrue(lowDensityTitle.style.fontSizeSp > highDensityTitle.style.fontSizeSp)
+    }
+
+    @Test
+    fun `portrait album yields when footer budget is tight and title needs two lines`() {
+        val metrics = metrics(
+            widthPx = 1080,
+            heightPx = 1920,
+            density = 3.0f,
+            orientation = TrackTextOrientation.PORTRAIT
+        )
+
+        val plan = policy.resolve(
+            TrackTextLayoutPolicyInput(
+                title = "A long enough title to occupy two lines in the poster footer",
+                artist = "Artist Name",
+                album = "Album Name",
+                screenMetrics = metrics,
+                availableBounds = TrackTextBounds(widthPx = 820, heightPx = 120)
+            )
+        )
+
+        val title = requireNotNull(plan.block(TrackTextField.TITLE))
+        val album = requireNotNull(plan.block(TrackTextField.ALBUM))
+
+        assertEquals(2, title.style.maxLines)
+        assertFalse(album.visible)
+    }
+
+    @Test
+    fun `airy portrait elevates title and hides album by default`() {
+        val metrics = metrics(
+            widthPx = 1080,
+            heightPx = 1920,
+            density = 3.0f,
+            orientation = TrackTextOrientation.PORTRAIT
+        )
+
+        val balancedPlan = policy.resolve(
+            TrackTextLayoutPolicyInput(
+                title = "Arcoluz",
+                artist = "Renaud Garcia-Fons / Kiko Ruiz / Negrito Trasante",
+                album = "Arcoluz",
+                screenMetrics = metrics,
+                availableBounds = TrackTextBounds(widthPx = 900, heightPx = 420)
+            )
+        )
+        val airyPlan = policy.resolve(
+            TrackTextLayoutPolicyInput(
+                title = "Arcoluz",
+                artist = "Renaud Garcia-Fons / Kiko Ruiz / Negrito Trasante",
+                album = "Arcoluz",
+                screenMetrics = metrics,
+                availableBounds = TrackTextBounds(widthPx = 900, heightPx = 420),
+                portraitProfile = PortraitCoverProfile.AIRY
+            )
+        )
+
+        val balancedTitle = requireNotNull(balancedPlan.block(TrackTextField.TITLE))
+        val balancedArtist = requireNotNull(balancedPlan.block(TrackTextField.ARTIST))
+        val airyTitle = requireNotNull(airyPlan.block(TrackTextField.TITLE))
+        val airyArtist = requireNotNull(airyPlan.block(TrackTextField.ARTIST))
+        val airyAlbum = requireNotNull(airyPlan.block(TrackTextField.ALBUM))
+
+        assertTrue(airyTitle.style.fontSizeSp > balancedTitle.style.fontSizeSp)
+        assertTrue(airyArtist.style.alpha > balancedArtist.style.alpha)
+        assertFalse(airyAlbum.visible)
     }
 
     private fun metrics(

@@ -190,6 +190,7 @@ class MainActivity : Activity() {
         private const val QUEUE_RESUBSCRIBE_DEBOUNCE_MS = 1000L
         private const val STATUS_OVERLAY_TEXT_COLOR = 0xFFE0E0E0.toInt()
         private const val METADATA_CONTAINER_TAG = "text_container"
+        private const val PORTRAIT_ATMOSPHERE_TAG = "portrait_atmosphere"
         
         // --- 统一设计语言池 (Design Tokens) ---
         object UIDesignTokens {
@@ -203,7 +204,7 @@ class MainActivity : Activity() {
             const val PROPORTION_LANDSCAPE_IMAGE_WIDTH = 0.618f // 更接近黄金比例
             const val PROPORTION_LANDSCAPE_TEXT_WIDTH = 0.38f
             const val PROPORTION_LANDSCAPE_HEIGHT = 0.65f
-            const val PROPORTION_PORTRAIT_IMAGE_WIDTH = 0.85f
+            const val PROPORTION_PORTRAIT_IMAGE_WIDTH = 0.87f
             const val PROPORTION_PORTRAIT_TEXT_HEIGHT = 0.35f
             const val PROPORTION_COVER_CORNER_RADIUS = 0.035f // 相对宽度的3.5%
             
@@ -251,6 +252,86 @@ class MainActivity : Activity() {
         val minReadableTextHeightPx: Int,
         val minLandscapeTextWidthPx: Int
     )
+
+    private data class PortraitLayoutProfileSpec(
+        val coverWidthRatio: Float,
+        val topMarginRatio: Float,
+        val topMarginRangePx: IntRange,
+        val bottomMarginRatio: Float,
+        val bottomMarginRangePx: IntRange,
+        val gapRatio: Float,
+        val gapRangePx: IntRange,
+        val metadataVerticalPaddingRatio: Float,
+        val metadataVerticalPaddingRangePx: IntRange,
+        val minReadableTextHeightRatio: Float,
+        val minReadableTextHeightRangePx: IntRange,
+        val atmosphereHeightRatio: Float,
+        val atmosphereFogAlpha: Float,
+        val atmosphereMidAlpha: Float,
+        val atmosphereBottomAlpha: Float,
+        val atmosphereFogBlendRatio: Float,
+        val atmosphereMidBlendRatio: Float,
+        val atmosphereBottomBlendRatio: Float,
+        val metadataPlateFillAlpha: Float,
+        val metadataPlateStrokeAlpha: Float,
+        val coverShadowAlpha: Float,
+        val coverElevationDp: Float
+    )
+
+    private fun resolvePortraitLayoutProfileSpec(
+        profile: PortraitCoverProfile = currentPortraitCoverProfile
+    ): PortraitLayoutProfileSpec {
+        return when (profile) {
+            PortraitCoverProfile.BALANCED -> PortraitLayoutProfileSpec(
+                coverWidthRatio = 0.87f,
+                topMarginRatio = 0.033f,
+                topMarginRangePx = 32..76,
+                bottomMarginRatio = 0.028f,
+                bottomMarginRangePx = 24..60,
+                gapRatio = 0.04f,
+                gapRangePx = 22..48,
+                metadataVerticalPaddingRatio = 0.015f,
+                metadataVerticalPaddingRangePx = 12..22,
+                minReadableTextHeightRatio = 0.22f,
+                minReadableTextHeightRangePx = 180..360,
+                atmosphereHeightRatio = 0.44f,
+                atmosphereFogAlpha = 0.18f,
+                atmosphereMidAlpha = 0.56f,
+                atmosphereBottomAlpha = 0.94f,
+                atmosphereFogBlendRatio = 0.08f,
+                atmosphereMidBlendRatio = 0.58f,
+                atmosphereBottomBlendRatio = 0.76f,
+                metadataPlateFillAlpha = 0f,
+                metadataPlateStrokeAlpha = 0f,
+                coverShadowAlpha = 0.16f,
+                coverElevationDp = 3f
+            )
+            PortraitCoverProfile.AIRY -> PortraitLayoutProfileSpec(
+                coverWidthRatio = 0.91f,
+                topMarginRatio = 0.024f,
+                topMarginRangePx = 40..52,
+                bottomMarginRatio = 0.026f,
+                bottomMarginRangePx = 24..52,
+                gapRatio = 0.028f,
+                gapRangePx = 18..36,
+                metadataVerticalPaddingRatio = 0.02f,
+                metadataVerticalPaddingRangePx = 18..30,
+                minReadableTextHeightRatio = 0.18f,
+                minReadableTextHeightRangePx = 132..260,
+                atmosphereHeightRatio = 0.52f,
+                atmosphereFogAlpha = 0.20f,
+                atmosphereMidAlpha = 0.68f,
+                atmosphereBottomAlpha = 0.97f,
+                atmosphereFogBlendRatio = 0.04f,
+                atmosphereMidBlendRatio = 0.46f,
+                atmosphereBottomBlendRatio = 0.82f,
+                metadataPlateFillAlpha = 0.22f,
+                metadataPlateStrokeAlpha = 0.10f,
+                coverShadowAlpha = 0.10f,
+                coverElevationDp = 2f
+            )
+        }
+    }
     
     // TrackState data class for unified state management
     data class TrackState(
@@ -410,11 +491,40 @@ class MainActivity : Activity() {
 
         private fun resolveLayoutSpec(): LayoutSpec {
             val outerMargin = spacingMd
-            val topMargin = if (isLandscape) spacingMd else spacingSm
-            val bottomMargin = spacingMd
-            val gap = spacingSm
-            val contentPaddingHorizontal = spacingSm
-            val contentPaddingVertical = spacingXs
+            val portraitSpec = resolvePortraitLayoutProfileSpec()
+            val topMargin = if (isLandscape) {
+                spacingMd
+            } else {
+                (screenHeight * portraitSpec.topMarginRatio).toInt().coerceIn(
+                    portraitSpec.topMarginRangePx.first,
+                    portraitSpec.topMarginRangePx.last
+                )
+            }
+            val bottomMargin = if (isLandscape) {
+                spacingMd
+            } else {
+                (screenHeight * portraitSpec.bottomMarginRatio).toInt().coerceIn(
+                    portraitSpec.bottomMarginRangePx.first,
+                    portraitSpec.bottomMarginRangePx.last
+                )
+            }
+            val gap = if (isLandscape) {
+                spacingSm
+            } else {
+                (shortEdge * portraitSpec.gapRatio).toInt().coerceIn(
+                    portraitSpec.gapRangePx.first,
+                    portraitSpec.gapRangePx.last
+                )
+            }
+            val contentPaddingHorizontal = if (isLandscape) spacingSm else 0
+            val contentPaddingVertical = if (isLandscape) {
+                spacingXs
+            } else {
+                (shortEdge * portraitSpec.metadataVerticalPaddingRatio).toInt().coerceIn(
+                    portraitSpec.metadataVerticalPaddingRangePx.first,
+                    portraitSpec.metadataVerticalPaddingRangePx.last
+                )
+            }
             val minReadableTextHeight = (shortEdge * 0.22f).toInt()
                 .coerceIn(180.dpToPx(), 360.dpToPx())
             val minLandscapeTextWidth = (shortEdge * 0.28f).toInt()
@@ -452,18 +562,23 @@ class MainActivity : Activity() {
                     minLandscapeTextWidthPx = minLandscapeTextWidth
                 )
             } else {
-                val portraitCoverWidthRatio = 0.94f
+                val portraitCoverWidthRatio = portraitSpec.coverWidthRatio
                 val maxCoverByWidth = (screenWidth - outerMargin * 2).coerceAtLeast(0)
+                val portraitMinReadableTextHeight = (shortEdge * portraitSpec.minReadableTextHeightRatio).toInt()
+                    .coerceIn(
+                        portraitSpec.minReadableTextHeightRangePx.first,
+                        portraitSpec.minReadableTextHeightRangePx.last
+                    )
                 val maxCoverByHeight = (
-                    screenHeight - topMargin - gap - bottomMargin - minReadableTextHeight
+                    screenHeight - topMargin - gap - bottomMargin - portraitMinReadableTextHeight
                     ).coerceAtLeast(0)
                 val desiredCover = (screenWidth * portraitCoverWidthRatio).toInt()
                 val coverSize = minOf(desiredCover, maxCoverByWidth, maxCoverByHeight, shortEdge)
                     .coerceAtLeast(0)
-                val maxTextWidth = (screenWidth - outerMargin * 2).coerceAtLeast(0)
+                val maxTextWidth = coverSize.coerceAtLeast(0)
                 val maxTextHeight = (
                     screenHeight - topMargin - coverSize - gap - bottomMargin
-                    ).coerceAtLeast(minReadableTextHeight)
+                    ).coerceAtLeast(portraitMinReadableTextHeight)
 
                 LayoutSpec(
                     screenWidthPx = screenWidth,
@@ -480,7 +595,7 @@ class MainActivity : Activity() {
                     coverSizePx = coverSize,
                     maxTextWidthPx = maxTextWidth,
                     maxTextHeightPx = maxTextHeight,
-                    minReadableTextHeightPx = minReadableTextHeight,
+                    minReadableTextHeightPx = portraitMinReadableTextHeight,
                     minLandscapeTextWidthPx = minLandscapeTextWidth
                 )
             }
@@ -622,7 +737,7 @@ class MainActivity : Activity() {
         return resolveMetadataContainerView() as? ViewGroup
     }
 
-    private fun applyStableMetadataContainerWidth(scene: TrackTextScene?) {
+    private fun applyStableMetadataContainerWidth() {
         if (!::screenAdapter.isInitialized || screenAdapter.isLandscape) {
             return
         }
@@ -630,22 +745,13 @@ class MainActivity : Activity() {
         val container = resolveMetadataContainerGroup() ?: return
         val layoutParams = container.layoutParams as? RelativeLayout.LayoutParams ?: return
         val maxWidth = screenAdapter.layoutSpec.maxTextWidthPx
-        val horizontalPadding = container.paddingLeft + container.paddingRight
-        val desiredWidth = when {
-            scene == null -> maxWidth
-            else -> (scene.contentWidthPx + horizontalPadding).coerceIn(horizontalPadding, maxWidth)
-        }
-
-        if (layoutParams.width != desiredWidth) {
-            layoutParams.width = desiredWidth
+        if (layoutParams.width != maxWidth) {
+            layoutParams.width = maxWidth
             container.layoutParams = layoutParams
         }
     }
 
-    private fun freezeMetadataContainerWidthForTransition(
-        sourceScene: TrackTextScene,
-        targetScene: TrackTextScene
-    ) {
+    private fun freezeMetadataContainerWidthForTransition() {
         if (!::screenAdapter.isInitialized || screenAdapter.isLandscape) {
             return
         }
@@ -653,13 +759,8 @@ class MainActivity : Activity() {
         val container = resolveMetadataContainerGroup() ?: return
         val layoutParams = container.layoutParams as? RelativeLayout.LayoutParams ?: return
         val maxWidth = screenAdapter.layoutSpec.maxTextWidthPx
-        val horizontalPadding = container.paddingLeft + container.paddingRight
-        val frozenWidth = (
-            maxOf(sourceScene.contentWidthPx, targetScene.contentWidthPx) + horizontalPadding
-            ).coerceIn(horizontalPadding, maxWidth)
-
-        if (layoutParams.width != frozenWidth) {
-            layoutParams.width = frozenWidth
+        if (layoutParams.width != maxWidth) {
+            layoutParams.width = maxWidth
             container.layoutParams = layoutParams
         }
     }
@@ -696,7 +797,7 @@ class MainActivity : Activity() {
             return false
         }
         trackTextSceneView.setScene(scene)
-        applyStableMetadataContainerWidth(scene)
+        applyStableMetadataContainerWidth()
         logDebug(
             "Track text scene rendered: reason=$reason " +
                 "width_px=${scene.bounds.widthPx} height_px=${scene.contentHeightPx}"
@@ -718,7 +819,7 @@ class MainActivity : Activity() {
             state = targetState,
             persistAsLastMeasured = false
         ) ?: return false
-        freezeMetadataContainerWidthForTransition(sourceScene, targetScene)
+        freezeMetadataContainerWidthForTransition()
         val transitionState = TrackTextSceneTransitionState(
             sourceScene = sourceScene,
             targetScene = targetScene,
@@ -744,7 +845,8 @@ class MainActivity : Activity() {
         }
         trackTextSceneView.finishTransition()
         lastMeasuredTrackTextScene = measureTrackTextScene(currentState.get())
-        applyStableMetadataContainerWidth(lastMeasuredTrackTextScene)
+        applyStableMetadataContainerWidth()
+        flushPendingPortraitProfileLayoutRefresh()
     }
 
     private fun cancelTrackTextSceneTransition(useTargetScene: Boolean) {
@@ -752,7 +854,55 @@ class MainActivity : Activity() {
             return
         }
         trackTextSceneView.cancelTransition(useTargetScene)
-        applyStableMetadataContainerWidth(lastMeasuredTrackTextScene)
+        applyStableMetadataContainerWidth()
+        flushPendingPortraitProfileLayoutRefresh()
+    }
+
+    private fun onPortraitCoverProfileResolved(profile: PortraitCoverProfile) {
+        if (profile == currentPortraitCoverProfile) {
+            return
+        }
+        currentPortraitCoverProfile = profile
+        schedulePortraitProfileLayoutRefresh()
+    }
+
+    private fun schedulePortraitProfileLayoutRefresh() {
+        if (!::mainLayout.isInitialized) {
+            pendingPortraitProfileLayoutRefresh = true
+            return
+        }
+        if (!canRefreshPortraitProfileLayout()) {
+            pendingPortraitProfileLayoutRefresh = true
+            return
+        }
+        pendingPortraitProfileLayoutRefresh = false
+        applyLayoutParameters()
+        initializeChoreographer()
+    }
+
+    private fun flushPendingPortraitProfileLayoutRefresh() {
+        if (!pendingPortraitProfileLayoutRefresh) {
+            return
+        }
+        if (!canRefreshPortraitProfileLayout()) {
+            return
+        }
+        pendingPortraitProfileLayoutRefresh = false
+        applyLayoutParameters()
+        initializeChoreographer()
+    }
+
+    private fun canRefreshPortraitProfileLayout(): Boolean {
+        if (!::screenAdapter.isInitialized || screenAdapter.isLandscape) {
+            return false
+        }
+        if (isArtWallMode) {
+            return false
+        }
+        if (::trackTextSceneView.isInitialized && trackTextSceneView.isTransitionRunning()) {
+            return false
+        }
+        return activeTransitionSession == null && !isTrackTransitionAnimating
     }
 
     private fun TextCascadeField.toTrackTextField(): TrackTextField {
@@ -799,7 +949,8 @@ class MainActivity : Activity() {
                     TrackTextOrientation.PORTRAIT
                 }
             ),
-            availableBounds = availableBounds
+            availableBounds = availableBounds,
+            portraitProfile = currentPortraitCoverProfile
         )
     }
 
@@ -1327,6 +1478,11 @@ class MainActivity : Activity() {
     // 布局和主题相关
     private lateinit var mainLayout: RelativeLayout
     private var currentDominantColor = 0xFF1a1a1a.toInt()
+    private var portraitAtmosphereView: View? = null
+    private var portraitMetadataBandView: View? = null
+    private var currentPortraitCoverProfile = PortraitCoverProfile.BALANCED
+    private var pendingPortraitProfileLayoutRefresh = false
+    private val coverCompositionAnalyzer = CoverCompositionAnalyzer()
     
     // State synchronization and message processing
     private val stateLock = ReentrantLock()
@@ -2419,7 +2575,7 @@ class MainActivity : Activity() {
                 }
             }
             // 初始化基础阴影效果，后续会根据专辑色彩动态更新
-            background = createDynamicShadowBackground(0xFF1a1a1a.toInt())
+            background = createDynamicShadowBackground(0xFF1a1a1a.toInt(), shadowAlpha = 0.24f)
             elevation = 5.dpToPx().toFloat() // 对应CSS的5px阴影深度
             adjustViewBounds = true
             
@@ -2427,11 +2583,14 @@ class MainActivity : Activity() {
     }
     
     // 动态创建基于专辑色彩的阴影背景
-    private fun createDynamicShadowBackground(dominantColor: Int): android.graphics.drawable.LayerDrawable {
+    private fun createDynamicShadowBackground(
+        dominantColor: Int,
+        shadowAlpha: Float = 0.24f
+    ): android.graphics.drawable.LayerDrawable {
         val radius = 8.dpToPx().toFloat()
         
         // 基于专辑主色调创建半透明阴影
-        val shadowColor = createShadowColor(dominantColor, 0.3f)
+        val shadowColor = createShadowColor(dominantColor, shadowAlpha)
         val shadowDrawable = android.graphics.drawable.GradientDrawable().apply {
             shape = android.graphics.drawable.GradientDrawable.RECTANGLE
             cornerRadius = radius
@@ -2447,7 +2606,7 @@ class MainActivity : Activity() {
         
         return android.graphics.drawable.LayerDrawable(arrayOf(shadowDrawable, borderDrawable)).apply {
             // 对应CSS的2px 2px 5px偏移
-            setLayerInset(0, 0, 0, 2.dpToPx(), 2.dpToPx()) // 阴影偏移
+            setLayerInset(0, 0, 0, 1.dpToPx(), 2.dpToPx()) // 阴影偏移
             setLayerInset(1, 0, 0, 0, 0) // 边框不偏移
         }
     }
@@ -2600,23 +2759,86 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun createPortraitBottomGradientBackground(): GradientDrawable {
+    private fun createPortraitBottomGradientBackground(
+        baseColor: Int,
+        profile: PortraitCoverProfile = currentPortraitCoverProfile
+    ): GradientDrawable {
+        val profileSpec = resolvePortraitLayoutProfileSpec(profile)
+        val fogColor = blendColors(baseColor, Color.WHITE, profileSpec.atmosphereFogBlendRatio)
+        val midColor = blendColors(baseColor, Color.BLACK, profileSpec.atmosphereMidBlendRatio)
+        val deepestColor = blendColors(baseColor, Color.BLACK, profileSpec.atmosphereBottomBlendRatio)
         return GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(
                 Color.TRANSPARENT,
-                0x14000000,
-                0x38000000
+                withAlpha(fogColor, profileSpec.atmosphereFogAlpha),
+                withAlpha(midColor, profileSpec.atmosphereMidAlpha),
+                withAlpha(deepestColor, profileSpec.atmosphereBottomAlpha)
             )
         )
+    }
+
+    private fun createPortraitMetadataBandBackground(
+        baseColor: Int,
+        profile: PortraitCoverProfile = currentPortraitCoverProfile
+    ): Drawable? {
+        val profileSpec = resolvePortraitLayoutProfileSpec(profile)
+        if (profileSpec.metadataPlateFillAlpha <= 0f && profileSpec.metadataPlateStrokeAlpha <= 0f) {
+            return null
+        }
+
+        val fillDrawable = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
+                withAlpha(blendColors(baseColor, Color.WHITE, 0.04f), profileSpec.metadataPlateFillAlpha * 0.45f),
+                withAlpha(blendColors(baseColor, Color.BLACK, 0.20f), profileSpec.metadataPlateFillAlpha)
+            )
+        ).apply {
+            cornerRadius = 18.dpToPx().toFloat()
+        }
+
+        val strokeDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 18.dpToPx().toFloat()
+            setColor(Color.TRANSPARENT)
+            setStroke(1.dpToPx(), withAlpha(Color.WHITE, profileSpec.metadataPlateStrokeAlpha))
+        }
+
+        return LayerDrawable(arrayOf(fillDrawable, strokeDrawable))
+    }
+
+    private fun withAlpha(color: Int, alpha: Float): Int {
+        return Color.argb(
+            (255 * alpha.coerceIn(0f, 1f)).toInt(),
+            Color.red(color),
+            Color.green(color),
+            Color.blue(color)
+        )
+    }
+
+    private fun resolveCoverShadowAlpha(): Float {
+        return if (::screenAdapter.isInitialized && !screenAdapter.isLandscape) {
+            resolvePortraitLayoutProfileSpec().coverShadowAlpha
+        } else {
+            0.24f
+        }
+    }
+
+    private fun resolvePortraitCoverElevationDp(): Float {
+        return resolvePortraitLayoutProfileSpec().coverElevationDp
     }
     
     private fun applyPortraitLayout() {
         logDebug("📱 Applying portrait layout parameters - Optimized for distance viewing")
         
         try {
+            val portraitProfile = currentPortraitCoverProfile
+            val portraitSpec = resolvePortraitLayoutProfileSpec(portraitProfile)
             val layoutSpec = screenAdapter.layoutSpec
             resetMetadataLayoutBudget(layoutSpec)
+            metadataHeightBudgetPx = (
+                layoutSpec.maxTextHeightPx - (layoutSpec.contentPaddingVerticalPx * 2)
+                ).coerceAtLeast(0)
             val coverSize = layoutSpec.coverSizePx
             val margin = layoutSpec.outerMarginPx
             val topMargin = layoutSpec.topMarginPx
@@ -2646,23 +2868,33 @@ class MainActivity : Activity() {
             albumArtView.layoutParams = RelativeLayout.LayoutParams(coverSize, coverSize).apply {
                 addRule(RelativeLayout.CENTER_HORIZONTAL)
             }
+            albumArtView.background = createDynamicShadowBackground(
+                dominantColor = currentDominantColor,
+                shadowAlpha = resolveCoverShadowAlpha()
+            )
+            albumArtView.elevation = resolvePortraitCoverElevationDp() * resources.displayMetrics.density
             
             coverContainer.addView(albumArtView)
 
             val gradientHeight = maxOf(
-                layoutSpec.maxTextHeightPx + (layoutSpec.contentPaddingVerticalPx * 2) + bottomMargin,
-                (screenAdapter.screenHeight * 0.24f).toInt()
+                layoutSpec.maxTextHeightPx + (layoutSpec.contentPaddingVerticalPx * 2) + bottomMargin + gap,
+                (screenAdapter.screenHeight * portraitSpec.atmosphereHeightRatio).toInt()
             )
             val bottomGradientView = View(this).apply {
+                tag = PORTRAIT_ATMOSPHERE_TAG
                 layoutParams = RelativeLayout.LayoutParams(
                     RelativeLayout.LayoutParams.MATCH_PARENT,
                     gradientHeight
                 ).apply {
                     addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
                 }
-                background = createPortraitBottomGradientBackground()
+                background = createPortraitBottomGradientBackground(
+                    baseColor = currentDominantColor,
+                    profile = portraitProfile
+                )
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
+            portraitAtmosphereView = bottomGradientView
 
             val textContainer = LinearLayout(this).apply {
                 id = View.generateViewId()
@@ -2672,12 +2904,15 @@ class MainActivity : Activity() {
                     layoutSpec.maxTextWidthPx,
                     RelativeLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    addRule(RelativeLayout.BELOW, coverContainer.id)
+                    addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
                     addRule(RelativeLayout.CENTER_HORIZONTAL)
                     setMargins(margin, 0, margin, bottomMargin)
                 }
-                gravity = android.view.Gravity.CENTER_HORIZONTAL
-                background = null
+                gravity = android.view.Gravity.START
+                background = createPortraitMetadataBandBackground(
+                    baseColor = currentDominantColor,
+                    profile = portraitProfile
+                )
                 setPadding(
                     layoutSpec.contentPaddingHorizontalPx,
                     layoutSpec.contentPaddingVerticalPx,
@@ -2685,6 +2920,8 @@ class MainActivity : Activity() {
                     layoutSpec.contentPaddingVerticalPx
                 )
             }
+            portraitMetadataBandView = textContainer
+            pendingPortraitProfileLayoutRefresh = false
             
             ensureTrackTextSceneViewInitialized()
             textContainer.addView(trackTextSceneView)
@@ -2710,6 +2947,8 @@ class MainActivity : Activity() {
         logDebug("🖥️ Applying landscape layout parameters - Optimized for distance viewing")
         
         try {
+            portraitAtmosphereView = null
+            portraitMetadataBandView = null
             val layoutSpec = screenAdapter.layoutSpec
             resetMetadataLayoutBudget(layoutSpec)
             val coverSize = layoutSpec.coverSizePx
@@ -2730,6 +2969,11 @@ class MainActivity : Activity() {
                 addRule(RelativeLayout.CENTER_VERTICAL)
                 setMargins(margin, layoutSpec.topMarginPx, gap, layoutSpec.bottomMarginPx)
             }
+            albumArtView.background = createDynamicShadowBackground(
+                dominantColor = currentDominantColor,
+                shadowAlpha = resolveCoverShadowAlpha()
+            )
+            albumArtView.elevation = 5.dpToPx().toFloat()
             
             val textContainer = LinearLayout(this).apply {
                 id = View.generateViewId()
@@ -2868,6 +3112,7 @@ class MainActivity : Activity() {
         // 显示正常播放界面
         albumArtView.visibility = View.VISIBLE
         refreshStatusOverlayVisibility()
+        flushPendingPortraitProfileLayoutRefresh()
         
     }
     
@@ -3424,8 +3669,10 @@ class MainActivity : Activity() {
     private fun updateBackgroundColor(bitmap: Bitmap) {
         activityScope.launch(Dispatchers.IO) {
             val dominantColor = paletteManager.extractDominantColor(bitmap)
+            val profileDecision = coverCompositionAnalyzer.analyze(bitmap)
             mainHandler.post {
                 if (!::mainLayout.isInitialized) return@post
+                onPortraitCoverProfileResolved(profileDecision.profile)
                 val fromColor = currentDominantColor
                 val toColor = dominantColor
                 val colorDrawable = (mainLayout.background as? ColorDrawable)
@@ -3439,6 +3686,14 @@ class MainActivity : Activity() {
                 paletteAnimator.addUpdateListener { animator ->
                     val animatedColor = animator.animatedValue as Int
                     colorDrawable.color = animatedColor
+                    portraitAtmosphereView?.background = createPortraitBottomGradientBackground(
+                        baseColor = animatedColor,
+                        profile = currentPortraitCoverProfile
+                    )
+                    portraitMetadataBandView?.background = createPortraitMetadataBandBackground(
+                        baseColor = animatedColor,
+                        profile = currentPortraitCoverProfile
+                    )
                     applyMetadataTextPalette(
                         paletteManager.createTrackTextPalette(animatedColor)
                     )
@@ -3469,7 +3724,11 @@ class MainActivity : Activity() {
         try {
             if (::albumArtView.isInitialized) {
                 // 创建新的动态阴影背景
-                val newShadowBackground = createDynamicShadowBackground(dominantColor)
+                val shadowAlpha = resolveCoverShadowAlpha()
+                val newShadowBackground = createDynamicShadowBackground(
+                    dominantColor = dominantColor,
+                    shadowAlpha = shadowAlpha
+                )
                 
                 // 平滑过渡到新的阴影效果
                 val currentBackground = albumArtView.background
@@ -3498,7 +3757,7 @@ class MainActivity : Activity() {
                 
                 // 如果支持，更新系统阴影颜色（Android P+）
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                    val shadowColor = createShadowColor(dominantColor, 0.4f)
+                    val shadowColor = createShadowColor(dominantColor, shadowAlpha + 0.08f)
                     albumArtView.outlineAmbientShadowColor = shadowColor
                     albumArtView.outlineSpotShadowColor = shadowColor
                 }

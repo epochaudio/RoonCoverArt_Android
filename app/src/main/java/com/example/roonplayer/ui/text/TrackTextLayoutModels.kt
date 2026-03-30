@@ -1,5 +1,6 @@
 package com.example.roonplayer.ui.text
 
+import com.example.roonplayer.PortraitCoverProfile
 import kotlin.math.min
 
 enum class TrackTextField {
@@ -55,7 +56,8 @@ data class TrackTextLayoutPolicyInput(
     val artist: String,
     val album: String,
     val screenMetrics: TrackTextScreenMetrics,
-    val availableBounds: TrackTextBounds
+    val availableBounds: TrackTextBounds,
+    val portraitProfile: PortraitCoverProfile = PortraitCoverProfile.BALANCED
 ) {
     fun textFor(field: TrackTextField): String {
         return when (field) {

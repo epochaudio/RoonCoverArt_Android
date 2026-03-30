@@ -10,11 +10,11 @@ data class TrackTextPalette(
     companion object {
         fun defaultDark(): TrackTextPalette {
             return TrackTextPalette(
-                primaryTextColor = 0xFFFFFFFF.toInt(),
-                secondaryTextColor = 0xFFFFFFFF.toInt(),
-                captionTextColor = 0xFFFFFFFF.toInt(),
+                primaryTextColor = 0xFFF6F0E7.toInt(),
+                secondaryTextColor = 0xFFF2E9DD.toInt(),
+                captionTextColor = 0xFFE8DDCF.toInt(),
                 backgroundColor = 0xFF1A1A1A.toInt(),
-                shadowColor = 0x73000000.toInt()
+                shadowColor = 0x66000000.toInt()
             )
         }
     }

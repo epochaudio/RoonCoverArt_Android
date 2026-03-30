@@ -140,13 +140,8 @@ class TrackTextSceneView @JvmOverloads constructor(
             textSize = block.style.fontSizeSp * resources.displayMetrics.density
             letterSpacing = block.style.letterSpacing
             color = applyAlpha(resolveColor(block.field), block.style.alpha * alphaMultiplier)
-            isFakeBoldText = block.field == TrackTextField.TITLE
-        }
-    }
-
-    private fun buildShadowPaint(textPaint: TextPaint, alphaMultiplier: Float): TextPaint {
-        return TextPaint(textPaint).apply {
-            color = applyAlpha(palette.shadowColor, 0.72f * alphaMultiplier)
+            isSubpixelText = true
+            isFakeBoldText = false
         }
     }
 
@@ -234,8 +229,6 @@ class TrackTextSceneView @JvmOverloads constructor(
             return
         }
         val textPaint = buildTextPaint(block, alphaMultiplier)
-        val shadowPaint = buildShadowPaint(textPaint, alphaMultiplier)
-        val shadowOffsetYPx = resolveShadowOffsetYPx(block.field)
         if (debugBoundsEnabled) {
             drawDebugBlockBounds(
                 canvas = canvas,
@@ -249,12 +242,6 @@ class TrackTextSceneView @JvmOverloads constructor(
             }
             val lineBaseline = blockTop + translationYPx + line.baselinePx
             val lineLeft = paddingLeft + line.leftPx + translationXPx
-            canvas.drawText(
-                line.renderedText,
-                lineLeft,
-                lineBaseline + shadowOffsetYPx,
-                shadowPaint
-            )
             canvas.drawText(line.renderedText, lineLeft, lineBaseline, textPaint)
             if (debugBoundsEnabled) {
                 drawDebugLineBounds(canvas, blockTop + translationYPx, line)
@@ -299,15 +286,6 @@ class TrackTextSceneView @JvmOverloads constructor(
             TrackTextField.TITLE -> 6f * density
             TrackTextField.ARTIST -> 4f * density
             TrackTextField.ALBUM -> 3f * density
-        }
-    }
-
-    private fun resolveShadowOffsetYPx(field: TrackTextField): Float {
-        val density = resources.displayMetrics.density
-        return when (field) {
-            TrackTextField.TITLE -> 1.5f * density
-            TrackTextField.ARTIST -> 1.25f * density
-            TrackTextField.ALBUM -> density
         }
     }
 
